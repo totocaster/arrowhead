@@ -54,6 +54,11 @@ pub async fn run(ctx: &CommandContext, command: &IndexCommand) -> Result<()> {
         "starting index command"
     );
 
+    let settings = vault.settings();
+    if !settings.ignored_folders().is_empty() {
+        info!(ignored = ?settings.ignored_folders(), "applying ignore filters");
+    }
+
     let mut config = IndexerConfig::default();
     config.force = command.force;
     if let Some(parallel) = command.parallel {

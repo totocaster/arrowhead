@@ -11,6 +11,7 @@ Arrowhead references the precision obsidian tools used by prehistoric humans for
 ## Features
 
 - **Smart Indexing**: On-demand indexing with staleness detection (only reindex changed notes)
+- **Obsidian-Aware**: Automatically honours `.obsidian/app.json` settings (ignored folders, attachments)
 - **Full-Text Search**: SQLite FTS5-based keyword search with field:value syntax
 - **Semantic Search**: Vector embeddings for conceptual similarity search
 - **Hybrid Search**: Combined FTS + semantic search for best results

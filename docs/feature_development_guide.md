@@ -34,6 +34,9 @@ specification.
 - SQLite changes require migrations in `sqlite.rs` plus tests proving schema
   upgrades succeed. Document versioning decisions in `docs/dev_status.md` when
   they influence roll-outs.
+- Vault-aware features must respect detected Obsidian settings (e.g.
+  `.obsidian/app.json` ignore filters, attachment directories) and surface them
+  through the `VaultSettings` APIs.
 - Feature flags (e.g. `vector-lancedb`) stay off by default until the phase
   specifies activation.
 

@@ -5,7 +5,8 @@
 - **Toolchain:** Rust 1.85 (2024 edition) pinned via `rust-toolchain.toml`.
 - **Workspace health:** `cargo fmt`, `cargo check`, and `cargo test` all pass.
 - **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
-- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically.
+- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically and respecting Obsidian ignore filters.
+- **Vault settings:** `.obsidian/app.json` is parsed for attachments and user ignore filters so templates stay out of the index.
 - **CLI:** `init`, `index`, and `notes read/list` execute end-to-end; logging writes to `.arrowhead/logs/arrowhead.log` with multi-day retention.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), feature development guide established, integration fixtures ready.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), API/MCP reference stubs added, integration test harness directories created.

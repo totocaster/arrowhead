@@ -23,4 +23,4 @@ pub mod vault;
 
 // Re-export commonly used types for convenience across crates.
 pub use types::{IndexingStats, MetadataMap, NoteId, NoteRecord, VaultPaths};
-pub use vault::{Vault, VaultConfig};
+pub use vault::{Vault, VaultConfig, VaultSettings};

@@ -12,6 +12,7 @@ fixtures/
     │   ├── appearance.json
     │   └── core-plugins.json
     ├── Attachments/      # Attachment directory (empty in tests)
+    ├── Templates/        # Ignored templates folder (excluded by settings)
     └── *.md              # Test markdown notes
 ```
 

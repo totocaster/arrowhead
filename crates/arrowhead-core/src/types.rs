@@ -70,16 +70,24 @@ pub struct VaultPaths {
     pub root: PathBuf,
     /// Directory that stores Arrowhead's index data.
     pub arrowhead_dir: PathBuf,
+    /// Directory containing Obsidian configuration files.
+    pub obsidian_dir: PathBuf,
     /// Directory containing attachments (images, PDFs, etc.).
     pub attachments_dir: Option<PathBuf>,
 }
 
 impl VaultPaths {
     /// Construct a new set of paths, making them absolute where possible.
-    pub fn new(root: PathBuf, arrowhead_dir: PathBuf, attachments_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        arrowhead_dir: PathBuf,
+        obsidian_dir: PathBuf,
+        attachments_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             root,
             arrowhead_dir,
+            obsidian_dir,
             attachments_dir,
         }
     }

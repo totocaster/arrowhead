@@ -8,7 +8,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::Value;
+use tracing::warn;
 
 use crate::types::VaultPaths;
 use crate::{MetadataMap, NoteId, NoteRecord};
@@ -42,14 +44,28 @@ impl VaultConfig {
         }
     }
 
-    /// Resolve the absolute path for the attachments directory.
-    pub fn resolve_attachments_dir(&self) -> Option<PathBuf> {
-        self.attachments_dir.as_ref().map(|dir| self.root.join(dir))
-    }
-
     /// Resolve the absolute path for the Arrowhead working directory.
     pub fn resolve_arrowhead_dir(&self) -> PathBuf {
         self.root.join(&self.arrowhead_dir_name)
+    }
+}
+
+/// Declarative Obsidian vault settings loaded from `.obsidian`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultSettings {
+    attachments_folder: Option<PathBuf>,
+    ignored_folders: Vec<PathBuf>,
+}
+
+impl VaultSettings {
+    /// Access the configured attachments folder relative to the vault root.
+    pub fn attachments_folder(&self) -> Option<&Path> {
+        self.attachments_folder.as_deref()
+    }
+
+    /// Paths that should be ignored during indexing, relative to the vault root.
+    pub fn ignored_folders(&self) -> &[PathBuf] {
+        &self.ignored_folders
     }
 }
 
@@ -57,6 +73,7 @@ impl VaultConfig {
 #[derive(Debug, Clone)]
 pub struct Vault {
     paths: Arc<VaultPaths>,
+    settings: Arc<VaultSettings>,
 }
 
 impl Vault {
@@ -74,16 +91,38 @@ impl Vault {
         }
 
         let arrowhead_dir = config.resolve_arrowhead_dir();
-        let attachments_dir = config.resolve_attachments_dir();
+        let obsidian_dir = root.join(".obsidian");
+
+        let mut settings = load_obsidian_settings(&obsidian_dir);
+        if let Some(config_attachments) = &config.attachments_dir {
+            if let Some(relative) = normalise_relative_path(config_attachments.as_path()) {
+                settings.attachments_folder = Some(relative);
+            }
+        }
+
+        let attachments_dir = settings
+            .attachments_folder()
+            .map(|relative| root.join(relative));
 
         Ok(Self {
-            paths: Arc::new(VaultPaths::new(root, arrowhead_dir, attachments_dir)),
+            paths: Arc::new(VaultPaths::new(
+                root,
+                arrowhead_dir,
+                obsidian_dir,
+                attachments_dir,
+            )),
+            settings: Arc::new(settings),
         })
     }
 
     /// Access the resolved vault paths.
     pub fn paths(&self) -> &VaultPaths {
         &self.paths
+    }
+
+    /// Access the loaded Obsidian settings.
+    pub fn settings(&self) -> &VaultSettings {
+        &self.settings
     }
 
     /// Ensure the Arrowhead working directory exists inside the vault.
@@ -129,6 +168,7 @@ impl Vault {
             &self.paths.root,
             Some(&self.paths.arrowhead_dir),
             self.paths.attachments_dir.as_deref(),
+            self.settings.ignored_folders(),
         )
     }
 
@@ -241,12 +281,25 @@ mod tests {
         assert!(note.metadata.is_empty());
         assert!(note.content.contains("# Note With Empty Frontmatter"));
     }
+
+    #[test]
+    fn list_note_ids_respects_ignored_folders() {
+        let vault = build_vault();
+        let ids = vault.list_note_ids().expect("listing succeeds");
+
+        assert!(ids.iter().any(|id| id == "2024-01-15"));
+        assert!(
+            !ids.iter()
+                .any(|id| id.starts_with("Templates") || id.contains("Meeting Template"))
+        );
+    }
 }
 
 fn collect_markdown_files(
     root: &Path,
     arrowhead_dir: Option<&Path>,
     attachments_dir: Option<&Path>,
+    ignored_folders: &[PathBuf],
 ) -> Result<Vec<PathBuf>> {
     let mut stack = vec![root.to_path_buf()];
     let mut files = Vec::new();
@@ -258,6 +311,8 @@ fn collect_markdown_files(
             let entry = entry?;
             let path = entry.path();
             let file_type = entry.file_type()?;
+
+            let relative = path.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
 
             if file_type.is_dir() {
                 if Some(path.as_path()) == arrowhead_dir {
@@ -280,14 +335,17 @@ fn collect_markdown_files(
                     }
                 }
 
+                if is_ignored(relative, ignored_folders) {
+                    continue;
+                }
+
                 stack.push(path);
             } else if file_type.is_file() && is_markdown(&path) {
-                let relative = path
-                    .strip_prefix(root)
-                    .with_context(|| {
-                        format!("failed to compute relative path for {}", path.display())
-                    })?
-                    .to_path_buf();
+                if is_ignored(relative, ignored_folders) {
+                    continue;
+                }
+
+                let relative = relative.to_path_buf();
                 files.push(relative);
             }
         }
@@ -304,6 +362,16 @@ fn is_markdown(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_ignored(relative: &Path, ignored_folders: &[PathBuf]) -> bool {
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+
+    ignored_folders
+        .iter()
+        .any(|ignore| relative.starts_with(ignore))
+}
+
 fn derive_note_id(path: &Path) -> Result<NoteId> {
     let mut without_ext = path.to_path_buf();
     without_ext.set_extension("");
@@ -318,6 +386,83 @@ fn derive_note_id(path: &Path) -> Result<NoteId> {
     }
 
     Ok(id)
+}
+
+#[derive(Debug, Deserialize)]
+struct ObsidianAppConfig {
+    #[serde(rename = "attachmentFolderPath")]
+    attachment_folder_path: Option<String>,
+    #[serde(rename = "userIgnoreFilters")]
+    user_ignore_filters: Option<Vec<String>>,
+}
+
+fn load_obsidian_settings(obsidian_dir: &Path) -> VaultSettings {
+    let mut settings = VaultSettings::default();
+    let app_path = obsidian_dir.join("app.json");
+
+    match fs::read_to_string(&app_path) {
+        Ok(content) => match serde_json::from_str::<ObsidianAppConfig>(&content) {
+            Ok(app) => {
+                if let Some(folder) = app.attachment_folder_path {
+                    if let Some(relative) = normalise_relative_str(&folder) {
+                        settings.attachments_folder = Some(relative);
+                    }
+                }
+
+                if let Some(filters) = app.user_ignore_filters {
+                    settings.ignored_folders = filters
+                        .into_iter()
+                        .filter_map(|filter| normalise_relative_str(&filter))
+                        .collect();
+                    settings.ignored_folders.sort();
+                    settings.ignored_folders.dedup();
+                }
+            }
+            Err(err) => {
+                warn!("failed to parse Obsidian app.json: {}", err);
+            }
+        },
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!("failed to read Obsidian settings: {}", err);
+            }
+        }
+    }
+
+    settings
+}
+
+fn normalise_relative_str(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let trimmed = trimmed.trim_end_matches(|c| c == '/' || c == char::from(b'\\'));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    normalise_relative_path(Path::new(trimmed))
+}
+
+fn normalise_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut cleaned = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => continue,
+            Component::CurDir => continue,
+            Component::ParentDir => continue,
+            Component::Normal(part) => cleaned.push(part),
+        }
+    }
+
+    if cleaned.as_os_str().is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
