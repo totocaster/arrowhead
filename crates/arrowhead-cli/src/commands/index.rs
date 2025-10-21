@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 
 use arrowhead_core::{
-    Vault, VaultConfig,
+    IndexProgressEvent, IndexingStats, Vault, VaultConfig,
     indexer::{Indexer, IndexerConfig},
     sqlite::IndexDatabase,
 };
@@ -14,6 +14,9 @@ use tracing::info;
 
 use super::CommandContext;
 use crate::logging;
+
+#[cfg(feature = "ui")]
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// Parameters for the `index` CLI command.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -72,7 +75,11 @@ pub async fn run(ctx: &CommandContext, command: &IndexCommand) -> Result<()> {
         println!("Indexed note {note_id}");
         info!(note_id = note_id.as_str(), "indexed single note");
     } else {
-        let stats = indexer.index_all().await?;
+        let stats = if command.progress {
+            index_with_progress(&indexer).await?
+        } else {
+            indexer.index_all().await?
+        };
         println!(
             "Indexed {} notes ({} updated, {} skipped, {} errors)",
             stats.total_notes, stats.indexed, stats.skipped, stats.errors
@@ -87,6 +94,46 @@ pub async fn run(ctx: &CommandContext, command: &IndexCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "ui")]
+async fn index_with_progress(indexer: &Indexer) -> Result<IndexingStats> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let progress = Arc::new(ProgressBar::new(0));
+    progress.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let progress_clone = Arc::clone(&progress);
+    let length_set = Arc::new(AtomicBool::new(false));
+    let length_flag = Arc::clone(&length_set);
+    let stats = indexer
+        .index_all_with_observer(|event: IndexProgressEvent| {
+            if !length_flag.swap(true, Ordering::SeqCst) {
+                progress_clone.set_length(event.total);
+            }
+            progress_clone.set_position(event.processed);
+            let message = if event.indexed { "indexed" } else { "skipped" };
+            progress_clone.set_message(format!("{} ({message})", event.note_id));
+        })
+        .await?;
+
+    progress.finish_with_message("Indexing complete");
+    Ok(stats)
+}
+
+#[cfg(not(feature = "ui"))]
+async fn index_with_progress(indexer: &Indexer) -> Result<IndexingStats> {
+    println!(
+        "Progress bar requested, but UI feature is disabled. Running without progress display."
+    );
+    indexer.index_all().await
 }
 
 #[cfg(test)]

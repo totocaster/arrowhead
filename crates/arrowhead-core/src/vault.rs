@@ -13,7 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::Deserialize;
@@ -146,6 +146,35 @@ impl Vault {
     /// Returns the absolute path to a note relative to the vault root.
     pub fn note_path<P: AsRef<Path>>(&self, relative: P) -> PathBuf {
         self.paths.root.join(relative)
+    }
+
+    /// Resolve a note identifier to a relative path inside the vault (without extension).
+    pub fn relative_path_from_id(&self, note_id: &str) -> Result<PathBuf> {
+        normalise_relative_path(Path::new(note_id))
+            .ok_or_else(|| anyhow!("invalid note id: {note_id}"))
+    }
+
+    /// Resolve a note identifier to an absolute path including the `.md` extension.
+    pub fn note_file_path(&self, note_id: &str) -> Result<PathBuf> {
+        let mut relative = self.relative_path_from_id(note_id)?;
+        relative.set_extension("md");
+        Ok(self.note_path(relative))
+    }
+
+    /// Write the supplied metadata/body to the given note identifier, creating parent directories.
+    pub fn write_note(&self, note_id: &str, metadata: &MetadataMap, body: &str) -> Result<()> {
+        let mut relative = self.relative_path_from_id(note_id)?;
+        relative.set_extension("md");
+        let absolute = self.note_path(&relative);
+
+        if let Some(parent) = absolute.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create note directory {}", parent.display()))?;
+        }
+
+        let content = compose_note_content(metadata, body)?;
+        fs::write(&absolute, content)
+            .with_context(|| format!("failed to write note file {}", absolute.display()))
     }
 
     /// List all markdown note identifiers in the vault.
@@ -372,6 +401,34 @@ fn is_ignored(relative: &Path, ignored_folders: &[PathBuf]) -> bool {
         .any(|ignore| relative.starts_with(ignore))
 }
 
+fn compose_note_content(metadata: &MetadataMap, body: &str) -> Result<String> {
+    let mut content = String::new();
+
+    if !metadata.is_empty() {
+        let yaml = metadata_to_yaml(metadata)?;
+        content.push_str("---\n");
+        content.push_str(&yaml);
+        if !yaml.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str("---\n\n");
+    }
+
+    content.push_str(body);
+    Ok(content)
+}
+
+fn metadata_to_yaml(metadata: &MetadataMap) -> Result<String> {
+    let mut mapping = serde_yaml::Mapping::new();
+    for (key, value) in metadata {
+        let yaml_value = serde_yaml::to_value(value.clone())?;
+        mapping.insert(serde_yaml::Value::String(key.clone()), yaml_value);
+    }
+
+    let yaml = serde_yaml::to_string(&mapping)?;
+    Ok(yaml.trim_end().to_string() + "\n")
+}
+
 fn derive_note_id(path: &Path) -> Result<NoteId> {
     let mut without_ext = path.to_path_buf();
     without_ext.set_extension("");
@@ -432,7 +489,7 @@ fn load_obsidian_settings(obsidian_dir: &Path) -> VaultSettings {
     settings
 }
 
-fn normalise_relative_str(value: &str) -> Option<PathBuf> {
+pub(crate) fn normalise_relative_str(value: &str) -> Option<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -446,7 +503,7 @@ fn normalise_relative_str(value: &str) -> Option<PathBuf> {
     normalise_relative_path(Path::new(trimmed))
 }
 
-fn normalise_relative_path(path: &Path) -> Option<PathBuf> {
+pub(crate) fn normalise_relative_path(path: &Path) -> Option<PathBuf> {
     let mut cleaned = PathBuf::new();
 
     for component in path.components() {

@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 async-trait = "0.1.89"
 num_cpus = "1.17.0"
+futures = "0.3.30"
 tracing-appender = "0.2.3"
 
 # CLI dependencies

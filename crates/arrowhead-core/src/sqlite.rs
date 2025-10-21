@@ -91,6 +91,7 @@ impl IndexDatabase {
         &self,
         note: &NoteRecord,
         extraction: &MetadataExtraction,
+        resolved_links: &[(String, Option<String>)],
         indexed_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut conn = self.connection()?;
@@ -138,11 +139,16 @@ impl IndexDatabase {
 
         tx.execute("DELETE FROM note_links WHERE source_id = ?1", [&note.id])
             .context("failed to clear existing note links")?;
-        for link in &extraction.wikilinks {
+        for (link_text, target_id) in resolved_links {
             tx.execute(
                 "INSERT INTO note_links (source_id, target_id, link_text, created_at)
-                 VALUES (?1, NULL, ?2, ?3)",
-                params![&note.id, link, indexed_at.timestamp()],
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &note.id,
+                    target_id.as_deref(),
+                    link_text,
+                    indexed_at.timestamp()
+                ],
             )
             .context("failed to insert note link")?;
         }
@@ -315,7 +321,13 @@ mod tests {
             .extract(&note)
             .expect("extract succeeds");
 
-        db.upsert_note(&note, &extraction, Utc::now())
+        let resolved_links: Vec<(String, Option<String>)> = extraction
+            .wikilinks
+            .iter()
+            .map(|link| (link.clone(), Some(link.clone())))
+            .collect();
+
+        db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
             .expect("upsert succeeds");
 
         let conn = db.connection().expect("connection");
@@ -345,6 +357,15 @@ mod tests {
             )
             .expect("count fts row");
         assert_eq!(fts_count, 1);
+
+        let link_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_links WHERE source_id = ?1 AND target_id IS NOT NULL",
+                [&note.id],
+                |row| row.get(0),
+            )
+            .expect("count links");
+        assert!(link_count >= 1);
     }
 
     #[test]
@@ -357,7 +378,13 @@ mod tests {
             .expect("extract succeeds");
 
         let indexed_at = Utc::now();
-        db.upsert_note(&note, &extraction, indexed_at)
+        let resolved_links: Vec<(String, Option<String>)> = extraction
+            .wikilinks
+            .iter()
+            .map(|link| (link.clone(), Some(link.clone())))
+            .collect();
+
+        db.upsert_note(&note, &extraction, &resolved_links, indexed_at)
             .expect("upsert succeeds");
 
         let state = db

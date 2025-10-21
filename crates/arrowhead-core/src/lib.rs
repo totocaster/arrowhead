@@ -22,5 +22,6 @@ pub mod types;
 pub mod vault;
 
 // Re-export commonly used types for convenience across crates.
+pub use indexer::IndexProgressEvent;
 pub use types::{IndexingStats, MetadataMap, NoteId, NoteRecord, VaultPaths};
 pub use vault::{Vault, VaultConfig, VaultSettings};

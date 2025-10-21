@@ -1,13 +1,19 @@
 //! Indexing orchestration.
 
-use std::sync::Arc;
+use std::{collections::HashSet, path::Path, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
-use tokio::task;
+use futures::{StreamExt, stream::FuturesUnordered};
+use tokio::{sync::Semaphore, task};
 use tracing::{error, info};
 
-use crate::{IndexingStats, Vault, metadata::MetadataExtractor, sqlite::IndexDatabase};
+use crate::{
+    IndexingStats, Vault,
+    metadata::MetadataExtractor,
+    sqlite::IndexDatabase,
+    vault::{normalise_relative_path, normalise_relative_str},
+};
 
 /// Configuration options shared by the indexing pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,24 +55,75 @@ impl Indexer {
 
     /// Runs a full indexing pass across the vault.
     pub async fn index_all(&self) -> Result<IndexingStats> {
+        self.index_all_with_observer(|_| {}).await
+    }
+
+    /// Runs a full indexing pass, invoking `observer` after each processed note.
+    pub async fn index_all_with_observer<F>(&self, mut observer: F) -> Result<IndexingStats>
+    where
+        F: FnMut(IndexProgressEvent),
+    {
         let note_ids = self.vault.list_note_ids()?;
+        let total = note_ids.len() as u64;
+        let note_set: Arc<HashSet<String>> = Arc::new(note_ids.iter().cloned().collect());
+
+        let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
+        let mut tasks = FuturesUnordered::new();
+
+        for note_id in note_ids {
+            let indexer = self.clone();
+            let known = Arc::clone(&note_set);
+            let semaphore = Arc::clone(&semaphore);
+
+            tasks.push(tokio::spawn(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
+                let result = indexer.run_single(note_id.clone(), known).await;
+                Ok::<_, anyhow::Error>((note_id, result))
+            }));
+        }
 
         let mut stats = IndexingStats {
-            total_notes: note_ids.len() as u64,
+            total_notes: total,
             ..IndexingStats::default()
         };
 
-        for note_id in note_ids {
-            match self.run_single(note_id.clone()).await {
+        let mut processed = 0u64;
+        while let Some(result) = tasks.next().await {
+            let (note_id, outcome) = result??;
+            match outcome {
                 Ok(NoteProcessing::Indexed) => {
                     stats.indexed += 1;
+                    processed += 1;
+                    observer(IndexProgressEvent {
+                        note_id,
+                        processed,
+                        total,
+                        indexed: true,
+                    });
                 }
                 Ok(NoteProcessing::Skipped) => {
                     stats.skipped += 1;
+                    processed += 1;
+                    observer(IndexProgressEvent {
+                        note_id,
+                        processed,
+                        total,
+                        indexed: false,
+                    });
                 }
                 Err(err) => {
                     stats.errors += 1;
-                    error!(%note_id, error = ?err, "failed to index note");
+                    processed += 1;
+                    error!(note = %note_id, error = ?err, "failed to index note");
+                    observer(IndexProgressEvent {
+                        note_id,
+                        processed,
+                        total,
+                        indexed: false,
+                    });
                 }
             }
         }
@@ -76,18 +133,23 @@ impl Indexer {
 
     /// Reindexes a single note identified by the given ID.
     pub async fn index_note(&self, note_id: &str) -> Result<()> {
-        self.run_single(note_id.to_string()).await?;
+        let note_set = Arc::new(self.vault.list_note_ids()?.into_iter().collect());
+        self.run_single(note_id.to_string(), note_set).await?;
         Ok(())
     }
 
-    async fn run_single(&self, note_id: String) -> Result<NoteProcessing> {
+    async fn run_single(
+        &self,
+        note_id: String,
+        known_notes: Arc<HashSet<String>>,
+    ) -> Result<NoteProcessing> {
         let indexer = self.clone();
-        task::spawn_blocking(move || indexer.process_note(&note_id))
+        task::spawn_blocking(move || indexer.process_note(&note_id, &known_notes))
             .await
             .context("indexing task panicked")?
     }
 
-    fn process_note(&self, note_id: &str) -> Result<NoteProcessing> {
+    fn process_note(&self, note_id: &str, known_notes: &HashSet<String>) -> Result<NoteProcessing> {
         let note = self
             .vault
             .load_note(note_id)
@@ -107,16 +169,57 @@ impl Indexer {
         }
 
         let extraction = self.metadata.extract(&note)?;
-        self.database.upsert_note(&note, &extraction, Utc::now())?;
+        let resolved_links = resolve_wikilinks(&extraction.wikilinks, known_notes);
+        self.database
+            .upsert_note(&note, &extraction, &resolved_links, Utc::now())?;
         info!(%note_id, "indexed note");
         Ok(NoteProcessing::Indexed)
     }
+}
+
+/// Progress event emitted during indexing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexProgressEvent {
+    /// Identifier of the note that was processed.
+    pub note_id: String,
+    /// Number of notes processed so far (including this event).
+    pub processed: u64,
+    /// Total notes scheduled for the indexing run.
+    pub total: u64,
+    /// Whether the note was reindexed (`true`) or skipped (`false`).
+    pub indexed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoteProcessing {
     Indexed,
     Skipped,
+}
+
+fn resolve_wikilinks(
+    links: &[String],
+    known_notes: &HashSet<String>,
+) -> Vec<(String, Option<String>)> {
+    links
+        .iter()
+        .map(|link| {
+            let normalised = normalise_link(link);
+            let target = normalised.as_ref().and_then(|candidate| {
+                if known_notes.contains(candidate) {
+                    Some(candidate.clone())
+                } else {
+                    None
+                }
+            });
+            (link.clone(), target)
+        })
+        .collect()
+}
+
+fn normalise_link(link: &str) -> Option<String> {
+    normalise_relative_str(link)
+        .or_else(|| normalise_relative_path(Path::new(link)))
+        .map(|path| path.to_string_lossy().replace(char::from(b'\\'), "/"))
 }
 
 #[cfg(test)]
@@ -155,7 +258,10 @@ mod tests {
         let database = temp_db();
         let indexer = Indexer::new(vault, database.clone(), IndexerConfig::default());
 
-        let stats = indexer.index_all().await.expect("index succeeds");
+        let stats = indexer
+            .index_all_with_observer(|_| {})
+            .await
+            .expect("index succeeds");
 
         assert!(stats.indexed > 0);
         assert!(stats.total_notes >= stats.indexed);
@@ -201,5 +307,22 @@ mod tests {
         let after = database.note_state("Photography Equipment").expect("state");
         assert!(after.is_some());
         assert!(after.unwrap().indexed_at >= before.unwrap().indexed_at);
+    }
+
+    #[tokio::test]
+    async fn index_all_reports_progress_events() {
+        let vault = fixture_vault();
+        let database = temp_db();
+        let indexer = Indexer::new(vault, database, IndexerConfig::default());
+
+        let mut events = Vec::new();
+        let stats = indexer
+            .index_all_with_observer(|event| events.push(event))
+            .await
+            .expect("index succeeds");
+
+        assert_eq!(events.len() as u64, stats.total_notes);
+        assert!(events.iter().any(|event| event.indexed));
+        assert_eq!(events.last().unwrap().processed, stats.total_notes);
     }
 }

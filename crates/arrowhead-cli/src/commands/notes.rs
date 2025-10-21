@@ -2,13 +2,14 @@
 
 use std::fs;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use tracing::info;
 
 use super::CommandContext;
 use crate::logging;
-use arrowhead_core::{Vault, VaultConfig};
+use arrowhead_core::{MetadataMap, Vault, VaultConfig};
+use serde_json::Value as JsonValue;
 
 /// CRUD operations for notes.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -133,9 +134,30 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
             }
             Ok(())
         }
-        NoteAction::Create(_) => bail!("note creation not implemented yet"),
-        NoteAction::Update(_) => bail!("note updates not implemented yet"),
-        NoteAction::Delete(_) => bail!("note deletion not implemented yet"),
+        NoteAction::Create(args) => {
+            info!(id = ?args.id, "creating note");
+            create_note(&vault, args)?;
+            println!(
+                "Created note {}",
+                args.id
+                    .clone()
+                    .or_else(|| args.title.clone())
+                    .unwrap_or_else(|| "(generated)".to_string())
+            );
+            Ok(())
+        }
+        NoteAction::Update(args) => {
+            info!(note_id = %args.note_id, "updating note");
+            update_note(&vault, args)?;
+            println!("Updated note {}", args.note_id);
+            Ok(())
+        }
+        NoteAction::Delete(args) => {
+            info!(note_id = %args.note_id, "deleting note");
+            delete_note(&vault, args)?;
+            println!("Deleted note {}", args.note_id);
+            Ok(())
+        }
     }
 }
 
@@ -162,10 +184,167 @@ fn collect_note_list(vault: &Vault, ids_only: bool) -> Result<Vec<(String, Optio
     Ok(results)
 }
 
+fn create_note(vault: &Vault, args: &CreateArgs) -> Result<()> {
+    let note_id = resolve_note_id(args)?;
+
+    if vault.note_file_path(&note_id)?.exists() {
+        bail!("note {note_id} already exists");
+    }
+
+    let mut metadata = MetadataMap::default();
+    if let Some(title) = &args.title {
+        metadata.insert("title".to_string(), JsonValue::String(title.clone()));
+    }
+    if let Some(category) = &args.category {
+        metadata.insert("category".to_string(), JsonValue::String(category.clone()));
+    }
+
+    merge_metadata_json(&mut metadata, &args.metadata)?;
+
+    if metadata.get("title").is_none() {
+        metadata.insert("title".to_string(), JsonValue::String(note_id.clone()));
+    }
+
+    let body = load_content(args.content.as_ref(), args.file.as_ref())?;
+
+    vault.write_note(&note_id, &metadata, &body)?;
+    Ok(())
+}
+
+fn update_note(vault: &Vault, args: &UpdateArgs) -> Result<()> {
+    let note = vault
+        .load_note(&args.note_id)
+        .with_context(|| format!("note {} not found", args.note_id))?;
+
+    let mut metadata = note.metadata.clone();
+
+    if let Some(title) = &args.title {
+        if title.trim().is_empty() {
+            metadata.remove("title");
+        } else {
+            metadata.insert("title".to_string(), JsonValue::String(title.clone()));
+        }
+    }
+
+    merge_metadata_json(&mut metadata, &args.metadata)?;
+
+    let body = if args.content.is_some() || args.file.is_some() {
+        load_content(args.content.as_ref(), args.file.as_ref())?
+    } else {
+        note.content.clone()
+    };
+
+    vault.write_note(&args.note_id, &metadata, &body)?;
+    Ok(())
+}
+
+fn delete_note(vault: &Vault, args: &DeleteArgs) -> Result<()> {
+    if !args.yes {
+        bail!("use --yes to confirm deletion");
+    }
+
+    let path = vault
+        .note_file_path(&args.note_id)
+        .with_context(|| format!("invalid note id {}", args.note_id))?;
+
+    if !path.exists() {
+        bail!("note {} does not exist", args.note_id);
+    }
+
+    fs::remove_file(&path)
+        .with_context(|| format!("failed to delete note file {}", path.display()))?;
+
+    cleanup_empty_dirs(path.parent(), &vault.paths().root)?;
+    Ok(())
+}
+
+fn cleanup_empty_dirs(start: Option<&std::path::Path>, root: &std::path::Path) -> Result<()> {
+    let mut current = match start {
+        Some(path) => path.to_path_buf(),
+        None => return Ok(()),
+    };
+
+    while current.starts_with(root) && current != root {
+        if fs::read_dir(&current)?.next().is_some() {
+            break;
+        }
+        fs::remove_dir(&current)?;
+        if let Some(parent) = current.parent() {
+            current = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_note_id(args: &CreateArgs) -> Result<String> {
+    if let Some(id) = &args.id {
+        return clean_note_id(id);
+    }
+
+    if let Some(title) = &args.title {
+        return clean_note_id(title);
+    }
+
+    Err(anyhow!("note id or title is required"))
+}
+
+fn clean_note_id(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("note id must not be empty"));
+    }
+
+    let without_ext = trimmed.strip_suffix(".md").unwrap_or(trimmed);
+    let candidate = without_ext.trim_matches(|c| c == '/' || c == '\\').trim();
+    if candidate.is_empty() {
+        return Err(anyhow!("note id must not be empty"));
+    }
+
+    Ok(candidate.replace(char::from(b'\\'), "/"))
+}
+
+fn load_content(inline: Option<&String>, file: Option<&String>) -> Result<String> {
+    if let Some(path) = file {
+        return fs::read_to_string(path)
+            .with_context(|| format!("failed to read content file {}", path));
+    }
+
+    Ok(inline.cloned().unwrap_or_default())
+}
+
+fn merge_metadata_json(metadata: &mut MetadataMap, payload: &Option<String>) -> Result<()> {
+    if let Some(raw) = payload {
+        if raw.trim().is_empty() {
+            return Ok(());
+        }
+
+        let value: JsonValue = serde_json::from_str(raw)
+            .with_context(|| "metadata must be a JSON object".to_string())?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("metadata must be a JSON object"))?;
+
+        for (key, value) in object {
+            if value.is_null() {
+                metadata.remove(key);
+            } else {
+                metadata.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    use tempfile::TempDir;
 
     fn fixture_vault() -> Vault {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -203,5 +382,103 @@ mod tests {
             .and_then(|(_, title)| title.clone())
             .expect("title present");
         assert_eq!(photography_title, "Photography Equipment");
+    }
+
+    #[test]
+    fn create_note_writes_frontmatter() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(VaultConfig::new(temp_dir.path().to_path_buf())).expect("vault");
+
+        let args = CreateArgs {
+            id: Some("Notes/Test Note".to_string()),
+            title: Some("Test Note".to_string()),
+            category: Some("testing".to_string()),
+            content: Some("Body content".to_string()),
+            file: None,
+            metadata: Some("{\"status\": \"draft\"}".to_string()),
+        };
+
+        create_note(&vault, &args).expect("create");
+
+        let note_path = vault.note_file_path("Notes/Test Note").expect("path");
+        let written = fs::read_to_string(note_path).expect("read note");
+        assert!(written.starts_with("---\n"));
+        assert!(written.contains("title: Test Note"));
+        assert!(written.contains("category: testing"));
+        assert!(written.contains("status: draft"));
+        assert!(written.contains("Body content"));
+    }
+
+    #[test]
+    fn update_note_merges_metadata() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(VaultConfig::new(temp_dir.path().to_path_buf())).expect("vault");
+
+        let create_args = CreateArgs {
+            id: Some("Note".to_string()),
+            title: Some("Original".to_string()),
+            category: Some("initial".to_string()),
+            content: Some("Original body".to_string()),
+            file: None,
+            metadata: Some("{\"tags\": [\"one\"]}".to_string()),
+        };
+        create_note(&vault, &create_args).expect("create");
+
+        let update_args = UpdateArgs {
+            note_id: "Note".to_string(),
+            content: Some("Updated body".to_string()),
+            file: None,
+            title: Some("Updated".to_string()),
+            metadata: Some("{\"tags\": [\"two\"], \"status\": \"done\"}".to_string()),
+        };
+
+        update_note(&vault, &update_args).expect("update");
+
+        let updated = vault.load_note("Note").expect("load note");
+        assert_eq!(
+            updated
+                .metadata
+                .get("title")
+                .and_then(|value| value.as_str()),
+            Some("Updated")
+        );
+        let tags = updated
+            .metadata
+            .get("tags")
+            .and_then(|value| value.as_array())
+            .expect("tags array");
+        assert_eq!(tags, &vec![JsonValue::String("two".to_string())]);
+        assert_eq!(
+            updated
+                .metadata
+                .get("status")
+                .and_then(|value| value.as_str()),
+            Some("done")
+        );
+        assert!(updated.content.contains("Updated body"));
+    }
+
+    #[test]
+    fn delete_note_removes_file() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(VaultConfig::new(temp_dir.path().to_path_buf())).expect("vault");
+
+        let args = CreateArgs {
+            id: Some("Disposable".to_string()),
+            title: None,
+            category: None,
+            content: Some("Temporary".to_string()),
+            file: None,
+            metadata: None,
+        };
+        create_note(&vault, &args).expect("create");
+
+        let delete_args = DeleteArgs {
+            note_id: "Disposable".to_string(),
+            yes: true,
+        };
+        delete_note(&vault, &delete_args).expect("delete");
+
+        assert!(!vault.note_file_path("Disposable").unwrap().exists());
     }
 }

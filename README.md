@@ -2,7 +2,7 @@
 
 **Obsidian vault indexing and search with MCP integration**
 
-Arrowhead is a cross-platform CLI tool that provides powerful indexing and search capabilities for Obsidian vaults, with AI integration via the Model Context Protocol (MCP).
+Arrowhead is a cross-platform CLI tool that provides Obsidian-aware indexing, note management, and (soon) search capabilities for Obsidian vaults, with AI integration via the Model Context Protocol (MCP).
 
 ## Name Origin
 
@@ -10,8 +10,15 @@ Arrowhead references the precision obsidian tools used by prehistoric humans for
 
 ## Features
 
+### Available today
+
 - **Smart Indexing**: On-demand indexing with staleness detection (only reindex changed notes)
 - **Obsidian-Aware**: Automatically honours `.obsidian/app.json` settings (ignored folders, attachments)
+- **Notes CLI**: `arrowhead notes read/list/create/update/delete` manages Markdown notes directly
+- **Progress & Logging**: `arrowhead index --progress` shows live progress, logs go to `.arrowhead/logs/arrowhead.log`
+
+### Coming soon
+
 - **Full-Text Search**: SQLite FTS5-based keyword search with field:value syntax
 - **Semantic Search**: Vector embeddings for conceptual similarity search
 - **Hybrid Search**: Combined FTS + semantic search for best results

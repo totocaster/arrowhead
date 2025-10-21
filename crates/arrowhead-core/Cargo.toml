@@ -21,6 +21,7 @@ serde_yaml.workspace = true
 # Async runtime
 tokio.workspace = true
 async-trait.workspace = true
+futures.workspace = true
 
 # Logging
 tracing.workspace = true
