@@ -20,19 +20,27 @@ pub struct CommandContext {
     pub config: AppConfig,
     /// Optional explicit config path supplied by the user.
     pub config_path: Option<PathBuf>,
+    /// CLI verbosity level passed via `-v`/`--verbose`.
+    pub verbosity: u8,
 }
 
 impl CommandContext {
     /// Construct a new context.
-    pub fn new(config: AppConfig, config_path: Option<PathBuf>) -> Self {
+    pub fn new(config: AppConfig, config_path: Option<PathBuf>, verbosity: u8) -> Self {
         Self {
             config,
             config_path,
+            verbosity,
         }
     }
 
     /// Save the configuration if the command mutated it.
     pub fn persist(&self) -> Result<()> {
         self.config.save(self.config_path.clone())
+    }
+
+    /// Access the CLI verbosity level.
+    pub fn verbosity(&self) -> u8 {
+        self.verbosity
     }
 }

@@ -3,36 +3,35 @@
 ## Snapshot
 
 - **Toolchain:** Rust 1.85 (2024 edition) pinned via `rust-toolchain.toml`.
-- **Workspace health:** `cargo check` / `cargo test` pass with the new scaffolding.
-- **Crates:** `arrowhead-core`, `arrowhead-cli`, and `arrowhead-mcp` compile with fully typed modules returning informative `todo` errors.
-- **CLI:** Command surface (`init`, `index`, `search`, `notes`, `graph`, `vault`) parses successfully and persists configuration via `AppConfig`.
+- **Workspace health:** `cargo fmt`, `cargo check`, and `cargo test` all pass.
+- **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
+- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically.
+- **CLI:** `init`, `index`, and `notes read/list` execute end-to-end; logging writes to `.arrowhead/logs/arrowhead.log` with multi-day retention.
+- **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), feature development guide established, integration fixtures ready.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), API/MCP reference stubs added, integration test harness directories created.
 - **Vectors:** LanceDB wiring lives behind the optional `vector-lancedb` feature; disabled until semantic search sprint begins.
 
-## Completed Work (Phase 0)
+## Completed Work (Phase 0-1)
 
 - Workspace upgrade to modern Rust/edition with reproducible toolchain.
 - Dependency audit and alignment to current stable releases.
 - Replacement of `todo!()` placeholders with structured scaffolding across core modules.
 - CLI architecture (commands module tree, config loader, tracing bootstrap).
 - Documentation refresh and repository structure parity with the specification.
+- Phase 1 foundations: vault metadata extraction, SQLite schema + migrations, indexing orchestration with mtime skips, CLI command wiring, logging, and regression tests.
 
 ## Next Focus Areas
 
-1. **Vault & Metadata Implementation (Phase 1)**
-   - Flesh out `Vault`, `MetadataExtractor`, and associated types.
-   - Start wiring SQLite schemas (notes, metadata, FTS tables).
-   - Add unit tests using `tests/fixtures/test-vault`.
+1. **Indexer Enhancements (Phase 1 wrap-up)**
+   - Add progress reporting / batching and parallelism tuning hooks.
+   - Finalise schema migration/versioning strategy and document upgrade story.
+   - Persist wiki link resolution/unresolved state during indexing.
 
-2. **Indexer Foundations (Phase 1 → Phase 2)**
-   - Implement staleness checks, note traversal, and progress reporting.
-   - Define schema migrations/versioning approach.
-
-3. **Search & Embeddings (Phase 2)**
+2. **Search & Embeddings (Phase 2)**
    - Enable `vector-lancedb` feature when ready, confirm MSRV remains acceptable.
    - Implement embedding generation via `fastembed`, persistence via LanceDB, and hybrid search strategy.
 
-4. **MCP Surface (Phase 4-5)**
+3. **MCP Surface (Phase 4-5)**
    - Finalise JSON-RPC types and tool schemas.
    - Implement stdio transport, then HTTP transport with bearer auth.
 

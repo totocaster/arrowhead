@@ -9,6 +9,7 @@ use clap::{ArgAction, Parser, Subcommand};
 
 mod commands;
 mod config;
+mod logging;
 
 use commands::{CommandContext, graph, index, init, notes, search, vault};
 use config::AppConfig;
@@ -50,17 +51,7 @@ enum Commands {
 }
 
 fn init_tracing(verbosity: u8) {
-    let level = match verbosity {
-        0 => tracing::Level::INFO,
-        1 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
-    };
-
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .compact()
-        .try_init();
+    logging::init_base_tracing(verbosity);
 }
 
 #[tokio::main]
@@ -74,7 +65,7 @@ async fn main() -> Result<()> {
         config.vault = Some(vault);
     }
 
-    let mut ctx = CommandContext::new(config, cli.config.clone());
+    let mut ctx = CommandContext::new(config, cli.config.clone(), cli.verbose);
 
     match cli.command {
         Commands::Init(command) => {

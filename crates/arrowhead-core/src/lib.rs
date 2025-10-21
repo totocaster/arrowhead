@@ -17,6 +17,7 @@ pub mod graph;
 pub mod indexer;
 pub mod metadata;
 pub mod search;
+pub mod sqlite;
 pub mod types;
 pub mod vault;
 

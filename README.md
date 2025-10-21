@@ -22,7 +22,7 @@ Arrowhead references the precision obsidian tools used by prehistoric humans for
 
 🚧 **Under active development** - This is a complete rewrite of Synapse from Swift to Rust.
 
-Current phase: **Scaffolding and planning**
+Current phase: **Phase 1 — Core foundation (vault/indexer)**
 
 See [docs/predev_synapse_rust_rewrite.md](docs/predev_synapse_rust_rewrite.md) for the complete specification.
 
@@ -40,7 +40,7 @@ arrowhead/
 
 ## Technology Stack
 
-- **Language**: Rust 1.75+ (2024 edition preferred)
+- **Language**: Rust 1.85+ (2024 edition)
 - **CLI**: clap 4.5+
 - **Database**: SQLite (rusqlite) with FTS5
 - **Vectors**: fastembed (ONNX embeddings)
@@ -56,8 +56,11 @@ cargo build
 # Build release version
 cargo build --release
 
+# Install the CLI (optional)
+make install PREFIX=$HOME/.local
+
 # Run CLI
-cargo run --bin arrowhead -- --help
+arrowhead --help
 
 # Run tests
 cargo test

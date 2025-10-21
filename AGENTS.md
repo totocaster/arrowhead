@@ -36,6 +36,7 @@
 
 ## Quick Reference
 - Spec: `docs/predev_synapse_rust_rewrite.md`
+- Feature guide: `docs/feature_development_guide.md`
 - Status: `docs/dev_status.md`
 - API overview: `docs/api.md`
 - MCP notes: `docs/mcp_protocol.md`

@@ -1,9 +1,14 @@
 //! `arrowhead notes` command family.
 
-use anyhow::{Result, bail};
+use std::fs;
+
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
+use tracing::info;
 
 use super::CommandContext;
+use crate::logging;
+use arrowhead_core::{Vault, VaultConfig};
 
 /// CRUD operations for notes.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -97,7 +102,106 @@ pub struct DeleteArgs {
 
 /// Execute the requested notes command.
 pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
-    let _ = ctx;
-    let _ = command;
-    bail!("notes command not implemented yet")
+    let vault_path = ctx
+        .config
+        .vault
+        .clone()
+        .context("no vault configured. Provide --vault or run `arrowhead init`.")?;
+
+    let vault = Vault::new(VaultConfig::new(vault_path))?;
+    vault.ensure_arrowhead_dirs()?;
+
+    let logs_dir = vault.paths().logs_dir();
+    let _logging_guard = logging::scoped_file_logging(&logs_dir, ctx.verbosity())?;
+
+    match &command.action {
+        NoteAction::Read(args) => {
+            info!(note_id = %args.note_id, "reading note contents");
+            let content = read_note_raw(&vault, &args.note_id)?;
+            print!("{content}");
+            Ok(())
+        }
+        NoteAction::List(args) => {
+            info!(ids_only = args.ids_only, "listing notes");
+            let items = collect_note_list(&vault, args.ids_only)?;
+            for (id, title) in items {
+                if let Some(title) = title {
+                    println!("{id}\t{title}");
+                } else {
+                    println!("{id}");
+                }
+            }
+            Ok(())
+        }
+        NoteAction::Create(_) => bail!("note creation not implemented yet"),
+        NoteAction::Update(_) => bail!("note updates not implemented yet"),
+        NoteAction::Delete(_) => bail!("note deletion not implemented yet"),
+    }
+}
+
+fn read_note_raw(vault: &Vault, note_id: &str) -> Result<String> {
+    let note = vault
+        .load_note(note_id)
+        .with_context(|| format!("note {note_id} not found"))?;
+    let path = vault.note_path(&note.relative_path);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read note file {}", path.display()))?;
+    Ok(content)
+}
+
+fn collect_note_list(vault: &Vault, ids_only: bool) -> Result<Vec<(String, Option<String>)>> {
+    let mut results = Vec::new();
+    for note_id in vault.list_note_ids()? {
+        if ids_only {
+            results.push((note_id, None));
+        } else {
+            let note = vault.load_note(&note_id)?;
+            results.push((note_id, note.title.clone()));
+        }
+    }
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_vault() -> Vault {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("fixtures")
+            .join("test-vault");
+        Vault::new(VaultConfig::new(root)).expect("fixture vault initialises")
+    }
+
+    #[test]
+    fn read_note_returns_complete_content() {
+        let vault = fixture_vault();
+        let content = read_note_raw(&vault, "2024-01-15").expect("read note");
+        assert!(content.starts_with("---"));
+        assert!(content.contains("# January 15, 2024"));
+    }
+
+    #[test]
+    fn list_ids_only_returns_identifiers() {
+        let vault = fixture_vault();
+        let entries = collect_note_list(&vault, true).expect("list notes");
+        assert!(entries.iter().all(|(_, title)| title.is_none()));
+        assert!(entries.iter().any(|(id, _)| id == "2024-01-15"));
+    }
+
+    #[test]
+    fn list_with_titles_includes_note_titles() {
+        let vault = fixture_vault();
+        let entries = collect_note_list(&vault, false).expect("list notes");
+        let photography_title = entries
+            .iter()
+            .find(|(id, _)| id == "Photography Equipment")
+            .and_then(|(_, title)| title.clone())
+            .expect("title present");
+        assert_eq!(photography_title, "Photography Equipment");
+    }
 }

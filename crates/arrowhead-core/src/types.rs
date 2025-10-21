@@ -83,4 +83,9 @@ impl VaultPaths {
             attachments_dir,
         }
     }
+
+    /// Directory used for storing log files.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.arrowhead_dir.join("logs")
+    }
 }
