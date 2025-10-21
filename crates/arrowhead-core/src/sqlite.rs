@@ -1,6 +1,6 @@
 //! SQLite persistence layer for Arrowhead.
 
-use std::{fs, path::Path, time::Duration};
+use std::{collections::HashMap, fs, path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -8,8 +8,12 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
+use tracing::info;
 
 use crate::{MetadataMap, NoteRecord, metadata::MetadataExtraction};
+
+/// Current schema version for the Arrowhead index database.
+const INDEX_SCHEMA_VERSION: i32 = 2;
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +39,28 @@ impl IndexDatabase {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create database directory {}", parent.display())
             })?;
+        }
+
+        if path.exists() {
+            let conn = Connection::open(&path).with_context(|| {
+                format!("failed to inspect existing database {}", path.display())
+            })?;
+            let stored_version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .context("failed to read SQLite user_version pragma")?;
+
+            if stored_version != INDEX_SCHEMA_VERSION {
+                info!(
+                    path = %path.display(),
+                    stored_version,
+                    expected_version = INDEX_SCHEMA_VERSION,
+                    "rebuilding index database due to schema version mismatch"
+                );
+                drop(conn);
+                fs::remove_file(&path).with_context(|| {
+                    format!("failed to remove incompatible database {}", path.display())
+                })?;
+            }
         }
 
         let manager = SqliteConnectionManager::file(&path);
@@ -130,10 +156,11 @@ impl IndexDatabase {
 
         tx.execute("DELETE FROM notes_fts WHERE id = ?1", [&note.id])
             .context("failed to remove stale FTS row")?;
+        let fts_content = format_content_for_fts(note);
         let fts_metadata = format_metadata_for_fts(note, &extraction.metadata);
         tx.execute(
             "INSERT INTO notes_fts (id, content, metadata) VALUES (?1, ?2, ?3)",
-            params![&note.id, &note.content, fts_metadata],
+            params![&note.id, fts_content, fts_metadata],
         )
         .context("failed to insert FTS row")?;
 
@@ -154,6 +181,80 @@ impl IndexDatabase {
         }
 
         tx.commit().context("failed to commit indexing transaction")
+    }
+
+    /// Execute a full-text search query against the FTS index.
+    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsMatch>> {
+        let limit = limit.max(1) as i64;
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.title, n.relative_path, bm25(notes_fts) AS rank,
+                    snippet(notes_fts, 1, '[[', ']]', '...', 20) AS snippet
+             FROM notes_fts
+             JOIN notes n ON notes_fts.id = n.id
+             WHERE notes_fts MATCH ?1
+             ORDER BY rank ASC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![query, limit], |row| {
+            let snippet: Option<String> = row.get(4)?;
+            Ok(FtsMatch {
+                note_id: row.get(0)?,
+                title: row.get(1)?,
+                relative_path: row.get(2)?,
+                rank: row.get(3)?,
+                snippet: snippet.filter(|value| !value.trim().is_empty()),
+            })
+        })?;
+
+        let mut matches = Vec::new();
+        for row in rows {
+            matches.push(row?);
+        }
+
+        Ok(matches)
+    }
+
+    /// Load metadata maps for a collection of note identifiers.
+    pub fn metadata_for_notes(&self, note_ids: &[String]) -> Result<HashMap<String, MetadataMap>> {
+        let mut result: HashMap<String, MetadataMap> = HashMap::new();
+        if note_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let conn = self.connection()?;
+        let placeholders = std::iter::repeat("?")
+            .take(note_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT note_id, key, value FROM metadata WHERE note_id IN ({})",
+            placeholders
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(note_ids.iter().map(|id| id.as_str())),
+            |row| {
+                let note_id: String = row.get(0)?;
+                let key: String = row.get(1)?;
+                let raw_value: String = row.get(2)?;
+                Ok((note_id, key, raw_value))
+            },
+        )?;
+
+        for row in rows {
+            let (note_id, key, raw_value) = row?;
+            let value: Value = serde_json::from_str(&raw_value).with_context(|| {
+                format!("failed to deserialize metadata value for {note_id}:{key}")
+            })?;
+            result
+                .entry(note_id)
+                .or_insert_with(MetadataMap::default)
+                .insert(key, value);
+        }
+
+        Ok(result)
     }
 }
 
@@ -206,11 +307,30 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             id UNINDEXED,
             content,
             metadata,
-            tokenize = 'unicode61'
+            tokenize = 'porter unicode61',
+            columnsize = 0
         );
         "#,
     )
-    .context("failed to apply schema migrations")
+    .context("failed to apply schema migrations")?;
+
+    conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
+        .context("failed to set schema version")
+}
+
+/// Result row produced by the FTS search query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FtsMatch {
+    /// Identifier for the note.
+    pub note_id: String,
+    /// Optional note title.
+    pub title: Option<String>,
+    /// Relative path on disk.
+    pub relative_path: String,
+    /// BM25 rank (lower is better).
+    pub rank: f64,
+    /// Highlighted content snippet.
+    pub snippet: Option<String>,
 }
 
 fn from_micros(micros: i64) -> Result<DateTime<Utc>> {
@@ -221,13 +341,26 @@ fn from_micros(micros: i64) -> Result<DateTime<Utc>> {
         .context("invalid timestamp stored in database")
 }
 
+fn format_content_for_fts(note: &NoteRecord) -> String {
+    let mut segments = Vec::new();
+    segments.push(note.id.clone());
+
+    if let Some(title) = &note.title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed.to_string());
+        }
+    }
+
+    segments.push(note.content.clone());
+    segments.join("\n\n")
+}
+
 fn format_metadata_for_fts(note: &NoteRecord, metadata: &MetadataMap) -> String {
     let mut parts = Vec::new();
 
     if let Some(title) = &note.title {
-        if !title.trim().is_empty() {
-            parts.push(format!("title:{}", title.trim()));
-        }
+        push_metadata_tokens(&mut parts, "title", title);
     }
 
     for (key, value) in metadata {
@@ -240,25 +373,37 @@ fn format_metadata_for_fts(note: &NoteRecord, metadata: &MetadataMap) -> String 
 fn append_metadata_value(parts: &mut Vec<String>, key: &str, value: &Value) {
     match value {
         Value::Null => {}
-        Value::Bool(bool_value) => parts.push(format!("{key}:{bool_value}")),
-        Value::Number(number) => parts.push(format!("{key}:{number}")),
-        Value::String(string) => {
-            let trimmed = string.trim();
-            if !trimmed.is_empty() {
-                parts.push(format!("{key}:{trimmed}"));
-            }
+        Value::Bool(bool_value) => {
+            let token = if *bool_value { "true" } else { "false" };
+            push_metadata_tokens(parts, key, token);
         }
+        Value::Number(number) => push_metadata_tokens(parts, key, &number.to_string()),
+        Value::String(string) => push_metadata_tokens(parts, key, string),
         Value::Array(items) => {
             for item in items {
                 append_metadata_value(parts, key, item);
             }
         }
-        Value::Object(_) => {
+        Value::Object(map) => {
             if let Ok(serialised) = serde_json::to_string(value) {
-                parts.push(format!("{key}:{serialised}"));
+                push_metadata_tokens(parts, key, &serialised);
+            }
+            for (nested_key, nested_value) in map {
+                let nested = format!("{key}.{}", nested_key);
+                append_metadata_value(parts, &nested, nested_value);
             }
         }
     }
+}
+
+fn push_metadata_tokens(parts: &mut Vec<String>, key: &str, raw_value: &str) {
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    parts.push(format!("{key}:{trimmed}"));
+    parts.push(trimmed.to_string());
 }
 
 #[cfg(test)]
@@ -400,5 +545,96 @@ mod tests {
             state.indexed_at.timestamp_micros(),
             indexed_at.timestamp_micros()
         );
+    }
+
+    #[test]
+    fn rebuilds_database_when_schema_version_changes() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+
+        {
+            let db = IndexDatabase::open(&db_path).expect("database opens");
+            let note = load_note("Photography Equipment");
+            let extraction = MetadataExtractor::new()
+                .extract(&note)
+                .expect("extract succeeds");
+            let resolved_links: Vec<(String, Option<String>)> = extraction
+                .wikilinks
+                .iter()
+                .map(|link| (link.clone(), Some(link.clone())))
+                .collect();
+            db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
+                .expect("upsert succeeds");
+        }
+
+        {
+            let conn = Connection::open(&db_path).expect("open raw connection");
+            conn.pragma_update(None, "user_version", 999)
+                .expect("set bogus version");
+        }
+
+        let db = IndexDatabase::open(&db_path).expect("database rebuilds");
+        let conn = db.connection().expect("connection available");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(version, INDEX_SCHEMA_VERSION);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .expect("count notes");
+        assert_eq!(count, 0, "incompatible database should be cleared");
+    }
+
+    #[test]
+    fn metadata_for_notes_returns_expected_fields() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let note = load_note("Photography Equipment");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract succeeds");
+        let resolved_links: Vec<(String, Option<String>)> = extraction
+            .wikilinks
+            .iter()
+            .map(|link| (link.clone(), Some(link.clone())))
+            .collect();
+        db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
+            .expect("upsert succeeds");
+
+        let metadata = db
+            .metadata_for_notes(&[note.id.clone()])
+            .expect("metadata query succeeds");
+        let map = metadata.get(&note.id).expect("metadata present");
+        assert_eq!(
+            map.get("category").and_then(|value| value.as_str()),
+            Some("reference")
+        );
+        assert!(map.get("tags").is_some());
+    }
+
+    #[test]
+    fn search_fts_returns_ranked_results() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let note = load_note("Photography Equipment");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract succeeds");
+        let resolved_links: Vec<(String, Option<String>)> = extraction
+            .wikilinks
+            .iter()
+            .map(|link| (link.clone(), Some(link.clone())))
+            .collect();
+        db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
+            .expect("upsert succeeds");
+
+        let matches = db
+            .search_fts("metadata:\"category:reference\"", 5)
+            .expect("fts search succeeds");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].note_id, note.id);
+        assert!(matches[0].rank.is_finite());
+        assert!(matches[0].snippet.is_some());
     }
 }

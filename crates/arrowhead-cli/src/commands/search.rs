@@ -1,7 +1,20 @@
 //! `arrowhead search` subcommands.
 
-use anyhow::{Result, bail};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
+use serde_json::json;
+use tracing::info;
+
+use arrowhead_core::IndexingStats;
+use arrowhead_core::{
+    SearchConfig, SearchResult, SearchService, Vault, VaultConfig,
+    indexer::{Indexer, IndexerConfig},
+    sqlite::IndexDatabase,
+};
+
+use crate::logging;
 
 use super::CommandContext;
 
@@ -39,7 +52,168 @@ pub struct QueryArgs {
 
 /// Dispatch search execution.
 pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
-    let _ = ctx;
-    let _ = command;
-    bail!("search command not implemented yet")
+    let vault_path = ctx
+        .config
+        .vault
+        .clone()
+        .context("no vault configured. Provide --vault or run `arrowhead init`.")?;
+
+    let vault = Arc::new(Vault::new(VaultConfig::new(vault_path.clone()))?);
+    vault.ensure_arrowhead_dirs()?;
+    let db_path = vault.paths().arrowhead_dir.join("index.db");
+    let database = Arc::new(IndexDatabase::open(&db_path)?);
+
+    let logs_dir = vault.paths().logs_dir();
+    let _logging_guard = logging::scoped_file_logging(&logs_dir, ctx.verbosity())?;
+
+    let stats = ensure_index_fresh(Arc::clone(&vault), Arc::clone(&database)).await?;
+    info!(
+        indexed = stats.indexed,
+        skipped = stats.skipped,
+        errors = stats.errors,
+        "ensured index before search"
+    );
+
+    let service = SearchService::new(database, SearchConfig::default());
+
+    match &command.mode {
+        SearchMode::Fts(args) => {
+            info!(query = args.query.as_str(), limit = ?args.limit, "executing FTS search");
+            let results = execute_fts_search(&service, args).await?;
+            render_results(&results, args.json)?;
+            Ok(())
+        }
+        SearchMode::Semantic(_) | SearchMode::Hybrid(_) => {
+            bail!("semantic and hybrid search are not implemented yet")
+        }
+    }
+}
+
+async fn execute_fts_search(
+    service: &SearchService,
+    args: &QueryArgs,
+) -> Result<Vec<SearchResult>> {
+    service
+        .search_fts(&args.query, args.limit)
+        .await
+        .context("failed to execute FTS search")
+}
+
+async fn ensure_index_fresh(
+    vault: Arc<Vault>,
+    database: Arc<IndexDatabase>,
+) -> Result<IndexingStats> {
+    let indexer = Indexer::new(vault, database, IndexerConfig::default());
+    indexer.index_all().await
+}
+
+fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
+    if json_output {
+        let payload: Vec<_> = results
+            .iter()
+            .map(|result| {
+                json!({
+                    "note_id": result.note_id,
+                    "title": result.title,
+                    "score": result.score,
+                    "bm25": result.bm25,
+                    "preview": result.preview,
+                    "metadata": result.metadata,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if results.is_empty() {
+        println!("No results found.");
+        return Ok(());
+    }
+
+    for result in results {
+        let title = result
+            .title
+            .as_deref()
+            .or_else(|| {
+                result
+                    .metadata
+                    .get("title")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or("-");
+        println!(
+            "{}\t{:.3}\t{:.2}\t{}",
+            result.note_id, result.score, result.bm25, title
+        );
+        if let Some(preview) = &result.preview {
+            println!("  {}", preview.trim());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, sync::Arc};
+
+    use arrowhead_core::sqlite::IndexDatabase;
+    use tempfile::TempDir;
+
+    use crate::commands::CommandContext;
+    use crate::config::AppConfig;
+
+    fn write_note(path: &std::path::Path) {
+        fs::write(
+            path,
+            "---\ntitle: Sample Note\ncategory: reference\ntags: [rust, testing]\n---\n\nRust testing fundamentals with SQLite.\n",
+        )
+        .expect("write note");
+    }
+
+    #[tokio::test]
+    async fn fts_search_returns_results() {
+        let vault_dir = TempDir::new().expect("vault");
+        let note_path = vault_dir.path().join("Sample.md");
+        write_note(&note_path);
+
+        let ctx = CommandContext::new(
+            AppConfig {
+                vault: Some(vault_dir.path().to_path_buf()),
+                ..AppConfig::default()
+            },
+            None,
+            0,
+        );
+
+        let query = QueryArgs {
+            query: "category:reference".to_string(),
+            limit: Some(5),
+            json: false,
+        };
+
+        let database = Arc::new(
+            IndexDatabase::open(vault_dir.path().join(".arrowhead").join("index.db"))
+                .expect("database opens"),
+        );
+        let vault =
+            Arc::new(Vault::new(VaultConfig::new(vault_dir.path().to_path_buf())).expect("vault"));
+        vault.ensure_arrowhead_dirs().expect("dirs");
+        ensure_index_fresh(Arc::clone(&vault), Arc::clone(&database))
+            .await
+            .expect("indexing succeeds");
+        let service = SearchService::new(database, SearchConfig::default());
+        let results = execute_fts_search(&service, &query)
+            .await
+            .expect("fts query succeeds");
+        assert!(!results.is_empty());
+
+        let command = SearchCommand {
+            mode: SearchMode::Fts(query),
+        };
+
+        run(&ctx, &command).await.expect("fts search executes");
+    }
 }

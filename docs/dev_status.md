@@ -8,6 +8,7 @@
 - **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically and respecting Obsidian ignore filters.
 - **Vault settings:** `.obsidian/app.json` is parsed for attachments and user ignore filters so templates stay out of the index.
 - **CLI:** `init`, `index`, and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/arrowhead.log` with multi-day retention.
+- **Search:** `arrowhead search fts` executes against SQLite FTS5 with `field:value` and boolean syntax, stemming (`porter`) enabled, richer relevance scores, cleaner snippets, and self-refreshing the index beforehand.
 - **CI:** GitHub Actions workflow (`CI`) runs on push/PR/workflow_dispatch, enforcing fmt, clippy, check, and test across the workspace.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), feature development guide established, integration fixtures ready.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), API/MCP reference stubs added, integration test harness directories created.
@@ -21,6 +22,8 @@
 - CLI architecture (commands module tree, config loader, tracing bootstrap).
 - Documentation refresh and repository structure parity with the specification.
 - Phase 1 foundations: vault metadata extraction, SQLite schema + migrations, indexing orchestration with mtime skips, CLI command wiring, logging, and regression tests.
+- Automatic schema-version detection for the SQLite index: incompatible databases are discarded and rebuilt to keep migrations unnecessary.
+- FTS search pipeline (Synapse-style query rewriting, porter tokenization, metadata/value dual-token indexing, revamped ranking/snippets) with comprehensive unit and integration coverage, including automatic index refresh when running searches.
 
 ## Next Focus Areas
 
@@ -30,8 +33,8 @@
    - Persist wiki link resolution/unresolved state during indexing.
 
 2. **Search & Embeddings (Phase 2)**
-   - Enable `vector-lancedb` feature when ready, confirm MSRV remains acceptable.
-   - Implement embedding generation via `fastembed`, persistence via LanceDB, and hybrid search strategy.
+   - Layer semantic search: embedding generation via `fastembed`, LanceDB persistence, hybrid scoring.
+   - Expand CLI with `semantic`/`hybrid` modes once vector pipeline lands.
 
 3. **MCP Surface (Phase 4-5)**
    - Finalise JSON-RPC types and tool schemas.
