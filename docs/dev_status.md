@@ -23,28 +23,32 @@
 - Documentation refresh and repository structure parity with the specification.
 - Phase 1 foundations: vault metadata extraction, SQLite schema + migrations, indexing orchestration with mtime skips, CLI command wiring, logging, and regression tests.
 - Automatic schema-version detection for the SQLite index: incompatible databases are discarded and rebuilt to keep migrations unnecessary.
+- Indexer progress instrumentation landed (batching hooks, observer events, CLI progress bar) so long-running reindexes surface user feedback out of the box.
 - FTS search pipeline (Synapse-style query rewriting, porter tokenization, metadata/value dual-token indexing, revamped ranking/snippets) with comprehensive unit and integration coverage, including automatic index refresh when running searches.
 
 ## Next Focus Areas
 
-1. **Indexer Enhancements (Phase 1 wrap-up)**
-   - Add progress reporting / batching and parallelism tuning hooks.
-   - Finalise schema migration/versioning strategy and document upgrade story.
-   - Persist wiki link resolution/unresolved state during indexing.
+1. **Phase 2 Prep — Embedding Infrastructure**
+   - Finalise model tier presets (`fast`/`good`/`better`), source ONNX assets from Hugging Face with licensing checks, and persist selection under `.arrowhead/config`.
+   - Implement authenticated/unauthenticated download + caching flow for embedding models, including progress reporting and checksum validation.
+   - Confirm LanceDB's current MSRV and bump the workspace toolchain as needed before enabling the `vector-lancedb` feature.
 
-2. **Search & Embeddings (Phase 2)**
+2. **Search & Embeddings (Phase 2 Execution)**
    - Layer semantic search: embedding generation via `fastembed`, LanceDB persistence, hybrid scoring.
    - Expand CLI with `semantic`/`hybrid` modes once vector pipeline lands.
 
-3. **MCP Surface (Phase 4-5)**
+3. **Graph Pipeline (Phase 3)**
+   - Defer WikiLink resolution persistence to the upcoming graph implementation; schedule planning session ahead of Phase 3 kickoff.
+
+4. **MCP Surface (Phase 4-5)**
    - Finalise JSON-RPC types and tool schemas.
    - Implement stdio transport, then HTTP transport with bearer auth.
 
 ## Open Decisions / Risks
 
-- **Vector MSRV:** Monitor LanceDB releases; enabling additional features may require Rust ≥1.86.
-- **Model distribution:** Need decision on embedding model delivery (bundle vs. download vs. local path).
-- **Schema migrations:** Determine approach for evolving SQLite schema once Phase 1 data structures land.
+- **Vector MSRV:** Track LanceDB's requirements; we are comfortable bumping to the latest stable Rust once we confirm the need.
+- **Model distribution:** Implement Hugging Face-backed downloads with clear licensing documentation and opt-in presets.
+- **Schema migrations:** Continue relying on drop-and-reindex for incompatible schemas; document any future scenarios that require persistent migrations.
 - **Concurrent access:** Clarify whether multi-process vault access needs to be supported in v1.
 
 ## Tracking
