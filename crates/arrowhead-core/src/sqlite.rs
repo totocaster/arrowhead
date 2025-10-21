@@ -162,7 +162,7 @@ fn init_connection(conn: &Connection) -> Result<()> {
         .context("failed to set journal_mode")?;
     conn.pragma_update(None, "synchronous", &"NORMAL")
         .context("failed to set synchronous")?;
-    conn.pragma_update(None, "foreign_keys", &true)
+    conn.pragma_update(None, "foreign_keys", true)
         .context("failed to enable foreign keys")?;
     conn.busy_timeout(Duration::from_secs(5))
         .context("failed to set busy_timeout")?;

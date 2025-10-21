@@ -206,7 +206,7 @@ impl Vault {
         let relative_path = self
             .list_markdown_paths()?
             .into_iter()
-            .find(|path| derive_note_id(path).map_or(false, |id| id == note_id))
+            .find(|path| derive_note_id(path).is_ok_and(|id| id == note_id))
             .with_context(|| format!("note {note_id} not found in vault"))?;
 
         let absolute_path = self.note_path(&relative_path);
