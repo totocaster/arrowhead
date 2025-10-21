@@ -62,8 +62,10 @@ pub async fn run(ctx: &CommandContext, command: &IndexCommand) -> Result<()> {
         info!(ignored = ?settings.ignored_folders(), "applying ignore filters");
     }
 
-    let mut config = IndexerConfig::default();
-    config.force = command.force;
+    let mut config = IndexerConfig {
+        force: command.force,
+        ..IndexerConfig::default()
+    };
     if let Some(parallel) = command.parallel {
         config.parallelism = parallel.max(1);
     }

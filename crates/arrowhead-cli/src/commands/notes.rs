@@ -201,7 +201,7 @@ fn create_note(vault: &Vault, args: &CreateArgs) -> Result<()> {
 
     merge_metadata_json(&mut metadata, &args.metadata)?;
 
-    if metadata.get("title").is_none() {
+    if !metadata.contains_key("title") {
         metadata.insert("title".to_string(), JsonValue::String(note_id.clone()));
     }
 

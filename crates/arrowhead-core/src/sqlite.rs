@@ -158,9 +158,9 @@ impl IndexDatabase {
 }
 
 fn init_connection(conn: &Connection) -> Result<()> {
-    conn.pragma_update(None, "journal_mode", &"WAL")
+    conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to set journal_mode")?;
-    conn.pragma_update(None, "synchronous", &"NORMAL")
+    conn.pragma_update(None, "synchronous", "NORMAL")
         .context("failed to set synchronous")?;
     conn.pragma_update(None, "foreign_keys", true)
         .context("failed to enable foreign keys")?;
