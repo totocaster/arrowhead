@@ -1,0 +1,10 @@
+{
+  "attachmentFolderPath": "Attachments",
+  "newLinkFormat": "absolute",
+  "showFrontmatter": false,
+  "alwaysUpdateLinks": true,
+  "useMarkdownLinks": false,
+  "userIgnoreFilters": [
+    "Templates/"
+  ]
+}

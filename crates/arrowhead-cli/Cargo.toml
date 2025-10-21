@@ -1,0 +1,48 @@
+[package]
+name = "arrowhead-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "arrowhead"
+path = "src/main.rs"
+
+[dependencies]
+# Core libraries
+arrowhead-core = { path = "../arrowhead-core" }
+arrowhead-mcp = { path = "../arrowhead-mcp" }
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# CLI framework
+clap.workspace = true
+directories.workspace = true
+
+# Configuration
+toml.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# UI (optional features)
+indicatif = { workspace = true, optional = true }
+colored = { workspace = true, optional = true }
+
+[features]
+default = ["ui"]
+ui = ["indicatif", "colored"]

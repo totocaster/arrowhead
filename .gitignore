@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Arrowhead specific
+.arrowhead/
+*.db
+*.db-shm
+*.db-wal
+
+# Config (except examples)
+config.toml
+!config.example.toml
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Build artifacts
+/dist/
+/release/
+
+# Testing
+/tmp/
+/temp/

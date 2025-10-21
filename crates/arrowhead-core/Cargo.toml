@@ -1,0 +1,51 @@
+[package]
+name = "arrowhead-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+# Async runtime
+tokio.workspace = true
+async-trait.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Database
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+
+# Vector embeddings
+fastembed.workspace = true
+ndarray.workspace = true
+lancedb = { workspace = true, optional = true }
+num_cpus.workspace = true
+
+# Text processing
+regex.workspace = true
+
+[features]
+default = []
+vector-lancedb = ["lancedb"]
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio = { workspace = true, features = ["test-util"] }

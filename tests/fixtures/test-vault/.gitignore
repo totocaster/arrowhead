@@ -1,0 +1,5 @@
+# Arrowhead index directory (created during tests)
+.arrowhead/
+
+# macOS
+.DS_Store

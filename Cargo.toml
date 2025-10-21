@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arrowhead-core",
+    "crates/arrowhead-mcp",
+    "crates/arrowhead-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Arrowhead Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/totocaster/arrowhead"
+homepage = "https://github.com/totocaster/arrowhead"
+
+[workspace.dependencies]
+# Core dependencies
+anyhow = "1.0.100"
+thiserror = "2.0.17"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+chrono = { version = "0.4.41", features = ["serde"] }
+async-trait = "0.1.89"
+num_cpus = "1.17.0"
+
+# CLI dependencies
+clap = { version = "4.5.50", features = ["derive"] }
+directories = "6.0.0"
+
+# Config dependencies
+toml = "0.9.8"
+
+# Database dependencies
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.31.0"
+
+# Vector dependencies
+fastembed = "5.2.0"
+ndarray = "0.16.1"
+lancedb = { version = "0.21.3", default-features = false }
+
+# HTTP dependencies
+axum = "0.8.6"
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["trace"] }
+
+# Parsing dependencies
+serde_yaml = "0.9.34"
+regex = "1.12.2"
+
+# UI dependencies
+indicatif = "0.18.0"
+colored = "3.0.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
