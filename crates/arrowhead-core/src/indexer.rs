@@ -10,10 +10,17 @@ use tracing::{error, info};
 
 use crate::{
     IndexingStats, Vault,
+    embeddings::EmbeddingPipeline,
     metadata::MetadataExtractor,
     sqlite::IndexDatabase,
     vault::{normalise_relative_path, normalise_relative_str},
 };
+
+#[cfg(feature = "vector-lancedb")]
+use crate::{NoteRecord, metadata::MetadataExtraction};
+
+#[cfg(feature = "vector-lancedb")]
+use crate::embeddings::EmbeddingRecord;
 
 /// Configuration options shared by the indexing pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -40,16 +47,23 @@ pub struct Indexer {
     database: Arc<IndexDatabase>,
     metadata: MetadataExtractor,
     config: IndexerConfig,
+    embeddings: Option<Arc<EmbeddingPipeline>>,
 }
 
 impl Indexer {
     /// Create a new indexer over a vault.
-    pub fn new(vault: Arc<Vault>, database: Arc<IndexDatabase>, config: IndexerConfig) -> Self {
+    pub fn new(
+        vault: Arc<Vault>,
+        database: Arc<IndexDatabase>,
+        config: IndexerConfig,
+        embeddings: Option<Arc<EmbeddingPipeline>>,
+    ) -> Self {
         Self {
             vault,
             database,
             metadata: MetadataExtractor::new(),
             config,
+            embeddings,
         }
     }
 
@@ -94,7 +108,22 @@ impl Indexer {
         while let Some(result) = tasks.next().await {
             let (note_id, outcome) = result??;
             match outcome {
-                Ok(NoteProcessing::Indexed) => {
+                Ok(NoteProcessing::Indexed(embedding)) => {
+                    #[cfg(feature = "vector-lancedb")]
+                    if let Some(record) = embedding {
+                        if EmbeddingPipeline::is_supported() {
+                            if let Some(pipeline) = &self.embeddings {
+                                let buffer = vec![record];
+                                pipeline
+                                    .store()
+                                    .upsert_embeddings(&buffer)
+                                    .await
+                                    .with_context(|| "failed to persist note embedding")?;
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "vector-lancedb"))]
+                    let _ = embedding;
                     stats.indexed += 1;
                     processed += 1;
                     observer(IndexProgressEvent {
@@ -170,10 +199,41 @@ impl Indexer {
 
         let extraction = self.metadata.extract(&note)?;
         let resolved_links = resolve_wikilinks(&extraction.wikilinks, known_notes);
+        let indexed_at = Utc::now();
         self.database
-            .upsert_note(&note, &extraction, &resolved_links, Utc::now())?;
+            .upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
+
+        let embedding_update: Option<EmbeddingUpdate> = if let Some(pipeline) = &self.embeddings {
+            #[cfg(feature = "vector-lancedb")]
+            {
+                if EmbeddingPipeline::is_supported() {
+                    let context = compose_embedding_text(&note, &extraction);
+                    let vector =
+                        pipeline
+                            .generator()
+                            .embed_document(&context)
+                            .with_context(|| {
+                                format!("failed to generate embedding for note {note_id}")
+                            })?;
+                    Some(EmbeddingRecord {
+                        note_id: note.id.clone(),
+                        vector,
+                        indexed_at,
+                    })
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(feature = "vector-lancedb"))]
+            {
+                let _ = pipeline;
+                None
+            }
+        } else {
+            None
+        };
         info!(%note_id, "indexed note");
-        Ok(NoteProcessing::Indexed)
+        Ok(NoteProcessing::Indexed(embedding_update))
     }
 }
 
@@ -190,10 +250,49 @@ pub struct IndexProgressEvent {
     pub indexed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "vector-lancedb")]
+type EmbeddingUpdate = EmbeddingRecord;
+
+#[cfg(not(feature = "vector-lancedb"))]
+type EmbeddingUpdate = ();
+
+#[derive(Debug)]
 enum NoteProcessing {
-    Indexed,
+    Indexed(Option<EmbeddingUpdate>),
     Skipped,
+}
+
+#[cfg(feature = "vector-lancedb")]
+fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) -> String {
+    let mut sections = Vec::new();
+
+    if let Some(title) = &note.title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
+    }
+
+    if !extraction.metadata.is_empty() {
+        let mut pairs: Vec<String> = extraction
+            .metadata
+            .iter()
+            .map(|(key, value)| format!("{}: {}", key, value))
+            .collect();
+        pairs.sort();
+        sections.push(format!("Metadata:\n{}", pairs.join("\n")));
+    }
+
+    if !extraction.tags.is_empty() {
+        sections.push(format!("Tags: {}", extraction.tags.join(", ")));
+    }
+
+    let body = note.content.trim();
+    if !body.is_empty() {
+        sections.push(body.to_string());
+    }
+
+    sections.join("\n\n")
 }
 
 fn resolve_wikilinks(
@@ -256,7 +355,7 @@ mod tests {
     async fn index_all_persists_notes() {
         let vault = fixture_vault();
         let database = temp_db();
-        let indexer = Indexer::new(vault, database.clone(), IndexerConfig::default());
+        let indexer = Indexer::new(vault, database.clone(), IndexerConfig::default(), None);
 
         let stats = indexer
             .index_all_with_observer(|_| {})
@@ -277,7 +376,12 @@ mod tests {
     async fn repeated_indexing_skips_fresh_notes() {
         let vault = fixture_vault();
         let database = temp_db();
-        let indexer = Indexer::new(vault.clone(), database.clone(), IndexerConfig::default());
+        let indexer = Indexer::new(
+            vault.clone(),
+            database.clone(),
+            IndexerConfig::default(),
+            None,
+        );
 
         let first = indexer.index_all().await.expect("first index");
         assert!(first.indexed > 0);
@@ -291,7 +395,12 @@ mod tests {
     async fn index_note_only_updates_target() {
         let vault = fixture_vault();
         let database = temp_db();
-        let indexer = Indexer::new(vault.clone(), database.clone(), IndexerConfig::default());
+        let indexer = Indexer::new(
+            vault.clone(),
+            database.clone(),
+            IndexerConfig::default(),
+            None,
+        );
 
         indexer.index_all().await.expect("initial index");
 
@@ -313,7 +422,7 @@ mod tests {
     async fn index_all_reports_progress_events() {
         let vault = fixture_vault();
         let database = temp_db();
-        let indexer = Indexer::new(vault, database, IndexerConfig::default());
+        let indexer = Indexer::new(vault, database, IndexerConfig::default(), None);
 
         let mut events = Vec::new();
         let stats = indexer

@@ -5,7 +5,7 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 
-use arrowhead_core::{Vault, VaultConfig};
+use arrowhead_core::{Vault, VaultConfig, embeddings::EmbeddingPreset};
 use tracing::info;
 
 use crate::logging;
@@ -64,6 +64,8 @@ pub async fn run(ctx: &mut CommandContext, command: &InitCommand) -> Result<()> 
 
     ctx.config.vault = Some(vault.paths().root.clone());
     if let Some(model) = &command.embeddings {
+        EmbeddingPreset::from_identifier(model)
+            .with_context(|| format!("unknown embedding preset `{model}`"))?;
         ctx.config.embedding_model = Some(model.clone());
         info!(model = model.as_str(), "set default embedding model");
     }
@@ -92,7 +94,7 @@ mod tests {
         let mut ctx = CommandContext::new(AppConfig::default(), Some(config_path.clone()), 0);
         let command = InitCommand {
             vault: Some(vault_dir.path().to_path_buf()),
-            embeddings: Some("test-model".to_string()),
+            embeddings: Some("fast".to_string()),
             force: true,
         };
 
@@ -102,6 +104,6 @@ mod tests {
         assert!(vault_dir.path().join(".arrowhead").exists());
 
         let config_contents = fs::read_to_string(&config_path).expect("config readable");
-        assert!(config_contents.contains("test-model"));
+        assert!(config_contents.contains("fast"));
     }
 }

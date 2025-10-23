@@ -19,7 +19,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             vault: None,
-            embedding_model: Some("all-MiniLM-L6-v2".to_string()),
+            embedding_model: Some("fast".to_string()),
         }
     }
 }

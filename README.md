@@ -15,13 +15,14 @@ Arrowhead references the precision obsidian tools used by prehistoric humans for
 - **Smart Indexing**: On-demand indexing with staleness detection (only reindex changed notes)
 - **Obsidian-Aware**: Automatically honours `.obsidian/app.json` settings (ignored folders, attachments)
 - **Notes CLI**: `arrowhead notes read/list/create/update/delete` manages Markdown notes directly
-- **Progress & Logging**: `arrowhead index --progress` shows live progress, logs go to `.arrowhead/logs/arrowhead.log`
+- **Full-Text Search**: SQLite FTS5-based keyword search with field:value syntax
+- **Semantic Search**: Vector embeddings for conceptual similarity search (enable with `--features vector-lancedb`)
+- **Hybrid Search**: Combined FTS + semantic scoring with per-result reasoning
+- **Match Explanations**: Each search result shows why it ranked (FTS rank vs semantic similarity)
+- **Progress & Logging**: `arrowhead index --progress` shows live progress; set `ARROWHEAD_ENABLE_FILE_LOGS=1` to emit per-command log files when running with LanceDB
 
 ### Coming soon
 
-- **Full-Text Search**: SQLite FTS5-based keyword search with field:value syntax
-- **Semantic Search**: Vector embeddings for conceptual similarity search
-- **Hybrid Search**: Combined FTS + semantic search for best results
 - **WikiLinks Graph**: Navigate backlinks, forward links, and find orphaned notes
 - **MCP Server**: Dual-mode MCP integration (stdio for local, HTTP for remote)
 - **Cross-Platform**: Works on macOS and Linux

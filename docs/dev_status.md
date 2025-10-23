@@ -2,7 +2,7 @@
 
 ## Snapshot
 
-- **Toolchain:** Rust 1.85 (2024 edition) pinned via `rust-toolchain.toml`.
+- **Toolchain:** Rust 1.86 (2024 edition) pinned via `rust-toolchain.toml`.
 - **Workspace health:** `cargo fmt`, `cargo check`, and `cargo test` all pass.
 - **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
 - **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically and respecting Obsidian ignore filters.
@@ -12,7 +12,7 @@
 - **CI:** GitHub Actions workflow (`CI`) runs on push/PR/workflow_dispatch, enforcing fmt, clippy, check, and test across the workspace.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), feature development guide established, integration fixtures ready.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), API/MCP reference stubs added, integration test harness directories created.
-- **Vectors:** LanceDB wiring lives behind the optional `vector-lancedb` feature; disabled until semantic search sprint begins.
+- **Vectors:** Semantic pipeline (fastembed + LanceDB) integrates with indexing and CLI search when the optional `vector-lancedb` feature is enabled; defaults to FTS-only when the feature is off. Vector builds skip per-command file logging by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1` to opt in) while we stabilise LanceDB tracing behaviour.
 
 ## Completed Work (Phase 0-1)
 
@@ -25,17 +25,18 @@
 - Automatic schema-version detection for the SQLite index: incompatible databases are discarded and rebuilt to keep migrations unnecessary.
 - Indexer progress instrumentation landed (batching hooks, observer events, CLI progress bar) so long-running reindexes surface user feedback out of the box.
 - FTS search pipeline (Synapse-style query rewriting, porter tokenization, metadata/value dual-token indexing, revamped ranking/snippets) with comprehensive unit and integration coverage, including automatic index refresh when running searches.
+- Semantic + hybrid search: embedding presets (`fast`/`good`/`better`), automatic Hugging Face downloads scoped to the vault, LanceDB persistence/refresh from the indexer, and CLI entry points for `search semantic` / `search hybrid` with cosine + weighted scoring.
 
 ## Next Focus Areas
 
-1. **Phase 2 Prep — Embedding Infrastructure**
-   - Finalise model tier presets (`fast`/`good`/`better`), source ONNX assets from Hugging Face with licensing checks, and persist selection under `.arrowhead/config`.
-   - Implement authenticated/unauthenticated download + caching flow for embedding models, including progress reporting and checksum validation.
-   - Confirm LanceDB's current MSRV and bump the workspace toolchain as needed before enabling the `vector-lancedb` feature.
+1. **Search Hardening (Phase 2 follow-up)**
+   - Tune hybrid weighting/thresholds against real vault corpora and add regression fixtures covering semantic-only and mixed queries.
+   - Improve semantic previews (smarter snippet generation) and document evaluation tooling.
+   - Extend integration tests to exercise LanceDB-backed searches (requires `protoc` in CI agents).
 
-2. **Search & Embeddings (Phase 2 Execution)**
-   - Layer semantic search: embedding generation via `fastembed`, LanceDB persistence, hybrid scoring.
-   - Expand CLI with `semantic`/`hybrid` modes once vector pipeline lands.
+2. **Model Management & UX**
+   - Finalise licensing guidance for the shipped presets and surface model selection in docs/CLI help.
+   - Allow opt-in cache directory overrides and surface download progress in CLI output.
 
 3. **Graph Pipeline (Phase 3)**
    - Defer WikiLink resolution persistence to the upcoming graph implementation; schedule planning session ahead of Phase 3 kickoff.
@@ -46,10 +47,11 @@
 
 ## Open Decisions / Risks
 
-- **Vector MSRV:** Track LanceDB's requirements; we are comfortable bumping to the latest stable Rust once we confirm the need.
+- **Vector MSRV:** LanceDB currently requires Rust ≥1.86; workspace bumped accordingly.
 - **Model distribution:** Implement Hugging Face-backed downloads with clear licensing documentation and opt-in presets.
 - **Schema migrations:** Continue relying on drop-and-reindex for incompatible schemas; document any future scenarios that require persistent migrations.
 - **Concurrent access:** Clarify whether multi-process vault access needs to be supported in v1.
+- **Protobuf tooling:** `vector-lancedb` builds need `protoc` on developer and CI machines; decide whether to vendor binaries or document the prerequisite.
 
 ## Tracking
 

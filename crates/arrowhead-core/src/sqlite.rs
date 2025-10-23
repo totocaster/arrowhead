@@ -256,6 +256,58 @@ impl IndexDatabase {
 
         Ok(result)
     }
+
+    /// Retrieve the stored titles for the supplied note identifiers.
+    pub fn titles_for_notes(&self, note_ids: &[String]) -> Result<HashMap<String, Option<String>>> {
+        let mut result: HashMap<String, Option<String>> = HashMap::new();
+        if note_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let conn = self.connection()?;
+        let placeholders = std::iter::repeat("?")
+            .take(note_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id, title FROM notes WHERE id IN ({})", placeholders);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(note_ids.iter().map(|id| id.as_str())),
+            |row| {
+                let id: String = row.get(0)?;
+                let title: Option<String> = row.get(1)?;
+                Ok((id, title))
+            },
+        )?;
+
+        for row in rows {
+            let (id, title) = row?;
+            result.insert(id, title);
+        }
+
+        Ok(result)
+    }
+
+    /// Fetch a brief excerpt of the note content for preview purposes.
+    pub fn note_excerpt(&self, note_id: &str, limit: usize) -> Result<Option<String>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare("SELECT content FROM notes_fts WHERE id = ?1")?;
+        let content: Option<String> = stmt.query_row([note_id], |row| row.get(0)).optional()?;
+
+        let excerpt = content.map(|text| {
+            if text.len() > limit {
+                let mut truncated = text.chars().take(limit).collect::<String>();
+                if !truncated.ends_with("...") {
+                    truncated.push_str("...");
+                }
+                truncated
+            } else {
+                text
+            }
+        });
+
+        Ok(excerpt)
+    }
 }
 
 fn init_connection(conn: &Connection) -> Result<()> {

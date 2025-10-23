@@ -250,6 +250,7 @@ arrowhead/
 **Search Results:**
 - Note ID, metadata, relevance score
 - Content preview (configurable length)
+- Match explanation (e.g. FTS rank vs semantic similarity)
 - Optional: Link statistics (backlinks, forward links)
 
 ### 5. Embeddings

@@ -11,10 +11,11 @@ specification.
   spec or existing UX.
 
 ## 2. Logging & Observability
-- Use `tracing` for diagnostic output. During CLI execution, logs must flow to
-  `.arrowhead/logs/arrowhead.log` via `logging::scoped_file_logging`. That helper
-  keeps a single log file, prunes entries older than ~3 days, and truncates when
-  oversized. Keep stdout/stderr for intentional user-facing output only.
+- Use `tracing` for diagnostic output. During CLI execution, logs normally flow
+  to `.arrowhead/logs/arrowhead.log` via `logging::scoped_file_logging`. When
+  building with the `vector-lancedb` feature we keep file logging opt-in (set
+  `ARROWHEAD_ENABLE_FILE_LOGS=1`) to avoid known issues in LanceDB's tracing
+  subscriber. Keep stdout/stderr for intentional user-facing output only.
 - Emit at least `info!` on command start/finish and for notable decisions (e.g.
   skipping stale work, writing migrations).
 - When adding async tasks, ensure the logging guard spans their lifetime so the

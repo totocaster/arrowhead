@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use tracing::info;
@@ -10,6 +10,7 @@ use tracing::info;
 use arrowhead_core::IndexingStats;
 use arrowhead_core::{
     SearchConfig, SearchResult, SearchService, Vault, VaultConfig,
+    embeddings::EmbeddingPipeline,
     indexer::{Indexer, IndexerConfig},
     sqlite::IndexDatabase,
 };
@@ -64,9 +65,45 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
     let database = Arc::new(IndexDatabase::open(&db_path)?);
 
     let logs_dir = vault.paths().logs_dir();
-    let _logging_guard = logging::scoped_file_logging(&logs_dir, ctx.verbosity())?;
 
-    let stats = ensure_index_fresh(Arc::clone(&vault), Arc::clone(&database)).await?;
+    #[cfg(feature = "vector-lancedb")]
+    let logging_enabled = std::env::var_os("ARROWHEAD_ENABLE_FILE_LOGS").is_some();
+
+    #[cfg(not(feature = "vector-lancedb"))]
+    let logging_enabled = std::env::var_os("ARROWHEAD_DISABLE_FILE_LOGS").is_none();
+
+    let _logging_guard = if logging_enabled {
+        Some(logging::scoped_file_logging(&logs_dir, ctx.verbosity())?)
+    } else {
+        None
+    };
+
+    let model_id = ctx
+        .config
+        .embedding_model
+        .clone()
+        .unwrap_or_else(|| "fast".to_string());
+    let embeddings = if EmbeddingPipeline::is_supported() {
+        let pipeline = EmbeddingPipeline::initialise(vault.as_ref(), &model_id)
+            .await
+            .context("failed to prepare embedding pipeline")?;
+        Some(Arc::new(pipeline))
+    } else {
+        None
+    };
+
+    let force_full = embeddings
+        .as_ref()
+        .map(|pipeline| pipeline.model_changed())
+        .unwrap_or(false);
+
+    let stats = ensure_index_fresh(
+        Arc::clone(&vault),
+        Arc::clone(&database),
+        embeddings.clone(),
+        force_full,
+    )
+    .await?;
     info!(
         indexed = stats.indexed,
         skipped = stats.skipped,
@@ -74,7 +111,7 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         "ensured index before search"
     );
 
-    let service = SearchService::new(database, SearchConfig::default());
+    let service = SearchService::new(database, SearchConfig::default(), embeddings);
 
     match &command.mode {
         SearchMode::Fts(args) => {
@@ -83,8 +120,23 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
             render_results(&results, args.json)?;
             Ok(())
         }
-        SearchMode::Semantic(_) | SearchMode::Hybrid(_) => {
-            bail!("semantic and hybrid search are not implemented yet")
+        SearchMode::Semantic(args) => {
+            info!(query = args.query.as_str(), limit = ?args.limit, "executing semantic search");
+            let results = service
+                .search_semantic(&args.query, args.limit)
+                .await
+                .context("failed to execute semantic search")?;
+            render_results(&results, args.json)?;
+            Ok(())
+        }
+        SearchMode::Hybrid(args) => {
+            info!(query = args.query.as_str(), limit = ?args.limit, "executing hybrid search");
+            let results = service
+                .search_hybrid(&args.query, args.limit)
+                .await
+                .context("failed to execute hybrid search")?;
+            render_results(&results, args.json)?;
+            Ok(())
         }
     }
 }
@@ -102,8 +154,12 @@ async fn execute_fts_search(
 async fn ensure_index_fresh(
     vault: Arc<Vault>,
     database: Arc<IndexDatabase>,
+    embeddings: Option<Arc<EmbeddingPipeline>>,
+    force: bool,
 ) -> Result<IndexingStats> {
-    let indexer = Indexer::new(vault, database, IndexerConfig::default());
+    let mut config = IndexerConfig::default();
+    config.force = force;
+    let indexer = Indexer::new(vault, database, config, embeddings);
     indexer.index_all().await
 }
 
@@ -118,6 +174,7 @@ fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
                     "score": result.score,
                     "bm25": result.bm25,
                     "preview": result.preview,
+                    "reason": result.reason,
                     "metadata": result.metadata,
                 })
             })
@@ -146,6 +203,9 @@ fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
             "{}\t{:.3}\t{:.2}\t{}",
             result.note_id, result.score, result.bm25, title
         );
+        if let Some(reason) = &result.reason {
+            println!("  Reason: {}", reason);
+        }
         if let Some(preview) = &result.preview {
             println!("  {}", preview.trim());
         }
@@ -201,10 +261,10 @@ mod tests {
         let vault =
             Arc::new(Vault::new(VaultConfig::new(vault_dir.path().to_path_buf())).expect("vault"));
         vault.ensure_arrowhead_dirs().expect("dirs");
-        ensure_index_fresh(Arc::clone(&vault), Arc::clone(&database))
+        ensure_index_fresh(Arc::clone(&vault), Arc::clone(&database), None, false)
             .await
             .expect("indexing succeeds");
-        let service = SearchService::new(database, SearchConfig::default());
+        let service = SearchService::new(database, SearchConfig::default(), None);
         let results = execute_fts_search(&service, &query)
             .await
             .expect("fts query succeeds");

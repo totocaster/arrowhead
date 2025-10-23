@@ -1,12 +1,16 @@
 //! Search coordination across FTS, semantic, and hybrid strategies.
 
 use std::sync::{Arc, LazyLock};
+#[cfg(feature = "vector-lancedb")]
+use std::{cmp::Ordering, collections::HashMap};
 
+#[cfg(feature = "vector-lancedb")]
+use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use tokio::task;
 
-use crate::{MetadataMap, NoteId, sqlite::IndexDatabase};
+use crate::{MetadataMap, NoteId, embeddings::EmbeddingPipeline, sqlite::IndexDatabase};
 
 /// Unified search result payload spanning the different search modes.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +23,8 @@ pub struct SearchResult {
     pub bm25: f32,
     /// Optional snippet or preview text.
     pub preview: Option<String>,
+    /// High-level explanation of why this result ranked where it did.
+    pub reason: Option<String>,
     /// Metadata attached to the note, useful for display.
     pub metadata: MetadataMap,
     /// Optional note title for display purposes.
@@ -33,6 +39,7 @@ impl SearchResult {
             score: 0.0,
             bm25: f32::MAX,
             preview: None,
+            reason: None,
             metadata: MetadataMap::default(),
             title: None,
         }
@@ -62,12 +69,26 @@ impl Default for SearchConfig {
 pub struct SearchService {
     database: Arc<IndexDatabase>,
     config: SearchConfig,
+    #[cfg(feature = "vector-lancedb")]
+    embeddings: Option<Arc<EmbeddingPipeline>>,
 }
 
 impl SearchService {
     /// Create a new search service with the supplied configuration.
-    pub fn new(database: Arc<IndexDatabase>, config: SearchConfig) -> Self {
-        Self { database, config }
+    pub fn new(
+        database: Arc<IndexDatabase>,
+        config: SearchConfig,
+        embeddings: Option<Arc<EmbeddingPipeline>>,
+    ) -> Self {
+        #[cfg(not(feature = "vector-lancedb"))]
+        let _ = embeddings;
+
+        Self {
+            database,
+            config,
+            #[cfg(feature = "vector-lancedb")]
+            embeddings,
+        }
     }
 
     /// Execute a full-text search query.
@@ -98,11 +119,13 @@ impl SearchService {
                     .cloned()
                     .unwrap_or_default();
                 let bm25 = item.rank as f32;
+                let reason = Some(format!("Full-text match (rank {:.2})", item.rank));
                 results.push(SearchResult {
                     note_id: item.note_id,
                     score: rank_to_score(item.rank),
                     bm25,
                     preview: item.snippet,
+                    reason,
                     metadata,
                     title: item.title,
                 });
@@ -117,21 +140,235 @@ impl SearchService {
     }
 
     /// Execute a semantic similarity search.
+    #[cfg(feature = "vector-lancedb")]
+    pub async fn search_semantic(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            bail!("empty search query");
+        }
+
+        let pipeline = self
+            .embeddings
+            .as_ref()
+            .ok_or_else(|| anyhow!(
+                "semantic search requires Arrowhead to be built with LanceDB support. Rebuild with the `vector-lancedb` feature and reindex the vault."
+            ))?;
+
+        let limit = limit.unwrap_or(self.config.default_limit).max(1);
+        let query_vector = pipeline
+            .generator()
+            .embed_query(query)
+            .context("failed to embed search query")?;
+
+        let matches = pipeline
+            .store()
+            .search(&query_vector, limit * 2, self.config.semantic_threshold)
+            .await
+            .context("semantic vector search failed")?;
+
+        if matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let note_ids: Vec<String> = matches.iter().map(|m| m.note_id.clone()).collect();
+        let metadata_maps = self
+            .database
+            .metadata_for_notes(&note_ids)
+            .context("failed to load metadata for semantic results")?;
+        let title_map = self
+            .database
+            .titles_for_notes(&note_ids)
+            .context("failed to load note titles for semantic results")?;
+
+        let mut results = Vec::new();
+        for item in matches.into_iter().take(limit) {
+            let similarity = (1.0_f32 - item.distance).max(0.0_f32);
+            if similarity < self.config.semantic_threshold {
+                continue;
+            }
+
+            let metadata = metadata_maps
+                .get(&item.note_id)
+                .cloned()
+                .unwrap_or_default();
+            let title = title_map.get(&item.note_id).cloned().unwrap_or(None);
+            let preview = self
+                .database
+                .note_excerpt(&item.note_id, 240)
+                .context("failed to fetch note excerpt")?;
+
+            results.push(SearchResult {
+                note_id: item.note_id,
+                score: similarity,
+                bm25: f32::MAX,
+                preview,
+                reason: Some(format!("Semantic similarity {:.2}", similarity)),
+                metadata,
+                title,
+            });
+        }
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        Ok(results)
+    }
+
+    /// Execute a hybrid search, combining semantic and keyword results.
+    #[cfg(feature = "vector-lancedb")]
+    pub async fn search_hybrid(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        const FTS_WEIGHT: f32 = 0.7;
+        const SEM_WEIGHT: f32 = 0.5;
+
+        let query = query.trim();
+        if query.is_empty() {
+            bail!("empty search query");
+        }
+
+        let pipeline = self
+            .embeddings
+            .as_ref()
+            .ok_or_else(|| anyhow!(
+                "hybrid search requires Arrowhead to be built with LanceDB support. Rebuild with the `vector-lancedb` feature and reindex the vault."
+            ))?;
+
+        let limit = limit.unwrap_or(self.config.default_limit).max(1);
+
+        let query_vector = pipeline
+            .generator()
+            .embed_query(query)
+            .context("failed to embed search query")?;
+
+        let semantic_matches = pipeline
+            .store()
+            .search(&query_vector, limit * 3, self.config.semantic_threshold)
+            .await
+            .context("semantic vector search failed")?;
+
+        let fts_results = self
+            .search_fts(query, Some(limit * 3))
+            .await
+            .context("fts portion of hybrid search failed")?;
+
+        #[derive(Default)]
+        struct CombinedEntry {
+            fts: Option<SearchResult>,
+            semantic: Option<f32>,
+        }
+
+        let mut combined: HashMap<String, CombinedEntry> = HashMap::new();
+
+        for result in fts_results {
+            let note_id = result.note_id.clone();
+            combined.entry(note_id).or_default().fts = Some(result);
+        }
+
+        for item in semantic_matches {
+            let similarity = (1.0_f32 - item.distance).max(0.0_f32);
+            if similarity <= 0.0 {
+                continue;
+            }
+            combined.entry(item.note_id.clone()).or_default().semantic = Some(similarity);
+        }
+
+        let missing_ids: Vec<String> = combined
+            .iter()
+            .filter_map(|(note_id, entry)| {
+                (entry.fts.is_none() && entry.semantic.is_some()).then(|| note_id.clone())
+            })
+            .collect();
+
+        let metadata_map = self
+            .database
+            .metadata_for_notes(&missing_ids)
+            .context("failed to load metadata for hybrid search results")?;
+        let title_map = self
+            .database
+            .titles_for_notes(&missing_ids)
+            .context("failed to load note titles for hybrid search results")?;
+
+        let mut excerpt_map = HashMap::new();
+        for note_id in &missing_ids {
+            let excerpt = self
+                .database
+                .note_excerpt(note_id, 240)
+                .context("failed to fetch note excerpt")?;
+            excerpt_map.insert(note_id.clone(), excerpt);
+        }
+
+        let mut results = Vec::new();
+        for (note_id, entry) in combined.into_iter() {
+            match (entry.fts, entry.semantic) {
+                (Some(mut fts), semantic) => {
+                    let semantic = semantic.unwrap_or(0.0);
+                    let combined_score = FTS_WEIGHT * fts.score + SEM_WEIGHT * semantic;
+                    if semantic > 0.0 && combined_score < self.config.semantic_threshold {
+                        continue;
+                    }
+                    let base_fts_score = fts.score;
+                    fts.score = combined_score;
+                    fts.reason = if semantic > 0.0 {
+                        Some(format!(
+                            "Hybrid match (FTS {:.2}, semantic {:.2})",
+                            base_fts_score, semantic
+                        ))
+                    } else {
+                        Some(format!("Full-text match (score {:.2})", base_fts_score))
+                    };
+                    results.push(fts);
+                }
+                (None, Some(semantic)) => {
+                    let combined_score = SEM_WEIGHT * semantic;
+                    if combined_score >= self.config.semantic_threshold {
+                        let metadata = metadata_map.get(&note_id).cloned().unwrap_or_default();
+                        let title = title_map.get(&note_id).cloned().unwrap_or(None);
+                        let preview = excerpt_map.remove(&note_id).unwrap_or(None);
+                        results.push(SearchResult {
+                            note_id,
+                            score: combined_score,
+                            bm25: f32::MAX,
+                            preview,
+                            reason: Some(format!("Semantic similarity {:.2}", semantic)),
+                            metadata,
+                            title,
+                        });
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        if results.len() > limit {
+            results.truncate(limit);
+        }
+        Ok(results)
+    }
+
+    #[cfg(not(feature = "vector-lancedb"))]
+    #[allow(missing_docs)]
     pub async fn search_semantic(
         &self,
         _query: &str,
         _limit: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
-        bail!("semantic search not implemented yet")
+        bail!("semantic search requires Arrowhead to be built with the `vector-lancedb` feature.")
     }
 
-    /// Execute a hybrid search, combining semantic and keyword results.
+    #[cfg(not(feature = "vector-lancedb"))]
+    #[allow(missing_docs)]
     pub async fn search_hybrid(
         &self,
         _query: &str,
         _limit: Option<usize>,
     ) -> Result<Vec<SearchResult>> {
-        bail!("hybrid search not implemented yet")
+        bail!("hybrid search requires Arrowhead to be built with the `vector-lancedb` feature.")
     }
 
     /// Access the current search configuration.
@@ -438,10 +675,11 @@ mod tests {
             Arc::clone(&vault),
             Arc::clone(&database),
             IndexerConfig::default(),
+            None,
         );
         indexer.index_all().await.expect("indexing succeeds");
 
-        let service = SearchService::new(database, SearchConfig::default());
+        let service = SearchService::new(database, SearchConfig::default(), None);
         let results = service
             .search_fts("category:reference AND tags:photography", Some(10))
             .await
@@ -450,6 +688,12 @@ mod tests {
         let ids: HashSet<_> = results.iter().map(|r| r.note_id.as_str()).collect();
         assert!(ids.contains("Photography Equipment"));
         assert!(results.iter().all(|result| result.score >= 0.0));
+        assert!(results
+            .iter()
+            .all(|result| result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("Full-text match"))));
     }
 
     #[tokio::test]
@@ -462,10 +706,11 @@ mod tests {
             Arc::clone(&vault),
             Arc::clone(&database),
             IndexerConfig::default(),
+            None,
         );
         indexer.index_all().await.expect("indexing succeeds");
 
-        let service = SearchService::new(database, SearchConfig::default());
+        let service = SearchService::new(database, SearchConfig::default(), None);
         let err = service
             .search_fts("   ", Some(5))
             .await
