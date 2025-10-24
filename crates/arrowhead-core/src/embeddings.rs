@@ -3,7 +3,7 @@
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -192,7 +192,7 @@ impl EmbeddingConfig {
 #[derive(Clone)]
 pub struct EmbeddingGenerator {
     config: EmbeddingConfig,
-    model: Arc<Mutex<TextEmbedding>>,
+    pool: Arc<ModelPool>,
 }
 
 impl EmbeddingGenerator {
@@ -213,19 +213,25 @@ impl EmbeddingGenerator {
             )
         })?;
 
-        let mut options = TextInitOptions::new(config.descriptor.model().clone())
-            .with_cache_dir(config.cache_dir.clone())
-            .with_show_download_progress(config.show_download_progress);
-        if let Some(max_length) = config.max_length {
-            options = options.with_max_length(max_length);
-        }
+        let pool_size = embedding_pool_size();
+        let mut models = Vec::with_capacity(pool_size);
 
-        let model = TextEmbedding::try_new(options)
-            .context("failed to initialise embedding model via fastembed")?;
+        for _ in 0..pool_size {
+            let mut options = TextInitOptions::new(config.descriptor.model().clone())
+                .with_cache_dir(config.cache_dir.clone())
+                .with_show_download_progress(config.show_download_progress);
+            if let Some(max_length) = config.max_length {
+                options = options.with_max_length(max_length);
+            }
+
+            let model = TextEmbedding::try_new(options)
+                .context("failed to initialise embedding model via fastembed")?;
+            models.push(model);
+        }
 
         Ok(Self {
             config,
-            model: Arc::new(Mutex::new(model)),
+            pool: Arc::new(ModelPool::new(models)),
         })
     }
 
@@ -240,8 +246,8 @@ impl EmbeddingGenerator {
             return Ok(Vec::new());
         }
 
-        let mut guard = self.model.lock().expect("embedding model poisoned");
-        let embeddings = guard
+        let mut lease = self.pool.checkout();
+        let embeddings = lease
             .embed(documents.to_vec(), None)
             .context("failed to embed documents")?;
 
@@ -259,12 +265,85 @@ impl EmbeddingGenerator {
     /// Generate an embedding suitable for semantic query comparisons.
     pub fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
         let inputs = vec![query.to_string()];
-        let mut guard = self.model.lock().expect("embedding model poisoned");
-        let mut embeddings = guard.embed(inputs, None).context("failed to embed query")?;
+        let mut lease = self.pool.checkout();
+        let mut embeddings = lease.embed(inputs, None).context("failed to embed query")?;
         let vector = embeddings
             .pop()
             .ok_or_else(|| anyhow!("query embedding missing"))?;
         normalize_vector(vector)
+    }
+}
+
+/// Number of model instances kept alive for concurrent embedding.
+fn embedding_pool_size() -> usize {
+    num_cpus::get().clamp(1, 8)
+}
+
+struct ModelPool {
+    models: Mutex<Vec<TextEmbedding>>,
+    available: Condvar,
+}
+
+impl ModelPool {
+    fn new(models: Vec<TextEmbedding>) -> Self {
+        debug_assert!(!models.is_empty(), "embedding pool must not be empty");
+        Self {
+            models: Mutex::new(models),
+            available: Condvar::new(),
+        }
+    }
+
+    fn checkout(&self) -> ModelLease<'_> {
+        let mut guard = self.models.lock().expect("embedding pool poisoned");
+        loop {
+            if let Some(model) = guard.pop() {
+                return ModelLease {
+                    pool: self,
+                    model: Some(model),
+                };
+            }
+            guard = self
+                .available
+                .wait(guard)
+                .expect("embedding pool wait poisoned");
+        }
+    }
+
+    fn checkin(&self, model: TextEmbedding) {
+        let mut guard = self.models.lock().expect("embedding pool poisoned");
+        guard.push(model);
+        self.available.notify_one();
+    }
+}
+
+struct ModelLease<'a> {
+    pool: &'a ModelPool,
+    model: Option<TextEmbedding>,
+}
+
+impl<'a> std::ops::Deref for ModelLease<'a> {
+    type Target = TextEmbedding;
+
+    fn deref(&self) -> &Self::Target {
+        self.model
+            .as_ref()
+            .expect("embedding model lease missing instance")
+    }
+}
+
+impl<'a> std::ops::DerefMut for ModelLease<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.model
+            .as_mut()
+            .expect("embedding model lease missing instance")
+    }
+}
+
+impl<'a> Drop for ModelLease<'a> {
+    fn drop(&mut self) {
+        if let Some(model) = self.model.take() {
+            self.pool.checkin(model);
+        }
     }
 }
 

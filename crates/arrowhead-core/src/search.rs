@@ -688,12 +688,12 @@ mod tests {
         let ids: HashSet<_> = results.iter().map(|r| r.note_id.as_str()).collect();
         assert!(ids.contains("Photography Equipment"));
         assert!(results.iter().all(|result| result.score >= 0.0));
-        assert!(results
-            .iter()
-            .all(|result| result
+        assert!(results.iter().all(|result| {
+            result
                 .reason
                 .as_deref()
-                .is_some_and(|reason| reason.starts_with("Full-text match"))));
+                .is_some_and(|reason| reason.starts_with("Full-text match"))
+        }));
     }
 
     #[tokio::test]

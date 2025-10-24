@@ -1,6 +1,13 @@
 //! SQLite persistence layer for Arrowhead.
 
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -11,6 +18,13 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::{MetadataMap, NoteRecord, metadata::MetadataExtraction};
+
+thread_local! {
+    static THREAD_CONNECTIONS: RefCell<HashMap<usize, Vec<PooledConnection<SqliteConnectionManager>>>> =
+        RefCell::new(HashMap::new());
+}
+
+static NEXT_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Current schema version for the Arrowhead index database.
 const INDEX_SCHEMA_VERSION: i32 = 2;
@@ -28,6 +42,7 @@ pub struct NoteIndexState {
 #[derive(Debug, Clone)]
 pub struct IndexDatabase {
     pool: Pool<SqliteConnectionManager>,
+    id: usize,
 }
 
 impl IndexDatabase {
@@ -77,7 +92,9 @@ impl IndexDatabase {
             apply_migrations(&conn)?;
         }
 
-        Ok(Self { pool })
+        let id = NEXT_DATABASE_ID.fetch_add(1, Ordering::SeqCst);
+
+        Ok(Self { pool, id })
     }
 
     /// Borrow a pooled SQLite connection.
@@ -85,6 +102,25 @@ impl IndexDatabase {
         self.pool
             .get()
             .context("failed to acquire SQLite connection from pool")
+    }
+
+    /// Borrow a connection scoped to the current thread, reusing it across calls.
+    pub fn connection_for_thread(&self) -> Result<ThreadConnection> {
+        if let Some(conn) = THREAD_CONNECTIONS.with(|cell| {
+            let mut map = cell.borrow_mut();
+            map.get_mut(&self.id).and_then(|stack| stack.pop())
+        }) {
+            return Ok(ThreadConnection {
+                id: self.id,
+                conn: Some(conn),
+            });
+        }
+
+        let conn = self.connection()?;
+        Ok(ThreadConnection {
+            id: self.id,
+            conn: Some(conn),
+        })
     }
 
     /// Retrieve existing indexing state for a note.
@@ -112,6 +148,29 @@ impl IndexDatabase {
         .transpose()
     }
 
+    /// Retrieve indexing state for every note as a single lookup table.
+    pub fn note_states(&self) -> Result<HashMap<String, NoteIndexState>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare("SELECT id, file_modified_at, indexed_at FROM notes")?;
+        let mut rows = stmt.query([])?;
+        let mut result = HashMap::new();
+
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let file_modified: i64 = row.get(1)?;
+            let indexed: i64 = row.get(2)?;
+            result.insert(
+                id,
+                NoteIndexState {
+                    file_modified_at: from_micros(file_modified)?,
+                    indexed_at: from_micros(indexed)?,
+                },
+            );
+        }
+
+        Ok(result)
+    }
+
     /// Upsert the supplied note content and metadata into the index.
     pub fn upsert_note(
         &self,
@@ -120,7 +179,7 @@ impl IndexDatabase {
         resolved_links: &[(String, Option<String>)],
         indexed_at: DateTime<Utc>,
     ) -> Result<()> {
-        let mut conn = self.connection()?;
+        let mut conn = self.connection_for_thread()?;
         let tx = conn.transaction().context("failed to start transaction")?;
 
         tx.execute(
@@ -370,6 +429,43 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         .context("failed to set schema version")
 }
 
+/// Connection handle tied to a worker thread for SQLite reuse.
+pub struct ThreadConnection {
+    id: usize,
+    conn: Option<PooledConnection<SqliteConnectionManager>>,
+}
+
+impl std::ops::Deref for ThreadConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &*self
+            .conn
+            .as_ref()
+            .expect("thread connection missing handle")
+    }
+}
+
+impl std::ops::DerefMut for ThreadConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self
+            .conn
+            .as_mut()
+            .expect("thread connection missing handle")
+    }
+}
+
+impl Drop for ThreadConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            THREAD_CONNECTIONS.with(|cell| {
+                let mut map = cell.borrow_mut();
+                map.entry(self.id).or_default().push(conn);
+            });
+        }
+    }
+}
+
 /// Result row produced by the FTS search query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FtsMatch {
@@ -597,6 +693,54 @@ mod tests {
             state.indexed_at.timestamp_micros(),
             indexed_at.timestamp_micros()
         );
+    }
+
+    #[test]
+    fn note_states_returns_all_records() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+
+        for note_id in ["2024-01-15", "Photography Equipment"] {
+            let note = load_note(note_id);
+            let extraction = MetadataExtractor::new()
+                .extract(&note)
+                .expect("extract succeeds");
+            let resolved_links: Vec<(String, Option<String>)> = extraction
+                .wikilinks
+                .iter()
+                .map(|link| (link.clone(), Some(link.clone())))
+                .collect();
+            db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
+                .expect("upsert succeeds");
+        }
+
+        let states = db.note_states().expect("note states query");
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key("2024-01-15"));
+        assert!(states.contains_key("Photography Equipment"));
+    }
+
+    #[test]
+    fn connection_for_thread_reuses_same_handle() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+
+        {
+            let conn = db.connection_for_thread().expect("thread connection");
+            conn.execute("CREATE TEMP TABLE temp_conn_test (id INTEGER)", [])
+                .expect("create temp table");
+        }
+
+        let conn = db.connection_for_thread().expect("thread connection reuse");
+        let temp_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name = 'temp_conn_test'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect temp tables");
+
+        assert_eq!(temp_table_count, 1);
     }
 
     #[test]

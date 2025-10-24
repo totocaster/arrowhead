@@ -23,6 +23,21 @@ use tracing::warn;
 use crate::types::VaultPaths;
 use crate::{MetadataMap, NoteId, NoteRecord};
 
+/// Lightweight description of a note discovered during vault inventory.
+#[derive(Debug, Clone)]
+pub struct NoteInventoryEntry {
+    /// Unique identifier derived from the file path.
+    pub id: NoteId,
+    /// Relative path (including extension) from the vault root.
+    pub relative_path: PathBuf,
+    /// Absolute filesystem path to the note file.
+    pub absolute_path: PathBuf,
+    /// Filesystem modification timestamp captured during inventory.
+    pub file_modified_at: DateTime<Utc>,
+    /// Optional filesystem creation timestamp.
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// Configuration values required to initialise a [`Vault`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultConfig {
@@ -179,16 +194,8 @@ impl Vault {
 
     /// List all markdown note identifiers in the vault.
     pub fn list_note_ids(&self) -> Result<Vec<NoteId>> {
-        let mut ids = BTreeMap::new();
-
-        for path in self.list_markdown_paths()? {
-            let note_id = derive_note_id(&path)?;
-            if ids.insert(note_id.clone(), path).is_some() {
-                bail!("duplicate note identifier detected: {note_id}");
-            }
-        }
-
-        Ok(ids.into_keys().collect())
+        let inventory = self.inventory()?;
+        Ok(inventory.into_iter().map(|entry| entry.id).collect())
     }
 
     /// List all markdown note paths relative to the vault root.
@@ -203,39 +210,77 @@ impl Vault {
 
     /// Load a note by its identifier.
     pub fn load_note(&self, note_id: &str) -> Result<NoteRecord> {
-        let relative_path = self
-            .list_markdown_paths()?
+        let inventory = self.inventory()?;
+        let entry = inventory
             .into_iter()
-            .find(|path| derive_note_id(path).is_ok_and(|id| id == note_id))
+            .find(|entry| entry.id == note_id)
             .with_context(|| format!("note {note_id} not found in vault"))?;
+        self.load_note_from_entry(&entry)
+    }
 
-        let absolute_path = self.note_path(&relative_path);
-        let raw = fs::read_to_string(&absolute_path)
-            .with_context(|| format!("failed to read note {}", absolute_path.display()))?;
+    /// Build an inventory of all markdown notes without parsing their contents.
+    pub fn inventory(&self) -> Result<Vec<NoteInventoryEntry>> {
+        let mut entries = Vec::new();
+        let mut ids = BTreeMap::new();
+
+        for relative_path in collect_markdown_files(
+            &self.paths.root,
+            Some(&self.paths.arrowhead_dir),
+            self.paths.attachments_dir.as_deref(),
+            self.settings.ignored_folders(),
+        )? {
+            let note_id = derive_note_id(&relative_path)?;
+            if ids.contains_key(&note_id) {
+                bail!("duplicate note identifier detected: {note_id}");
+            }
+
+            let absolute_path = self.note_path(&relative_path);
+            let file_meta = fs::metadata(&absolute_path)
+                .with_context(|| format!("failed to stat note {}", absolute_path.display()))?;
+            let modified =
+                system_time_to_utc(file_meta.modified().unwrap_or_else(|_| SystemTime::now()))?;
+            let created = file_meta
+                .created()
+                .ok()
+                .and_then(|time| system_time_to_utc(time).ok());
+
+            let entry = NoteInventoryEntry {
+                id: note_id.clone(),
+                relative_path: relative_path.clone(),
+                absolute_path,
+                file_modified_at: modified,
+                created_at: created,
+            };
+            ids.insert(note_id, entries.len());
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    /// Load a note using a precomputed inventory entry.
+    pub fn load_note_from_entry(&self, entry: &NoteInventoryEntry) -> Result<NoteRecord> {
+        let raw = fs::read_to_string(&entry.absolute_path)
+            .with_context(|| format!("failed to read note {}", entry.absolute_path.display()))?;
 
         let (frontmatter_str, body) = split_frontmatter(&raw);
-        let metadata = parse_frontmatter(frontmatter_str)
-            .with_context(|| format!("invalid frontmatter in note {}", relative_path.display()))?;
+        let metadata = parse_frontmatter(frontmatter_str).with_context(|| {
+            format!(
+                "invalid frontmatter in note {}",
+                entry.relative_path.display()
+            )
+        })?;
 
         let title = derive_title(&metadata, body);
 
-        let file_meta = fs::metadata(&absolute_path)
-            .with_context(|| format!("failed to stat note {}", absolute_path.display()))?;
-        let file_modified_at =
-            system_time_to_utc(file_meta.modified().unwrap_or_else(|_| SystemTime::now()))?;
-        let created_at = file_meta
-            .created()
-            .ok()
-            .and_then(|time| system_time_to_utc(time).ok());
-
         Ok(NoteRecord {
-            id: note_id.to_string(),
+            id: entry.id.clone(),
             title,
             metadata,
             content: body.to_string(),
-            relative_path,
-            file_modified_at,
-            created_at,
+            relative_path: entry.relative_path.clone(),
+            file_modified_at: entry.file_modified_at,
+            created_at: entry.created_at,
         })
     }
 }
@@ -309,6 +354,29 @@ mod tests {
 
         assert!(note.metadata.is_empty());
         assert!(note.content.contains("# Note With Empty Frontmatter"));
+    }
+
+    #[test]
+    fn inventory_entries_can_load_notes() {
+        let vault = build_vault();
+        let inventory = vault.inventory().expect("inventory builds");
+
+        assert!(!inventory.is_empty());
+        let entry = inventory
+            .iter()
+            .find(|entry| entry.id == "2024-01-15")
+            .expect("locate fixture note");
+
+        assert_eq!(entry.relative_path, PathBuf::from("2024-01-15.md"));
+        assert!(entry.absolute_path.is_absolute());
+        assert!(entry.file_modified_at.timestamp() > 0);
+
+        let record = vault
+            .load_note_from_entry(entry)
+            .expect("load via inventory entry");
+        assert_eq!(record.id, "2024-01-15");
+        assert_eq!(record.relative_path, entry.relative_path);
+        assert_eq!(record.file_modified_at, entry.file_modified_at);
     }
 
     #[test]

@@ -1,6 +1,10 @@
 //! Indexing orchestration.
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
@@ -12,7 +16,8 @@ use crate::{
     IndexingStats, Vault,
     embeddings::EmbeddingPipeline,
     metadata::MetadataExtractor,
-    sqlite::IndexDatabase,
+    sqlite::{IndexDatabase, NoteIndexState},
+    vault::NoteInventoryEntry,
     vault::{normalise_relative_path, normalise_relative_str},
 };
 
@@ -21,6 +26,9 @@ use crate::{NoteRecord, metadata::MetadataExtraction};
 
 #[cfg(feature = "vector-lancedb")]
 use crate::embeddings::EmbeddingRecord;
+
+#[cfg(feature = "vector-lancedb")]
+const EMBEDDING_FLUSH_BATCH: usize = 64;
 
 /// Configuration options shared by the indexing pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,25 +85,30 @@ impl Indexer {
     where
         F: FnMut(IndexProgressEvent),
     {
-        let note_ids = self.vault.list_note_ids()?;
-        let total = note_ids.len() as u64;
-        let note_set: Arc<HashSet<String>> = Arc::new(note_ids.iter().cloned().collect());
+        let inventory = self.vault.inventory()?;
+        let total = inventory.len() as u64;
+        let note_set: Arc<HashSet<String>> =
+            Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
+        let state_table: Arc<HashMap<String, NoteIndexState>> =
+            Arc::new(self.database.note_states()?);
 
         let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
         let mut tasks = FuturesUnordered::new();
 
-        for note_id in note_ids {
+        for entry in inventory {
             let indexer = self.clone();
             let known = Arc::clone(&note_set);
             let semaphore = Arc::clone(&semaphore);
+            let states = Arc::clone(&state_table);
+            let entry_id = entry.id.clone();
 
             tasks.push(tokio::spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()
                     .await
                     .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
-                let result = indexer.run_single(note_id.clone(), known).await;
-                Ok::<_, anyhow::Error>((note_id, result))
+                let result = indexer.run_single(entry, known, states).await;
+                Ok::<_, anyhow::Error>((entry_id, result))
             }));
         }
 
@@ -104,26 +117,36 @@ impl Indexer {
             ..IndexingStats::default()
         };
 
+        #[cfg(feature = "vector-lancedb")]
+        let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
+        #[cfg(feature = "vector-lancedb")]
+        let embeddings_pipeline = self.embeddings.clone();
+
         let mut processed = 0u64;
         while let Some(result) = tasks.next().await {
             let (note_id, outcome) = result??;
             match outcome {
                 Ok(NoteProcessing::Indexed(embedding)) => {
                     #[cfg(feature = "vector-lancedb")]
-                    if let Some(record) = embedding {
-                        if EmbeddingPipeline::is_supported() {
-                            if let Some(pipeline) = &self.embeddings {
-                                let buffer = vec![record];
-                                pipeline
-                                    .store()
-                                    .upsert_embeddings(&buffer)
-                                    .await
-                                    .with_context(|| "failed to persist note embedding")?;
+                    {
+                        if let Some(record) = embedding {
+                            if let Some(pipeline) = embeddings_pipeline.as_ref() {
+                                embedding_buffer.push(record);
+                                if embedding_buffer.len() >= EMBEDDING_FLUSH_BATCH {
+                                    pipeline
+                                        .store()
+                                        .upsert_embeddings(&embedding_buffer)
+                                        .await
+                                        .with_context(|| "failed to persist note embeddings")?;
+                                    embedding_buffer.clear();
+                                }
                             }
                         }
                     }
                     #[cfg(not(feature = "vector-lancedb"))]
-                    let _ = embedding;
+                    {
+                        let _ = embedding;
+                    }
                     stats.indexed += 1;
                     processed += 1;
                     observer(IndexProgressEvent {
@@ -157,38 +180,83 @@ impl Indexer {
             }
         }
 
+        #[cfg(feature = "vector-lancedb")]
+        if let Some(pipeline) = embeddings_pipeline.as_ref() {
+            if !embedding_buffer.is_empty() {
+                pipeline
+                    .store()
+                    .upsert_embeddings(&embedding_buffer)
+                    .await
+                    .with_context(|| "failed to persist note embeddings")?;
+            }
+        }
+
         Ok(stats)
     }
 
     /// Reindexes a single note identified by the given ID.
     pub async fn index_note(&self, note_id: &str) -> Result<()> {
-        let note_set = Arc::new(self.vault.list_note_ids()?.into_iter().collect());
-        self.run_single(note_id.to_string(), note_set).await?;
+        let inventory = self.vault.inventory()?;
+        let note_set: Arc<HashSet<String>> =
+            Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
+        let state_table: Arc<HashMap<String, NoteIndexState>> =
+            Arc::new(self.database.note_states()?);
+        let entry = inventory
+            .into_iter()
+            .find(|entry| entry.id == note_id)
+            .with_context(|| format!("note {note_id} not found in vault"))?;
+        let outcome = self.run_single(entry, note_set, state_table).await?;
+
+        match outcome {
+            NoteProcessing::Indexed(embedding) => {
+                #[cfg(feature = "vector-lancedb")]
+                if let Some(record) = embedding {
+                    if let Some(pipeline) = self.embeddings.clone() {
+                        pipeline
+                            .store()
+                            .upsert_embeddings(&[record])
+                            .await
+                            .with_context(|| "failed to persist note embeddings")?;
+                    }
+                }
+                #[cfg(not(feature = "vector-lancedb"))]
+                {
+                    let _ = embedding;
+                }
+            }
+            NoteProcessing::Skipped => {}
+        }
         Ok(())
     }
 
     async fn run_single(
         &self,
-        note_id: String,
+        entry: NoteInventoryEntry,
         known_notes: Arc<HashSet<String>>,
+        index_states: Arc<HashMap<String, NoteIndexState>>,
     ) -> Result<NoteProcessing> {
         let indexer = self.clone();
-        task::spawn_blocking(move || indexer.process_note(&note_id, &known_notes))
+        task::spawn_blocking(move || indexer.process_note(&entry, &known_notes, &index_states))
             .await
             .context("indexing task panicked")?
     }
 
-    fn process_note(&self, note_id: &str, known_notes: &HashSet<String>) -> Result<NoteProcessing> {
+    fn process_note(
+        &self,
+        entry: &NoteInventoryEntry,
+        known_notes: &HashSet<String>,
+        index_states: &HashMap<String, NoteIndexState>,
+    ) -> Result<NoteProcessing> {
         let note = self
             .vault
-            .load_note(note_id)
-            .with_context(|| format!("failed to load note {note_id}"))?;
+            .load_note_from_entry(entry)
+            .with_context(|| format!("failed to load note {}", entry.id))?;
 
-        let state = self.database.note_state(note_id)?;
+        let state = index_states.get(&entry.id).cloned();
         let is_stale = if self.config.force {
             true
         } else if let Some(state) = state {
-            state.file_modified_at < note.file_modified_at
+            state.file_modified_at < entry.file_modified_at
         } else {
             true
         };
@@ -213,7 +281,7 @@ impl Indexer {
                             .generator()
                             .embed_document(&context)
                             .with_context(|| {
-                                format!("failed to generate embedding for note {note_id}")
+                                format!("failed to generate embedding for note {}", entry.id)
                             })?;
                     Some(EmbeddingRecord {
                         note_id: note.id.clone(),
@@ -232,7 +300,7 @@ impl Indexer {
         } else {
             None
         };
-        info!(%note_id, "indexed note");
+        info!(note_id = %entry.id, "indexed note");
         Ok(NoteProcessing::Indexed(embedding_update))
     }
 }
