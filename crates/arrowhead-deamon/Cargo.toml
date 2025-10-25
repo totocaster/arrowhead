@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[[bin]]
+name = "arrowheadd"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 arrowhead-core = { path = "../arrowhead-core" }

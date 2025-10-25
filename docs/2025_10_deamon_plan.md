@@ -45,7 +45,7 @@
      the deamon can emit precise status updates and errors.
 
 2. **Arrowhead Deamon Crate**
-   - New crate `arrowhead-deamon` (library + Tokio binary) that depends on
+  - New crate `arrowhead-deamon` (library + Tokio binary `arrowheadd`) that depends on
      `arrowhead-core`.
    - Responsibilities:
      - Bootstraps vault context, runs an initial full index, writes status file,
@@ -58,12 +58,12 @@
        the vault for portability and backups. `status.json` reports total indexed notes,
        current error count, detailed activity status (including `idle`), download
        progress for embeddings/models, outstanding issues, and the
-       `arrowhead-deamon.log` path for diagnostics.
+       `arrowheadd.log` path for diagnostics.
      - Exposes a JSON command interface over `.arrowhead/deamon/control.sock`
        (Unix domain socket, owner-only permissions) supporting `status`, `shutdown`,
        and health pings. The PID file enforces a single active deamon instance.
    - Observability:
-     - Structured `tracing` routed to `.arrowhead/logs/arrowhead-deamon.log`, using the
+     - Structured `tracing` routed to `.arrowhead/logs/arrowheadd.log`, using the
        same retention and rotation policy as `arrowhead.log`.
      - Rotate logs similarly to CLI, keeping separation between CLI
        (`arrowhead.log`) and background service logging.
@@ -93,8 +93,11 @@
      - `vault cleanup` – stops the deamon, removes `.arrowhead` caches (index.db,
        vectors, logs, status, socket, PID, autostart metadata), and uninstalls launch
        agents while leaving raw vault notes untouched.
-   - `arrowhead init` should delegate to `vault init` when pointed at a new vault so
-     setup flows remain single-command.
+  - `arrowhead init` delegates to `vault init` and runs the full interactive setup
+    (auto-start prompt + deamon launch). Once the control socket is ready the
+    command returns immediately while `arrowheadd` completes the initial crawl in the
+    background; users can monitor progress via `arrowhead vault status`. Pass
+    `--no-start` to skip launching in bespoke deployments.
    - Update `search`/`notes`/future commands to:
      - Skip `ensure_index_fresh`; instead, query deamon status before operations. If
        the socket is unavailable or returns an error—or `status.json` lists outstanding
@@ -149,11 +152,11 @@
   creation and version normalisation (`save_to_path`, `load_from_path`).
 
 **Phase 2 – Deamon Runtime**
-- Create the `arrowhead-deamon` crate/binary, build the watcher pipeline, and wire up
+- Create the `arrowhead-deamon` crate/binary (`arrowheadd`), build the watcher pipeline, and wire up
   status/log emissions.
 - Implement the Unix socket server at `.arrowhead/deamon/control.sock` with `status`
   and `shutdown` commands, ensuring single-instance enforcement.
-- Integrate logging to `.arrowhead/logs/arrowhead-deamon.log` and ensure download
+- Integrate logging to `.arrowhead/logs/arrowheadd.log` and ensure download
   progress + errors feed into `status.json`.
 
 **Phase 3 – CLI Integration & Auto-start**

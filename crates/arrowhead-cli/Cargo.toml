@@ -36,6 +36,9 @@ serde_json.workspace = true
 # Async runtime
 tokio.workspace = true
 
+# Hashing
+sha2 = "0.10"
+
 # Logging
 tracing.workspace = true
 tracing-subscriber.workspace = true

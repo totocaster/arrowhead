@@ -24,6 +24,9 @@ pub struct InitCommand {
     /// Overwrite existing configuration and directories if present.
     #[arg(long)]
     pub force: bool,
+    /// Prepare the vault without starting the deamon (used for advanced setups).
+    #[arg(long)]
+    pub no_start: bool,
 }
 
 /// Run the init command.
@@ -63,7 +66,7 @@ pub async fn run(ctx: &mut CommandContext, command: &InitCommand) -> Result<()> 
     let init_command = VaultCommand {
         action: VaultAction::Init(VaultInitArgs {
             force: command.force,
-            no_start: true,
+            no_start: command.no_start,
         }),
     };
 
@@ -95,6 +98,7 @@ mod tests {
             vault: Some(vault_dir.path().to_path_buf()),
             embeddings: Some("fast".to_string()),
             force: true,
+            no_start: true,
         };
 
         run(&mut ctx, &command).await.expect("init succeeds");

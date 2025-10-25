@@ -11,9 +11,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use arrowhead_core::{ActivityState, DeamonStatus, IssueSeverity, StatusIssue, Vault, VaultConfig};
 use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
 use clap::{Args, Subcommand};
+use serde_json::json;
 use tokio::time::{Instant, sleep};
 
 use super::CommandContext;
+use crate::autostart::{
+    AUTOSTART_DIR, AutoStartManager, AutoStartProvider, AutoStartStatus, MANIFEST_FILE,
+    prompt_yes_no,
+};
 use crate::config::DeamonConfig;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,12 +95,25 @@ async fn handle_status(ctx: &mut CommandContext, args: &VaultStatusArgs) -> Resu
         anyhow!("arrowhead deamon is not running. Start it with `arrowhead vault start`")
     })?;
 
+    let auto_status = auto_start_status(&paths)?;
+
     if args.json {
-        let payload = serde_json::to_string_pretty(&status).context("failed to render JSON")?;
+        let payload = json!({
+            "status": &status,
+            "auto_start": auto_start_status_json(&auto_status),
+        });
+        let payload =
+            serde_json::to_string_pretty(&payload).context("failed to render JSON payload")?;
         println!("{}", payload);
     } else {
-        render_status(&status);
+        render_status(&status, &auto_status);
     }
+
+    ctx.config.deamon.auto_start_enabled = match auto_status {
+        AutoStartStatus::Enabled { .. } => Some(true),
+        AutoStartStatus::Disabled { .. } => Some(false),
+        AutoStartStatus::Unsupported => ctx.config.deamon.auto_start_enabled,
+    };
 
     update_config_with_status(ctx, &paths, Some(&status))?;
 
@@ -112,8 +130,38 @@ async fn handle_start(ctx: &mut CommandContext, args: &VaultStartArgs) -> Result
 
     ensure_runtime_dirs(&vault, &paths)?;
 
-    let pid = launch_deamon_process(&vault_path)?;
-    write_pid_file(&paths.pid_path, pid)?;
+    let manager = AutoStartManager::detect(paths.autostart_manifest_path.clone());
+    let mut pid: Option<u32> = None;
+
+    if let Some(manager) = &manager {
+        if let Some(manifest) = manager.load_manifest()? {
+            match manager.start_unit(&manifest) {
+                Ok(reported_pid) => {
+                    pid = reported_pid;
+                    ctx.config.deamon.auto_start_enabled = Some(true);
+                }
+                Err(err) => {
+                    println!(
+                        "failed to start auto-start service ({err}); falling back to direct spawn"
+                    );
+                }
+            }
+        }
+    }
+
+    if pid.is_none() {
+        let spawned_pid = launch_deamon_process(&vault_path)?;
+        pid = Some(spawned_pid);
+        if ctx.config.deamon.auto_start_enabled.is_none() {
+            ctx.config.deamon.auto_start_enabled = Some(false);
+        }
+    }
+
+    if let Some(actual_pid) = pid {
+        write_pid_file(&paths.pid_path, actual_pid)?;
+    } else {
+        remove_pid_file(&paths.pid_path)?;
+    }
 
     if !args.no_wait {
         wait_for_socket(&paths.socket_path, STARTUP_TIMEOUT)
@@ -123,10 +171,17 @@ async fn handle_start(ctx: &mut CommandContext, args: &VaultStartArgs) -> Result
 
     update_config_with_status(ctx, &paths, None)?;
 
-    println!(
-        "arrowhead deamon started (pid {pid}). Control socket: {}",
-        paths.socket_path.display()
-    );
+    if let Some(actual_pid) = pid {
+        println!(
+            "arrowhead deamon started (pid {actual_pid}). Control socket: {}",
+            paths.socket_path.display()
+        );
+    } else {
+        println!(
+            "arrowhead deamon started. Control socket: {}",
+            paths.socket_path.display()
+        );
+    }
 
     Ok(())
 }
@@ -182,6 +237,7 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
     }
 
     if args.force {
+        cleanup_auto_start(&paths)?;
         cleanup_arrowhead_dirs(&paths)?;
     }
 
@@ -189,11 +245,25 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
 
     ctx.config.vault = Some(vault.paths().root.clone());
 
+    let manager = AutoStartManager::detect(paths.autostart_manifest_path.clone());
+    let mut manifest = match manager.as_ref() {
+        Some(manager) => manager.load_manifest()?,
+        None => None,
+    };
+
+    let mut auto_start_preference = ctx.config.deamon.auto_start_enabled;
+
     if args.no_start {
+        if manifest.is_some() {
+            auto_start_preference = Some(true);
+        } else if auto_start_preference.is_none() {
+            auto_start_preference = Some(false);
+        }
+
         ctx.config.deamon = DeamonConfig {
             socket_path: Some(paths.socket_path.clone()),
             status_path: Some(paths.status_path.clone()),
-            auto_start_enabled: ctx.config.deamon.auto_start_enabled,
+            auto_start_enabled: auto_start_preference,
             last_status: None,
         };
         ctx.persist()?;
@@ -206,12 +276,77 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
 
     if is_socket_alive(&paths).await? {
         println!("arrowhead deamon already running; skipping launch");
+        if manifest.is_some() {
+            auto_start_preference = Some(true);
+        } else if auto_start_preference.is_none() {
+            auto_start_preference = Some(false);
+        }
+        ctx.config.deamon.auto_start_enabled = auto_start_preference;
         update_config_with_status(ctx, &paths, None)?;
         return Ok(());
     }
 
-    let pid = launch_deamon_process(&vault_path)?;
-    write_pid_file(&paths.pid_path, pid)?;
+    if manifest.is_none() {
+        if let Some(manager) = &manager {
+            let enable = if let Some(preference) = auto_start_preference {
+                preference
+            } else {
+                match prompt_yes_no(
+                    "Enable Arrowhead auto-start so the deamon launches automatically on login?",
+                )? {
+                    Some(value) => value,
+                    None => false,
+                }
+            };
+
+            if enable {
+                let binary = find_deamon_binary()?;
+                manifest = Some(
+                    manager
+                        .install(&vault_path, &binary)
+                        .context("failed to install auto-start service")?,
+                );
+                println!("Auto-start configured; Arrowhead will launch on login.");
+                auto_start_preference = Some(true);
+            } else {
+                auto_start_preference = Some(false);
+            }
+        } else if auto_start_preference.is_none() {
+            println!(
+                "Auto-start is not supported on this platform; the deamon must be started manually."
+            );
+            auto_start_preference = Some(false);
+        }
+    } else {
+        auto_start_preference = Some(true);
+    }
+
+    ctx.config.deamon.auto_start_enabled = auto_start_preference;
+
+    let mut pid: Option<u32> = None;
+    if let (Some(manager), Some(manifest)) = (&manager, manifest.as_ref()) {
+        match manager.start_unit(manifest) {
+            Ok(reported_pid) => {
+                pid = reported_pid;
+            }
+            Err(err) => {
+                println!(
+                    "failed to start auto-start manager ({err}); falling back to direct spawn"
+                );
+            }
+        }
+    }
+
+    if pid.is_none() {
+        let spawned_pid = launch_deamon_process(&vault_path)?;
+        pid = Some(spawned_pid);
+    }
+
+    if let Some(actual_pid) = pid {
+        write_pid_file(&paths.pid_path, actual_pid)?;
+    } else {
+        remove_pid_file(&paths.pid_path)?;
+    }
 
     wait_for_socket(&paths.socket_path, STARTUP_TIMEOUT)
         .await
@@ -219,8 +354,18 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
 
     update_config_with_status(ctx, &paths, None)?;
 
+    if let Some(actual_pid) = pid {
+        println!(
+            "Arrowhead initialised and deamon started (pid {actual_pid}). Monitor progress with `arrowhead vault status`."
+        );
+    } else {
+        println!(
+            "Arrowhead initialised and deamon started. Monitor progress with `arrowhead vault status`."
+        );
+    }
+
     println!(
-        "Arrowhead initialised and deamon started (pid {pid}). Monitor progress with `arrowhead vault status`."
+        "arrowheadd is performing the initial indexing pass in the background. Check `arrowhead vault status` for progress."
     );
 
     Ok(())
@@ -258,6 +403,7 @@ async fn handle_cleanup(ctx: &mut CommandContext) -> Result<()> {
     }
     remove_pid_file(&paths.pid_path)?;
 
+    cleanup_auto_start(&paths)?;
     cleanup_arrowhead_dirs(&paths)?;
 
     ctx.config.deamon = DeamonConfig::default();
@@ -282,13 +428,16 @@ fn load_vault_environment(vault_path: &Path) -> Result<(Vault, DeamonPaths)> {
     let vault = Vault::new(VaultConfig::new(vault_path.to_path_buf()))?;
     let vault_paths = vault.paths().clone();
     let deamon_dir = vault_paths.arrowhead_dir.join("deamon");
+    let autostart_dir = deamon_dir.join(AUTOSTART_DIR);
     let paths = DeamonPaths {
         arrowhead_dir: vault_paths.arrowhead_dir.clone(),
         deamon_dir,
+        autostart_dir: autostart_dir.clone(),
+        autostart_manifest_path: autostart_dir.join(MANIFEST_FILE),
         status_path: vault_paths.arrowhead_dir.join("deamon/status.json"),
         socket_path: vault_paths.arrowhead_dir.join("deamon/control.sock"),
         pid_path: vault_paths.arrowhead_dir.join("deamon/deamon.pid"),
-        log_path: vault_paths.logs_dir().join("arrowhead-deamon.log"),
+        log_path: vault_paths.logs_dir().join("arrowheadd.log"),
     };
 
     Ok((vault, paths))
@@ -320,7 +469,39 @@ async fn is_socket_alive(paths: &DeamonPaths) -> Result<bool> {
     }
 }
 
-fn render_status(status: &DeamonStatus) {
+fn auto_start_status(paths: &DeamonPaths) -> Result<AutoStartStatus> {
+    if let Some(manager) = AutoStartManager::detect(paths.autostart_manifest_path.clone()) {
+        if let Some(manifest) = manager.load_manifest()? {
+            manager.query_status(&manifest)
+        } else {
+            Ok(AutoStartStatus::Disabled {
+                provider: manager.provider(),
+            })
+        }
+    } else {
+        Ok(AutoStartStatus::Unsupported)
+    }
+}
+
+fn auto_start_status_json(status: &AutoStartStatus) -> serde_json::Value {
+    match status {
+        AutoStartStatus::Enabled { provider, active } => json!({
+            "enabled": true,
+            "provider": provider_label(*provider),
+            "active": active,
+        }),
+        AutoStartStatus::Disabled { provider } => json!({
+            "enabled": false,
+            "provider": provider_label(*provider),
+        }),
+        AutoStartStatus::Unsupported => json!({
+            "enabled": false,
+            "supported": false,
+        }),
+    }
+}
+
+fn render_status(status: &DeamonStatus, auto: &AutoStartStatus) {
     println!(
         "arrowhead deamon status (updated {})",
         status.updated_at.to_rfc3339()
@@ -340,6 +521,20 @@ fn render_status(status: &DeamonStatus) {
     println!("  Indexed notes: {}", status.indexed_notes);
     println!("  Error notes: {}", status.error_notes);
     println!("  Log file: {}", status.log_path.display());
+    match auto {
+        AutoStartStatus::Enabled { provider, active } => {
+            let label = provider_label(*provider);
+            let activity = if *active { "active" } else { "inactive" };
+            println!("  Auto-start: enabled via {label} ({activity})");
+        }
+        AutoStartStatus::Disabled { provider } => {
+            let label = provider_label(*provider);
+            println!("  Auto-start: disabled ({label})");
+        }
+        AutoStartStatus::Unsupported => {
+            println!("  Auto-start: unsupported on this platform");
+        }
+    }
 
     if status.downloads.is_empty() {
         println!("  Downloads: none");
@@ -403,12 +598,25 @@ fn severity_label(severity: IssueSeverity) -> &'static str {
     }
 }
 
+fn provider_label(provider: AutoStartProvider) -> &'static str {
+    match provider {
+        AutoStartProvider::Launchd => "launchd",
+        AutoStartProvider::SystemdUser => "systemd --user",
+    }
+}
+
 fn ensure_runtime_dirs(vault: &Vault, paths: &DeamonPaths) -> Result<()> {
     vault.ensure_arrowhead_dirs()?;
     fs::create_dir_all(&paths.deamon_dir).with_context(|| {
         format!(
             "failed to create deamon directory {}",
             paths.deamon_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&paths.autostart_dir).with_context(|| {
+        format!(
+            "failed to create auto-start directory {}",
+            paths.autostart_dir.display()
         )
     })?;
     if let Some(parent) = paths.log_path.parent() {
@@ -419,22 +627,29 @@ fn ensure_runtime_dirs(vault: &Vault, paths: &DeamonPaths) -> Result<()> {
 }
 
 fn find_deamon_binary() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("ARROWHEAD_DEAMON_PATH") {
+    if let Some(path) =
+        env::var_os("ARROWHEAD_DEAMON_PATH").or_else(|| env::var_os("ARROWHEADD_PATH"))
+    {
         return Ok(PathBuf::from(path));
     }
 
-    let binary_name = format!("arrowhead-deamon{}", std::env::consts::EXE_SUFFIX);
+    let candidate_names = [
+        format!("arrowheadd{}", std::env::consts::EXE_SUFFIX),
+        format!("arrowhead-deamon{}", std::env::consts::EXE_SUFFIX),
+    ];
 
     if let Ok(current) = env::current_exe() {
         if let Some(dir) = current.parent() {
-            let candidate = dir.join(&binary_name);
-            if candidate.exists() {
-                return Ok(candidate);
+            for name in &candidate_names {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
             }
         }
     }
 
-    Ok(PathBuf::from(binary_name))
+    Ok(PathBuf::from(&candidate_names[0]))
 }
 
 fn launch_deamon_process(vault_path: &Path) -> Result<u32> {
@@ -536,6 +751,8 @@ fn update_config_with_status(
 struct DeamonPaths {
     arrowhead_dir: PathBuf,
     deamon_dir: PathBuf,
+    autostart_dir: PathBuf,
+    autostart_manifest_path: PathBuf,
     status_path: PathBuf,
     socket_path: PathBuf,
     pid_path: PathBuf,
@@ -550,6 +767,17 @@ fn cleanup_arrowhead_dirs(paths: &DeamonPaths) -> Result<()> {
                 paths.arrowhead_dir.display()
             )
         })?;
+    }
+    Ok(())
+}
+
+fn cleanup_auto_start(paths: &DeamonPaths) -> Result<()> {
+    if let Some(manager) = AutoStartManager::detect(paths.autostart_manifest_path.clone()) {
+        if let Some(manifest) = manager.load_manifest()? {
+            manager.uninstall(&manifest)?;
+        } else {
+            manager.remove_manifest()?;
+        }
     }
     Ok(())
 }
@@ -650,5 +878,24 @@ mod tests {
         );
         assert!(ctx.config.deamon.socket_path.is_some());
         assert!(ctx.config.deamon.status_path.is_some());
+        assert_eq!(ctx.config.deamon.auto_start_enabled, Some(false));
+    }
+
+    #[test]
+    fn auto_start_status_json_handles_enabled_state() {
+        let value = auto_start_status_json(&AutoStartStatus::Enabled {
+            provider: AutoStartProvider::SystemdUser,
+            active: true,
+        });
+        assert_eq!(value["enabled"], true);
+        assert_eq!(value["provider"], "systemd --user");
+        assert_eq!(value["active"], true);
+    }
+
+    #[test]
+    fn auto_start_status_json_handles_unsupported_state() {
+        let value = auto_start_status_json(&AutoStartStatus::Unsupported);
+        assert_eq!(value["enabled"], false);
+        assert_eq!(value["supported"], false);
     }
 }

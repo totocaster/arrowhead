@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 
+mod autostart;
 mod commands;
 mod config;
 mod logging;

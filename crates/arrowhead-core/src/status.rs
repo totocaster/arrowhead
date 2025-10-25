@@ -249,7 +249,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let status_path = dir.path().join("status.json");
 
-        let mut status = DeamonStatus::new("/tmp/arrowhead-deamon.log");
+        let mut status = DeamonStatus::new("/tmp/arrowheadd.log");
         status.indexed_notes = 42;
         status.error_notes = 2;
         status.activity =

@@ -89,7 +89,7 @@ impl DeamonRuntimeBuilder {
 
         let status_path = deamon_dir.join("status.json");
         let socket_path = deamon_dir.join("control.sock");
-        let log_path = logs_dir.join("arrowhead-deamon.log");
+        let log_path = logs_dir.join("arrowheadd.log");
 
         let db_path = arrowhead_dir.join("index.db");
         let database = Arc::new(IndexDatabase::open(db_path)?);
@@ -245,8 +245,6 @@ impl DeamonRuntime {
     }
 
     async fn run(mut self) -> Result<()> {
-        self.ensure_initial_index().await?;
-
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let control_task = {
             let status = Arc::clone(&self.status);
@@ -262,6 +260,14 @@ impl DeamonRuntime {
                 .await
             })
         };
+
+        if let Err(err) = self.ensure_initial_index().await {
+            let _ = self.shutdown_tx.send(());
+            if let Err(join_err) = control_task.await {
+                warn!(error = ?join_err, "control server task aborted during startup");
+            }
+            return Err(err);
+        }
 
         loop {
             tokio::select! {
