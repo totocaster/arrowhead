@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -62,8 +63,20 @@ impl DeamonStatus {
 
         let payload =
             serde_json::to_vec_pretty(self).context("failed to serialise deamon status")?;
-        fs::write(path, payload)
-            .with_context(|| format!("failed to write status file {}", path.display()))
+
+        let mut tmp_path = path.to_path_buf();
+        tmp_path.set_extension("tmp");
+
+        let mut file = fs::File::create(&tmp_path)
+            .with_context(|| format!("failed to create status file {}", tmp_path.display()))?;
+        file.write_all(&payload)
+            .with_context(|| format!("failed to write status file {}", tmp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("failed to flush status file {}", tmp_path.display()))?;
+        drop(file);
+
+        fs::rename(&tmp_path, path)
+            .with_context(|| format!("failed to move status file into place {}", path.display()))
     }
 
     /// Load a status snapshot from disk, returning `Ok(None)` if the file is absent.
@@ -249,7 +262,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let status_path = dir.path().join("status.json");
 
-        let mut status = DeamonStatus::new("/tmp/arrowheadd.log");
+        let mut status = DeamonStatus::new("/tmp/daemon.log");
         status.indexed_notes = 42;
         status.error_notes = 2;
         status.activity =

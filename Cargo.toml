@@ -48,6 +48,7 @@ r2d2_sqlite = "0.31.0"
 fastembed = "5.2.0"
 ndarray = "0.16.1"
 lancedb = { version = "0.21.3", default-features = false }
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 
 # HTTP dependencies
 axum = "0.8.6"

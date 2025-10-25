@@ -12,7 +12,7 @@ specification.
 
 ## 2. Logging & Observability
 - Use `tracing` for diagnostic output. During CLI execution, logs normally flow
-  to `.arrowhead/logs/arrowhead.log` via `logging::scoped_file_logging`. When
+  to `.arrowhead/logs/cli.log` via `logging::scoped_file_logging`. When
   building with the `vector-lancedb` feature we keep file logging opt-in (set
   `ARROWHEAD_ENABLE_FILE_LOGS=1`) to avoid known issues in LanceDB's tracing
   subscriber. Keep stdout/stderr for intentional user-facing output only.

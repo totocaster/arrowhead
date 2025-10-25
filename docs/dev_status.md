@@ -7,13 +7,13 @@
 - **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
 - **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically and respecting Obsidian ignore filters.
 - **Vault settings:** `.obsidian/app.json` is parsed for attachments and user ignore filters so templates stay out of the index.
-- **CLI:** `init` now performs the full interactive vault setup (prompting for auto-start, launching the deamon unless `--no-start` is passed) and returns immediately once `arrowheadd` is alive—the initial crawl continues in the background and progress is surfaced via `arrowhead vault status`. `index` remains informational, and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/arrowhead.log` with multi-day retention. Vault subcommands (`vault init/start/status/stop/cleanup`) manage the background deamon, cache socket/status metadata in config, render runtime health (JSON or human-readable), and provide teardown. Search commands rely on the deamon status instead of running local indexing passes.
+- **CLI:** `init` now performs the full interactive vault setup (prompting for auto-start, launching the deamon unless `--no-start` is passed) and returns immediately once `arrowheadd` is alive—the initial crawl continues in the background and progress is surfaced via `arrowhead vault status`. A new `--fts-only` switch lets users opt out of semantic indexing up front. `index` remains informational, and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/cli.log` with multi-day retention. Vault subcommands (`vault init/start/status/stop/cleanup`) manage the background deamon, cache socket/status metadata in config, render runtime health (JSON or human-readable), and provide teardown. Search commands rely on the deamon status instead of running local indexing passes.
 - **Auto-start:** `vault init` now offers to register per-user auto-start units (launchd on macOS, `systemd --user` on Linux), persists manifest metadata under `.arrowhead/deamon/autostart/`, surfaces enablement in `vault status`, and ensures `vault cleanup` removes the units.
 - **Search:** `arrowhead search fts` executes against SQLite FTS5 with `field:value` and boolean syntax, stemming (`porter`) enabled, richer relevance scores, and cleaner snippets while relying on the deamon-maintained index (no inline refresh).
-- **Deamon runtime:** New `arrowhead-deamon` crate (Tokio binary `arrowheadd` + library) exposes `status`/`shutdown` JSON socket commands, persists PID/status/log files under `.arrowhead/deamon`, and streams filesystem events via `notify` to `Indexer::reindex_paths`. Poll-based watcher integration tests verify path reindex + status updates. Semantic embedding refresh is still CLI-triggered; daemon integration remains on the roadmap.
+- **Deamon runtime:** New `arrowhead-deamon` crate (Tokio binary `arrowheadd` + library) exposes `status`/`shutdown` JSON socket commands, persists PID/status/log files under `.arrowhead/deamon`, and streams filesystem events via `notify` to `Indexer::reindex_paths`. Poll-based watcher integration tests verify path reindex + status updates. When semantic indexing is enabled the runtime now initialises the fastembed + LanceDB pipeline itself, streaming Hugging Face download progress into `DeamonStatus.downloads`, raising issues on failure, and falling back to FTS-only indexing if the model cannot be prepared.
 - **CI:** GitHub Actions workflow (`CI`) runs on push/PR/workflow_dispatch, enforcing fmt, clippy, check, and test across the workspace.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`) and updated to include the deamon crate/runtime responsibilities; feature development guide established; integration fixtures ready.
-- **Vectors:** Semantic pipeline (fastembed + LanceDB) integrates with indexing and CLI search when the optional `vector-lancedb` feature is enabled; defaults to FTS-only when the feature is off. Vector builds skip per-command file logging by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1` to opt in) while we stabilise LanceDB tracing behaviour.
+- **Vectors:** Semantic pipeline (fastembed + LanceDB) integrates with indexing, the deamon runtime, and CLI search when the optional `vector-lancedb` feature is enabled; defaults to FTS-only when the feature is off or `--fts-only` is chosen. Vector builds skip per-command file logging by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1` to opt in) while we stabilise LanceDB tracing behaviour.
 
 ## Completed Work (Phase 0-1)
 
@@ -37,7 +37,7 @@
 
 2. **Model Management & UX**
    - Finalise licensing guidance for the shipped presets and surface model selection in docs/CLI help.
-   - Allow opt-in cache directory overrides and surface download progress in CLI output.
+   - Allow opt-in cache directory overrides and consider richer CLI presentation for deamon-reported download progress.
 
 3. **Graph Pipeline (Phase 3)**
    - Defer WikiLink resolution persistence to the upcoming graph implementation; schedule planning session ahead of Phase 3 kickoff.
@@ -54,6 +54,9 @@
 - **Schema migrations:** Continue relying on drop-and-reindex for incompatible schemas; document any future scenarios that require persistent migrations.
 - **Concurrent access:** Clarify whether multi-process vault access needs to be supported in v1.
 - **Protobuf tooling:** `vector-lancedb` builds need `protoc` on developer and CI machines; decide whether to vendor binaries or document the prerequisite.
+- **Daemon logging:** File logging currently only emits the startup banner in some environments; investigate tracing subscriber configuration so progress entries persist to `.arrowhead/logs/daemon.log`.
+- **Watcher telemetry:** Incremental reindexing updates status counters but does not yet surface per-note progress in logs; add richer progress hooks.
+- **Indexing diagnostics:** Some vaults still report failed notes without actionable errors—improve logging around extraction failures and include note identifiers in the status output.
 
 ## Tracking
 

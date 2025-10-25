@@ -6,6 +6,7 @@
 //! `status` and `shutdown` commands.
 
 mod control;
+mod logging;
 mod runtime;
 mod watcher;
 

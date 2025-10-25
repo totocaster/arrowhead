@@ -22,6 +22,7 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
     let (temp_dir, vault_root) = prepare_vault()?;
 
     let handle = DeamonRuntimeBuilder::new(&vault_root)
+        .disable_embeddings()
         .watcher_strategy(WatcherStrategy::Poll {
             interval: Duration::from_millis(50),
         })
@@ -65,6 +66,7 @@ async fn control_socket_status_and_shutdown() -> Result<()> {
     let (temp_dir, vault_root) = prepare_vault()?;
 
     let handle = DeamonRuntimeBuilder::new(&vault_root)
+        .disable_embeddings()
         .watcher_strategy(WatcherStrategy::Poll {
             interval: Duration::from_millis(50),
         })

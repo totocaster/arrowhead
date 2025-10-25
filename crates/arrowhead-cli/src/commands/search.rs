@@ -290,6 +290,7 @@ mod tests {
         write_note(&note_path);
 
         let handle = DeamonRuntimeBuilder::new(vault_dir.path())
+            .disable_embeddings()
             .watcher_strategy(WatcherStrategy::Poll {
                 interval: Duration::from_millis(50),
             })

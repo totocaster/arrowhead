@@ -147,10 +147,19 @@ impl AutoStartManager {
 
     /// Install auto-start support for the given vault and binary, returning the
     /// manifest describing the installed unit.
-    pub fn install(&self, vault_path: &Path, deamon_binary: &Path) -> Result<AutoStartManifest> {
+    pub fn install(
+        &self,
+        vault_path: &Path,
+        deamon_binary: &Path,
+        embedding_model: Option<&str>,
+    ) -> Result<AutoStartManifest> {
         match self.provider {
-            AutoStartProvider::Launchd => self.install_launchd(vault_path, deamon_binary),
-            AutoStartProvider::SystemdUser => self.install_systemd(vault_path, deamon_binary),
+            AutoStartProvider::Launchd => {
+                self.install_launchd(vault_path, deamon_binary, embedding_model)
+            }
+            AutoStartProvider::SystemdUser => {
+                self.install_systemd(vault_path, deamon_binary, embedding_model)
+            }
         }
     }
 
@@ -183,6 +192,7 @@ impl AutoStartManager {
         &self,
         vault_path: &Path,
         deamon_binary: &Path,
+        embedding_model: Option<&str>,
     ) -> Result<AutoStartManifest> {
         let home = UserDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
@@ -198,7 +208,7 @@ impl AutoStartManager {
         let label = format!("com.arrowhead.deamon.{}", vault_slug(vault_path)?);
         let plist_path = agents_dir.join(format!("{label}.plist"));
 
-        let plist = render_launchd_plist(&label, deamon_binary, vault_path);
+        let plist = render_launchd_plist(&label, deamon_binary, vault_path, embedding_model);
         fs::write(&plist_path, plist)
             .with_context(|| format!("failed to write launchd plist {}", plist_path.display()))?;
 
@@ -327,6 +337,7 @@ impl AutoStartManager {
         &self,
         vault_path: &Path,
         deamon_binary: &Path,
+        embedding_model: Option<&str>,
     ) -> Result<AutoStartManifest> {
         let home = UserDirs::new()
             .map(|dirs| dirs.home_dir().to_path_buf())
@@ -342,7 +353,7 @@ impl AutoStartManager {
         let unit_name = format!("arrowheadd-{}.service", vault_slug(vault_path)?);
         let unit_path = units_dir.join(&unit_name);
 
-        let unit = render_systemd_unit(deamon_binary, vault_path);
+        let unit = render_systemd_unit(deamon_binary, vault_path, embedding_model);
         fs::write(&unit_path, unit)
             .with_context(|| format!("failed to write systemd unit {}", unit_path.display()))?;
 
@@ -513,11 +524,17 @@ fn vault_slug(vault_path: &Path) -> Result<String> {
     Ok(format!("{}-{}", clean.trim_matches('-'), hash))
 }
 
-fn render_launchd_plist(label: &str, binary: &Path, vault: &Path) -> String {
+fn render_launchd_plist(
+    label: &str,
+    binary: &Path,
+    vault: &Path,
+    embedding_model: Option<&str>,
+) -> String {
     let program = binary.display();
     let vault_path = vault.display();
-    let log_path = vault.join(".arrowhead/logs/arrowheadd.log");
+    let log_path = vault.join(".arrowhead/logs/daemon.log");
     let log_display = log_path.display();
+    let embedding = embedding_model.unwrap_or("none");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -533,6 +550,8 @@ fn render_launchd_plist(label: &str, binary: &Path, vault: &Path) -> String {
     <dict>
         <key>ARROWHEAD_VAULT</key>
         <string>{vault_path}</string>
+        <key>ARROWHEAD_EMBEDDING_MODEL</key>
+        <string>{embedding}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -548,11 +567,12 @@ fn render_launchd_plist(label: &str, binary: &Path, vault: &Path) -> String {
     )
 }
 
-fn render_systemd_unit(binary: &Path, vault: &Path) -> String {
+fn render_systemd_unit(binary: &Path, vault: &Path, embedding_model: Option<&str>) -> String {
     let program = binary.display();
     let vault_path = vault.display();
-    let log_path = vault.join(".arrowhead/logs/arrowheadd.log");
+    let log_path = vault.join(".arrowhead/logs/daemon.log");
     let log_display = log_path.display();
+    let embedding = embedding_model.unwrap_or("none");
     format!(
         r#"[Unit]
 Description=Arrowhead deamon for {vault_path}
@@ -562,6 +582,7 @@ After=network.target
 Type=simple
 ExecStart={program}
 Environment="ARROWHEAD_VAULT={vault_path}"
+Environment="ARROWHEAD_EMBEDDING_MODEL={embedding}"
 StandardOutput=append:{log_display}
 StandardError=append:{log_display}
 Restart=on-failure

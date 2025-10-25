@@ -13,6 +13,7 @@ use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use tokio::time::{Instant, sleep};
+use tracing::info;
 
 use super::CommandContext;
 use crate::autostart::{
@@ -45,6 +46,8 @@ pub enum VaultAction {
     Stop,
     /// Stop the deamon (if running) and remove Arrowhead caches from the vault.
     Cleanup,
+    /// Manage auto-start integration for the vault.
+    Autostart(VaultAutostartCommand),
 }
 
 /// Options for `vault init`.
@@ -56,6 +59,9 @@ pub struct VaultInitArgs {
     /// Prepare the vault without launching the deamon.
     #[arg(long)]
     pub no_start: bool,
+    /// Disable semantic indexing when initialising the vault.
+    #[arg(long)]
+    pub fts_only: bool,
 }
 
 /// Options for `vault status`.
@@ -74,6 +80,25 @@ pub struct VaultStartArgs {
     pub no_wait: bool,
 }
 
+/// Options for `vault autostart`.
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+pub struct VaultAutostartCommand {
+    /// Auto-start operation to perform.
+    #[command(subcommand)]
+    pub action: VaultAutostartAction,
+}
+
+/// Supported auto-start operations.
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+pub enum VaultAutostartAction {
+    /// Install and enable auto-start for this vault.
+    Enable,
+    /// Disable auto-start and remove installed units.
+    Disable,
+    /// Display the current auto-start status.
+    Status,
+}
+
 /// Execute the vault command.
 pub async fn run(ctx: &mut CommandContext, command: &VaultCommand) -> Result<()> {
     match &command.action {
@@ -82,6 +107,7 @@ pub async fn run(ctx: &mut CommandContext, command: &VaultCommand) -> Result<()>
         VaultAction::Start(args) => handle_start(ctx, args).await?,
         VaultAction::Stop => handle_stop(ctx).await?,
         VaultAction::Cleanup => handle_cleanup(ctx).await?,
+        VaultAction::Autostart(command) => handle_autostart(ctx, command).await?,
     }
 
     Ok(())
@@ -129,6 +155,7 @@ async fn handle_start(ctx: &mut CommandContext, args: &VaultStartArgs) -> Result
     }
 
     ensure_runtime_dirs(&vault, &paths)?;
+    println!("initialising arrowhead daemon…");
 
     let manager = AutoStartManager::detect(paths.autostart_manifest_path.clone());
     let mut pid: Option<u32> = None;
@@ -150,7 +177,8 @@ async fn handle_start(ctx: &mut CommandContext, args: &VaultStartArgs) -> Result
     }
 
     if pid.is_none() {
-        let spawned_pid = launch_deamon_process(&vault_path)?;
+        let spawned_pid =
+            launch_deamon_process(&vault_path, ctx.config.embedding_model.as_deref())?;
         pid = Some(spawned_pid);
         if ctx.config.deamon.auto_start_enabled.is_none() {
             ctx.config.deamon.auto_start_enabled = Some(false);
@@ -230,7 +258,18 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
 
     let (vault, paths) = load_vault_environment(&vault_path)?;
 
-    if paths.arrowhead_dir.exists() && !args.force {
+    let index_path = paths.arrowhead_dir.join("index.db");
+    let already_initialised = [
+        paths.status_path.as_path(),
+        paths.socket_path.as_path(),
+        paths.pid_path.as_path(),
+        paths.autostart_manifest_path.as_path(),
+        index_path.as_path(),
+    ]
+    .iter()
+    .any(|path| path.exists());
+
+    if already_initialised && !args.force {
         bail!(
             "Arrowhead is already initialised for this vault. Re-run with --force to reinitialise."
         );
@@ -242,8 +281,13 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
     }
 
     ensure_runtime_dirs(&vault, &paths)?;
+    println!("initialising arrowhead daemon…");
 
     ctx.config.vault = Some(vault.paths().root.clone());
+    if args.fts_only {
+        ctx.config.embedding_model = None;
+        info!("configured vault for full-text search only");
+    }
 
     let manager = AutoStartManager::detect(paths.autostart_manifest_path.clone());
     let mut manifest = match manager.as_ref() {
@@ -303,7 +347,7 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
                 let binary = find_deamon_binary()?;
                 manifest = Some(
                     manager
-                        .install(&vault_path, &binary)
+                        .install(&vault_path, &binary, ctx.config.embedding_model.as_deref())
                         .context("failed to install auto-start service")?,
                 );
                 println!("Auto-start configured; Arrowhead will launch on login.");
@@ -338,7 +382,8 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
     }
 
     if pid.is_none() {
-        let spawned_pid = launch_deamon_process(&vault_path)?;
+        let spawned_pid =
+            launch_deamon_process(&vault_path, ctx.config.embedding_model.as_deref())?;
         pid = Some(spawned_pid);
     }
 
@@ -417,6 +462,94 @@ async fn handle_cleanup(ctx: &mut CommandContext) -> Result<()> {
     Ok(())
 }
 
+async fn handle_autostart(ctx: &mut CommandContext, command: &VaultAutostartCommand) -> Result<()> {
+    let vault_path = resolve_vault_path(ctx)?;
+    let (vault, paths) = load_vault_environment(&vault_path)?;
+    ctx.config.vault = Some(vault.paths().root.clone());
+
+    match command.action {
+        VaultAutostartAction::Enable => {
+            ensure_runtime_dirs(&vault, &paths)?;
+
+            let manager = match AutoStartManager::detect(paths.autostart_manifest_path.clone()) {
+                Some(manager) => manager,
+                None => {
+                    println!("Auto-start is not supported on this platform.");
+                    ctx.config.deamon.auto_start_enabled = Some(false);
+                    ctx.persist()?;
+                    return Ok(());
+                }
+            };
+
+            let binary = find_deamon_binary()?;
+            let embedding_model = ctx.config.embedding_model.as_deref();
+            let manifest = manager.load_manifest()?;
+
+            let manifest = match manifest {
+                Some(existing) => {
+                    println!(
+                        "Auto-start already configured via {}.",
+                        provider_label(existing.provider)
+                    );
+                    existing
+                }
+                None => {
+                    let installed = manager
+                        .install(&vault_path, &binary, embedding_model)
+                        .context("failed to install auto-start service")?;
+                    println!(
+                        "Auto-start enabled via {}.",
+                        provider_label(installed.provider)
+                    );
+                    installed
+                }
+            };
+
+            if let Err(err) = manager.start_unit(&manifest) {
+                println!(
+                    "failed to start auto-start manager immediately ({err}); service will launch on next login"
+                );
+            }
+
+            ctx.config.deamon.auto_start_enabled = Some(true);
+            update_config_with_status(ctx, &paths, None)?;
+            ctx.persist()?;
+        }
+        VaultAutostartAction::Disable => {
+            let manager = match AutoStartManager::detect(paths.autostart_manifest_path.clone()) {
+                Some(manager) => manager,
+                None => {
+                    println!("Auto-start is not supported on this platform.");
+                    ctx.config.deamon.auto_start_enabled = Some(false);
+                    ctx.persist()?;
+                    return Ok(());
+                }
+            };
+
+            if let Some(manifest) = manager.load_manifest()? {
+                manager.uninstall(&manifest)?;
+                manager.remove_manifest()?;
+                println!(
+                    "Auto-start disabled (removed {}).",
+                    provider_label(manifest.provider)
+                );
+            } else {
+                println!("Auto-start is already disabled for this vault.");
+            }
+
+            ctx.config.deamon.auto_start_enabled = Some(false);
+            update_config_with_status(ctx, &paths, None)?;
+            ctx.persist()?;
+        }
+        VaultAutostartAction::Status => {
+            let status = auto_start_status(&paths)?;
+            print_autostart_status(&status);
+        }
+    }
+
+    Ok(())
+}
+
 fn resolve_vault_path(ctx: &CommandContext) -> Result<PathBuf> {
     ctx.config
         .vault
@@ -437,7 +570,7 @@ fn load_vault_environment(vault_path: &Path) -> Result<(Vault, DeamonPaths)> {
         status_path: vault_paths.arrowhead_dir.join("deamon/status.json"),
         socket_path: vault_paths.arrowhead_dir.join("deamon/control.sock"),
         pid_path: vault_paths.arrowhead_dir.join("deamon/deamon.pid"),
-        log_path: vault_paths.logs_dir().join("arrowheadd.log"),
+        log_path: vault_paths.logs_dir().join("daemon.log"),
     };
 
     Ok((vault, paths))
@@ -605,6 +738,27 @@ fn provider_label(provider: AutoStartProvider) -> &'static str {
     }
 }
 
+fn print_autostart_status(status: &AutoStartStatus) {
+    match status {
+        AutoStartStatus::Enabled { provider, active } => {
+            let state = if *active { "active" } else { "inactive" };
+            println!(
+                "Auto-start enabled via {} ({state}).",
+                provider_label(*provider)
+            );
+        }
+        AutoStartStatus::Disabled { provider } => {
+            println!(
+                "Auto-start is installed but disabled ({}).",
+                provider_label(*provider)
+            );
+        }
+        AutoStartStatus::Unsupported => {
+            println!("Auto-start is not available on this platform.");
+        }
+    }
+}
+
 fn ensure_runtime_dirs(vault: &Vault, paths: &DeamonPaths) -> Result<()> {
     vault.ensure_arrowhead_dirs()?;
     fs::create_dir_all(&paths.deamon_dir).with_context(|| {
@@ -652,7 +806,7 @@ fn find_deamon_binary() -> Result<PathBuf> {
     Ok(PathBuf::from(&candidate_names[0]))
 }
 
-fn launch_deamon_process(vault_path: &Path) -> Result<u32> {
+fn launch_deamon_process(vault_path: &Path, embedding_model: Option<&str>) -> Result<u32> {
     let binary = find_deamon_binary()?;
     let mut command = Command::new(&binary);
     command
@@ -660,6 +814,14 @@ fn launch_deamon_process(vault_path: &Path) -> Result<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    match embedding_model {
+        Some(model) => {
+            command.env("ARROWHEAD_EMBEDDING_MODEL", model);
+        }
+        None => {
+            command.env("ARROWHEAD_EMBEDDING_MODEL", "none");
+        }
+    }
 
     let child = command
         .spawn()
@@ -867,6 +1029,7 @@ mod tests {
         let args = VaultInitArgs {
             force: false,
             no_start: true,
+            fts_only: false,
         };
 
         handle_init(&mut ctx, &args).await.expect("init succeeds");

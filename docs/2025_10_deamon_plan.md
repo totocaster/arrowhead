@@ -57,22 +57,24 @@
        `deamon.pid`, `control.sock`, `autostart/` metadata); every artefact lives inside
        the vault for portability and backups. `status.json` reports total indexed notes,
        current error count, detailed activity status (including `idle`), download
-       progress for embeddings/models, outstanding issues, and the
-       `arrowheadd.log` path for diagnostics.
+      progress for embeddings/models, outstanding issues, and the
+      `daemon.log` path for diagnostics.
      - Exposes a JSON command interface over `.arrowhead/deamon/control.sock`
        (Unix domain socket, owner-only permissions) supporting `status`, `shutdown`,
        and health pings. The PID file enforces a single active deamon instance.
    - Observability:
-     - Structured `tracing` routed to `.arrowhead/logs/arrowheadd.log`, using the
-       same retention and rotation policy as `arrowhead.log`.
+     - Structured `tracing` routed to `.arrowhead/logs/daemon.log`, using the
+       same retention and rotation policy as `cli.log`.
      - Rotate logs similarly to CLI, keeping separation between CLI
-       (`arrowhead.log`) and background service logging.
+       (`cli.log`) and background service logging.
      - Emit counters for processed events, queued work, failures, time of last
        successful index, and index staleness.
    - Auto-start:
      - During `vault init`, prompt the user before installing a per-user `launchd`
        plist (macOS) or `systemd --user` unit (Linux). Follow-up commands (`start`,
        `stop`, `cleanup`) remain non-interactive.
+     - Expose explicit `vault autostart enable/disable/status` commands so users
+       can manage the integration after initial setup.
      - Maintain install status in `.arrowhead/deamon/autostart/` for troubleshooting,
        and ensure `vault cleanup` removes these units and marks them disabled.
      - After launching, inform the user that the first indexing pass may take time and
@@ -156,7 +158,7 @@
   status/log emissions.
 - Implement the Unix socket server at `.arrowhead/deamon/control.sock` with `status`
   and `shutdown` commands, ensuring single-instance enforcement.
-- Integrate logging to `.arrowhead/logs/arrowheadd.log` and ensure download
+- Integrate logging to `.arrowhead/logs/daemon.log` and ensure download
   progress + errors feed into `status.json`.
 
 **Phase 3 – CLI Integration & Auto-start**

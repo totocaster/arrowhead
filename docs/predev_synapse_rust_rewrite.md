@@ -265,7 +265,7 @@ arrowhead/
 **Runtime Behaviour:**
 - Launches from the `arrowhead-deamon` crate (binary `arrowheadd`) and expects `ARROWHEAD_VAULT` to point at the vault root.
 - Records status snapshots under `.arrowhead/deamon/status.json`, including indexed/error counts, current activity, queued jobs, download progress, and surfaced issues.
-- Writes structured logs to `.arrowhead/logs/arrowheadd.log`.
+- Writes structured logs to `.arrowhead/logs/daemon.log`.
 - Watches the vault (excluding `.arrowhead/`, ignored folders, and attachments) via `notify`, coalescing events into a bounded queue before calling `Indexer::reindex_paths`.
 - Persists a PID file and owns the control socket at `.arrowhead/deamon/control.sock`.
 

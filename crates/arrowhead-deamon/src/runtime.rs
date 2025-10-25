@@ -1,21 +1,33 @@
+use std::sync::Mutex as StdMutex;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
+use crate::logging::LoggingGuard;
 use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "vector-lancedb")]
+use arrowhead_core::embeddings::EmbeddingDescriptor;
+use arrowhead_core::embeddings::EmbeddingPipeline;
 use arrowhead_core::indexer::{Indexer, IndexerConfig};
 use arrowhead_core::sqlite::IndexDatabase;
 use arrowhead_core::{
-    ActivityState, ActivityStatus, DeamonStatus, InventorySnapshot, IssueSeverity, StatusIssue,
-    Vault, VaultConfig,
+    ActivityState, ActivityStatus, DeamonStatus, DownloadState, DownloadStatus, InventorySnapshot,
+    IssueSeverity, StatusIssue, Vault, VaultConfig,
 };
+#[cfg(feature = "vector-lancedb")]
+use fastembed::{EmbeddingModel, ModelTrait};
+#[cfg(feature = "vector-lancedb")]
+use hf_hub::api::{Progress, sync::ApiBuilder};
+#[cfg(feature = "vector-lancedb")]
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{
     sync::{Mutex, broadcast, mpsc},
     task::JoinHandle,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::control::{ControlRequest, ControlResponse, run_control_server, send_control_request};
 use crate::watcher::{WatcherHandle, WatcherStrategy, start_watcher};
@@ -24,7 +36,8 @@ use crate::watcher::{WatcherHandle, WatcherStrategy, start_watcher};
 pub struct DeamonConfig {
     pub(crate) vault: Arc<Vault>,
     pub(crate) database: Arc<IndexDatabase>,
-    pub(crate) indexer: Arc<Indexer>,
+    pub(crate) indexer_config: IndexerConfig,
+    pub(crate) embedding_model: Option<String>,
     pub(crate) status_path: PathBuf,
     pub(crate) socket_path: PathBuf,
     pub(crate) log_path: PathBuf,
@@ -38,6 +51,7 @@ pub struct DeamonRuntimeBuilder {
     watcher_strategy: WatcherStrategy,
     event_buffer: usize,
     indexer_config: IndexerConfig,
+    embedding_model: Option<String>,
 }
 
 impl DeamonRuntimeBuilder {
@@ -48,6 +62,7 @@ impl DeamonRuntimeBuilder {
             watcher_strategy: WatcherStrategy::Recommended,
             event_buffer: 128,
             indexer_config: IndexerConfig::default(),
+            embedding_model: None,
         }
     }
 
@@ -66,6 +81,20 @@ impl DeamonRuntimeBuilder {
     /// Override the indexer configuration.
     pub fn indexer_config(mut self, config: IndexerConfig) -> Self {
         self.indexer_config = config;
+        self
+    }
+
+    /// Configure the embedding model identifier used by the runtime.
+    ///
+    /// Passing `None` disables semantic indexing.
+    pub fn embedding_model<S: Into<String>>(mut self, model: Option<S>) -> Self {
+        self.embedding_model = model.map(|value| value.into());
+        self
+    }
+
+    /// Disable semantic indexing, restricting the runtime to FTS updates.
+    pub fn disable_embeddings(mut self) -> Self {
+        self.embedding_model = None;
         self
     }
 
@@ -89,21 +118,16 @@ impl DeamonRuntimeBuilder {
 
         let status_path = deamon_dir.join("status.json");
         let socket_path = deamon_dir.join("control.sock");
-        let log_path = logs_dir.join("arrowheadd.log");
+        let log_path = logs_dir.join("daemon.log");
 
         let db_path = arrowhead_dir.join("index.db");
         let database = Arc::new(IndexDatabase::open(db_path)?);
-        let indexer = Arc::new(Indexer::new(
-            Arc::clone(&vault),
-            Arc::clone(&database),
-            self.indexer_config,
-            None,
-        ));
 
         Ok(DeamonConfig {
             vault,
             database,
-            indexer,
+            indexer_config: self.indexer_config,
+            embedding_model: self.embedding_model,
             status_path,
             socket_path,
             log_path,
@@ -196,14 +220,16 @@ impl DeamonHandle {
 /// Main runtime structure wiring watchers, event queue, and control server.
 struct DeamonRuntime {
     config: DeamonConfig,
+    indexer: Option<Arc<Indexer>>,
     status: Arc<Mutex<DeamonStatus>>,
     _watcher: WatcherHandle,
     event_rx: mpsc::Receiver<Vec<PathBuf>>,
     shutdown_tx: broadcast::Sender<()>,
+    _logging_guard: LoggingGuard,
 }
 
 impl DeamonRuntime {
-    fn new(config: DeamonConfig) -> Result<Self> {
+    async fn new(config: DeamonConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(config.event_buffer);
         let watcher_root = config.vault.paths().root.clone();
         let watcher = start_watcher(
@@ -212,6 +238,8 @@ impl DeamonRuntime {
             event_tx.clone(),
         )?;
 
+        let logging_guard = crate::logging::init_logging(&config.log_path)?;
+
         let status_snapshot = DeamonStatus::new(config.log_path.clone());
         status_snapshot.save_to_path(&config.status_path)?;
         let status = Arc::new(Mutex::new(status_snapshot));
@@ -219,15 +247,17 @@ impl DeamonRuntime {
 
         Ok(Self {
             config,
+            indexer: None,
             status,
             _watcher: watcher,
             event_rx,
             shutdown_tx,
+            _logging_guard: logging_guard,
         })
     }
 
     async fn spawn(config: DeamonConfig) -> Result<DeamonHandle> {
-        let runtime = DeamonRuntime::new(config)?;
+        let runtime = DeamonRuntime::new(config).await?;
         let shutdown_tx = runtime.shutdown_tx.clone();
         let status_path = runtime.config.status_path.clone();
         let socket_path = runtime.config.socket_path.clone();
@@ -260,6 +290,14 @@ impl DeamonRuntime {
                 .await
             })
         };
+
+        if let Err(err) = self.initialise_indexer().await {
+            let _ = self.shutdown_tx.send(());
+            if let Err(join_err) = control_task.await {
+                warn!(error = ?join_err, "control server task aborted during startup");
+            }
+            return Err(err);
+        }
 
         if let Err(err) = self.ensure_initial_index().await {
             let _ = self.shutdown_tx.send(());
@@ -314,7 +352,60 @@ impl DeamonRuntime {
         })
         .await?;
 
-        let stats = self.config.indexer.index_all().await?;
+        let indexer = self
+            .indexer
+            .as_ref()
+            .expect("indexer should be initialised before indexing")
+            .clone();
+        info!("starting initial indexing pass");
+
+        let status = Arc::clone(&self.status);
+        let status_path = self.config.status_path.clone();
+        let handle = tokio::runtime::Handle::current();
+        let throttle = Arc::new(StdMutex::new(Instant::now()));
+
+        let stats = indexer
+            .index_all_with_observer(|event| {
+                let should_emit = {
+                    if let Ok(mut guard) = throttle.lock() {
+                        if guard.elapsed() >= Duration::from_millis(500)
+                            || event.processed == event.total
+                        {
+                            *guard = Instant::now();
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                };
+
+                if !should_emit {
+                    return;
+                }
+
+                let status = Arc::clone(&status);
+                let status_path = status_path.clone();
+                let event = event.clone();
+                handle.spawn(async move {
+                    let remaining = event.total.saturating_sub(event.processed);
+                    let note_id = event.note_id.clone();
+                    let description =
+                        format!("indexing note {} of {}", event.processed, event.total);
+                    if let Err(err) = persist_status_to_path(&status, &status_path, |snapshot| {
+                        snapshot.activity.note_id = Some(note_id.clone());
+                        snapshot.activity.queued_jobs = remaining as usize;
+                        snapshot.activity.description = Some(description.clone());
+                        snapshot.indexed_notes = event.processed;
+                    })
+                    .await
+                    {
+                        debug!(error = ?err, "failed to persist indexing progress status");
+                    }
+                });
+            })
+            .await?;
         let snapshot: InventorySnapshot = self.config.vault.inventory_snapshot()?;
         let indexed_notes = snapshot.entries().len() as u64;
 
@@ -324,7 +415,30 @@ impl DeamonRuntime {
             status.activity = ActivityStatus::idle();
         })
         .await?;
+        info!(
+            indexed = stats.indexed,
+            skipped = stats.skipped,
+            removed = stats.removed,
+            errors = stats.errors,
+            total = stats.total_notes,
+            "initial indexing pass completed"
+        );
 
+        Ok(())
+    }
+
+    async fn initialise_indexer(&mut self) -> Result<()> {
+        if self.indexer.is_some() {
+            return Ok(());
+        }
+
+        let embeddings = prepare_embeddings(&self.config, Arc::clone(&self.status)).await?;
+        self.indexer = Some(Arc::new(Indexer::new(
+            Arc::clone(&self.config.vault),
+            Arc::clone(&self.config.database),
+            self.config.indexer_config.clone(),
+            embeddings,
+        )));
         Ok(())
     }
 
@@ -368,8 +482,17 @@ impl DeamonRuntime {
             status.activity.description = Some(format!("processing {} file(s)", target_list.len()));
         })
         .await?;
+        info!(
+            queued = queued_jobs,
+            targets = target_list.len(),
+            "processing watcher event batch"
+        );
 
-        let stats = self.config.indexer.reindex_paths(&target_list).await?;
+        let indexer = self
+            .indexer
+            .as_ref()
+            .expect("indexer should be initialised before reindexing");
+        let stats = indexer.reindex_paths(&target_list).await?;
         let indexed_notes = self.config.database.list_note_ids()?.len() as u64;
 
         self.persist_status(|status| {
@@ -378,24 +501,591 @@ impl DeamonRuntime {
             status.activity = ActivityStatus::idle();
         })
         .await?;
+        info!(
+            indexed = stats.indexed,
+            skipped = stats.skipped,
+            removed = stats.removed,
+            errors = stats.errors,
+            "watcher batch completed"
+        );
 
         Ok(())
     }
 
-    async fn persist_status<F>(&self, mut update: F) -> Result<()>
+    async fn persist_status<F>(&self, update: F) -> Result<()>
     where
         F: FnMut(&mut DeamonStatus),
     {
-        let mut status = self.status.lock().await;
-        update(&mut status);
-        status.touch();
-        status
-            .save_to_path(&self.config.status_path)
-            .context("failed to persist deamon status")
+        persist_status_to_path(&self.status, &self.config.status_path, update).await
     }
 }
 
+#[cfg(feature = "vector-lancedb")]
+async fn prepare_embeddings(
+    config: &DeamonConfig,
+    status: Arc<Mutex<DeamonStatus>>,
+) -> Result<Option<Arc<EmbeddingPipeline>>> {
+    use tokio::sync::mpsc::unbounded_channel;
+
+    let Some(model_id) = config.embedding_model.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }) else {
+        return Ok(None);
+    };
+
+    if !EmbeddingPipeline::is_supported() {
+        warn!(
+            model = model_id.as_str(),
+            "semantic indexing requested but embedding pipeline not supported in this build"
+        );
+        record_embedding_unavailable(&status, &config.status_path, &model_id).await?;
+        return Ok(None);
+    }
+
+    let descriptor = EmbeddingDescriptor::resolve(&model_id)
+        .with_context(|| format!("invalid embedding preset `{model_id}`"))?;
+    info!(
+        model = descriptor.identifier(),
+        "preparing embedding pipeline for daemon"
+    );
+    let paths = config.vault.paths();
+    let models_dir = paths
+        .arrowhead_dir
+        .join("models")
+        .join(descriptor.identifier());
+    let vectors_dir = paths.arrowhead_dir.join("vectors");
+
+    std::fs::create_dir_all(&models_dir).with_context(|| {
+        format!(
+            "failed to create embedding cache directory {}",
+            models_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(&vectors_dir).with_context(|| {
+        format!(
+            "failed to create vectors directory {}",
+            vectors_dir.display()
+        )
+    })?;
+
+    persist_status_to_path(&status, &config.status_path, |snapshot| {
+        snapshot
+            .downloads
+            .retain(|entry| !entry.item.starts_with(descriptor.identifier()));
+    })
+    .await?;
+
+    let (tx, rx) = unbounded_channel();
+    let descriptor_for_task = descriptor.clone();
+    let models_dir_for_task = models_dir.clone();
+    let download_handle = tokio::task::spawn_blocking(move || {
+        download_embedding_assets(&descriptor_for_task, &models_dir_for_task, tx)
+    });
+
+    let downloads_failed = consume_download_events(
+        &descriptor,
+        Arc::clone(&status),
+        config.status_path.clone(),
+        rx,
+    )
+    .await?;
+
+    let join_result = download_handle.await;
+
+    if downloads_failed {
+        if let Ok(Err(err)) = &join_result {
+            warn!(
+                error = ?err,
+                model = descriptor.identifier(),
+                "embedding download reported failure"
+            );
+        } else if let Err(err) = &join_result {
+            warn!(
+                error = ?err,
+                model = descriptor.identifier(),
+                "embedding download task panicked"
+            );
+        }
+        persist_status_to_path(&status, &config.status_path, |snapshot| {
+            if snapshot.activity.state == ActivityState::Downloading
+                || snapshot.activity.state == ActivityState::Faulted
+            {
+                snapshot.activity = ActivityStatus::idle();
+            }
+        })
+        .await?;
+        return Ok(None);
+    }
+
+    match join_result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            warn!(
+                error = ?err,
+                model = descriptor.identifier(),
+                "embedding download failed"
+            );
+            record_embedding_failure(&status, &config.status_path, &descriptor, err.to_string())
+                .await?;
+            persist_status_to_path(&status, &config.status_path, |snapshot| {
+                snapshot.activity = ActivityStatus::idle();
+            })
+            .await?;
+            return Ok(None);
+        }
+        Err(err) => {
+            warn!(
+                error = ?err,
+                model = descriptor.identifier(),
+                "embedding download task panicked"
+            );
+            record_embedding_failure(
+                &status,
+                &config.status_path,
+                &descriptor,
+                format!("download task panicked: {err}"),
+            )
+            .await?;
+            persist_status_to_path(&status, &config.status_path, |snapshot| {
+                snapshot.activity = ActivityStatus::idle();
+            })
+            .await?;
+            return Ok(None);
+        }
+    }
+
+    match EmbeddingPipeline::initialise(&config.vault, &model_id).await {
+        Ok(pipeline) => {
+            if pipeline.model_changed() {
+                persist_status_to_path(&status, &config.status_path, |snapshot| {
+                    if let Some(entry) = snapshot
+                        .downloads
+                        .iter_mut()
+                        .find(|entry| entry.item.starts_with(descriptor.identifier()))
+                    {
+                        entry.message = Some("model updated; vectors rebuilt".to_string());
+                    }
+                })
+                .await?;
+            }
+            persist_status_to_path(&status, &config.status_path, |snapshot| {
+                if snapshot.activity.state == ActivityState::Downloading
+                    || snapshot.activity.state == ActivityState::Faulted
+                {
+                    snapshot.activity = ActivityStatus::idle();
+                }
+            })
+            .await?;
+            info!(
+                model = pipeline.descriptor().identifier(),
+                "embedding pipeline initialised"
+            );
+            Ok(Some(Arc::new(pipeline)))
+        }
+        Err(err) => {
+            warn!(
+                error = ?err,
+                model = descriptor.identifier(),
+                "failed to initialise embedding pipeline"
+            );
+            record_embedding_failure(&status, &config.status_path, &descriptor, err.to_string())
+                .await?;
+            persist_status_to_path(&status, &config.status_path, |snapshot| {
+                snapshot.activity = ActivityStatus::idle();
+            })
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(feature = "vector-lancedb")]
+#[derive(Debug, Clone)]
+enum DownloadEvent {
+    Started {
+        item: String,
+        total: Option<u64>,
+    },
+    Progress {
+        item: String,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    Completed {
+        item: String,
+        downloaded: u64,
+        total: Option<u64>,
+        cached: bool,
+    },
+    Failed {
+        item: String,
+        message: String,
+    },
+}
+
+#[cfg(feature = "vector-lancedb")]
+#[derive(Default, Clone)]
+struct ProgressState {
+    downloaded: u64,
+    total: Option<u64>,
+    last_reported: u64,
+}
+
+#[cfg(feature = "vector-lancedb")]
+struct ObserverProgress {
+    item: String,
+    sender: UnboundedSender<DownloadEvent>,
+    state: Arc<StdMutex<ProgressState>>,
+}
+
+#[cfg(feature = "vector-lancedb")]
+impl ObserverProgress {
+    fn with_state(
+        item: String,
+        sender: UnboundedSender<DownloadEvent>,
+        state: Arc<StdMutex<ProgressState>>,
+    ) -> Self {
+        Self {
+            item,
+            sender,
+            state,
+        }
+    }
+}
+
+#[cfg(feature = "vector-lancedb")]
+impl Progress for ObserverProgress {
+    fn init(&mut self, size: usize, _filename: &str) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.total = Some(size as u64);
+            guard.downloaded = 0;
+            guard.last_reported = 0;
+        }
+        let _ = self.sender.send(DownloadEvent::Started {
+            item: self.item.clone(),
+            total: Some(size as u64),
+        });
+    }
+
+    fn update(&mut self, size: usize) {
+        let mut should_emit = false;
+        let mut downloaded = 0;
+        let mut total = None;
+        if let Ok(mut guard) = self.state.lock() {
+            guard.downloaded = guard.downloaded.saturating_add(size as u64);
+            downloaded = guard.downloaded;
+            total = guard.total;
+            if guard.downloaded.saturating_sub(guard.last_reported) >= 512 * 1024 {
+                guard.last_reported = guard.downloaded;
+                should_emit = true;
+            }
+        }
+        if should_emit {
+            let _ = self.sender.send(DownloadEvent::Progress {
+                item: self.item.clone(),
+                downloaded,
+                total,
+            });
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.last_reported = guard.downloaded;
+        }
+    }
+}
+
+#[cfg(feature = "vector-lancedb")]
+fn download_embedding_assets(
+    descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
+    cache_dir: &Path,
+    sender: UnboundedSender<DownloadEvent>,
+) -> Result<()> {
+    let model_info = EmbeddingModel::get_model_info(descriptor.model())
+        .ok_or_else(|| anyhow!("missing model metadata for {}", descriptor.identifier()))?;
+
+    let api = ApiBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .with_progress(false)
+        .build()
+        .context("failed to initialise hf-hub client")?;
+    let repo = api.model(model_info.model_code.clone());
+
+    let mut assets = Vec::new();
+    assets.push(model_info.model_file.clone());
+    assets.extend(model_info.additional_files.clone());
+
+    for asset in assets {
+        let item = format!("{}:{}", descriptor.identifier(), asset);
+        let progress_state = Arc::new(StdMutex::new(ProgressState::default()));
+        let observer =
+            ObserverProgress::with_state(item.clone(), sender.clone(), Arc::clone(&progress_state));
+        match repo.download_with_progress(&asset, observer) {
+            Ok(path) => {
+                let metadata_size = std::fs::metadata(&*path).ok().map(|meta| meta.len());
+                let snapshot = progress_state
+                    .lock()
+                    .expect("progress state poisoned")
+                    .clone();
+                let total = snapshot.total.or(metadata_size);
+                let downloaded = if snapshot.downloaded > 0 {
+                    snapshot.downloaded
+                } else {
+                    total.unwrap_or(0)
+                };
+                let cached = snapshot.downloaded == 0 && downloaded > 0;
+                let _ = sender.send(DownloadEvent::Completed {
+                    item,
+                    downloaded,
+                    total,
+                    cached,
+                });
+            }
+            Err(err) => {
+                let _ = sender.send(DownloadEvent::Failed {
+                    item,
+                    message: err.to_string(),
+                });
+                return Err(err.into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "vector-lancedb")]
+async fn consume_download_events(
+    descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
+    status: Arc<Mutex<DeamonStatus>>,
+    status_path: PathBuf,
+    mut rx: UnboundedReceiver<DownloadEvent>,
+) -> Result<bool> {
+    let mut failed = false;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            DownloadEvent::Started { item, total } => {
+                info!(item = %item, total = total.unwrap_or(0), "embedding download started");
+                persist_status_to_path(&status, &status_path, |snapshot| {
+                    if snapshot.activity.state != ActivityState::Downloading {
+                        snapshot.activity =
+                            ActivityStatus::running(ActivityState::Downloading, None, 0);
+                        snapshot.activity.description = Some(format!(
+                            "downloading embeddings for {}",
+                            descriptor.identifier()
+                        ));
+                    }
+                    let entry = ensure_download_entry(snapshot, &item);
+                    entry.state = DownloadState::InProgress;
+                    entry.bytes_total = total;
+                    entry.bytes_downloaded = 0;
+                    entry.message = Some("downloading".to_string());
+                })
+                .await?;
+            }
+            DownloadEvent::Progress {
+                item,
+                downloaded,
+                total,
+            } => {
+                persist_status_to_path(&status, &status_path, |snapshot| {
+                    let entry = ensure_download_entry(snapshot, &item);
+                    entry.state = DownloadState::InProgress;
+                    entry.bytes_total = entry.bytes_total.or(total);
+                    entry.bytes_downloaded = downloaded;
+                })
+                .await?;
+            }
+            DownloadEvent::Completed {
+                item,
+                downloaded,
+                total,
+                cached,
+            } => {
+                info!(item = %item, cached, downloaded, "embedding download completed");
+                persist_status_to_path(&status, &status_path, |snapshot| {
+                    let entry = ensure_download_entry(snapshot, &item);
+                    entry.state = DownloadState::Completed;
+                    entry.bytes_total = entry.bytes_total.or(total).or(Some(downloaded));
+                    entry.bytes_downloaded = entry.bytes_total.unwrap_or(downloaded);
+                    entry.message = if cached {
+                        Some("cache hit".to_string())
+                    } else {
+                        Some("downloaded".to_string())
+                    };
+                })
+                .await?;
+            }
+            DownloadEvent::Failed { item, message } => {
+                failed = true;
+                let descriptor_id = descriptor.identifier().to_string();
+                warn!(item = %item, error = %message, "embedding download failed");
+                persist_status_to_path(&status, &status_path, move |snapshot| {
+                    let entry = ensure_download_entry(snapshot, &item);
+                    entry.state = DownloadState::Failed;
+                    entry.message = Some(message.clone());
+                    snapshot.activity = ActivityStatus::running(ActivityState::Faulted, None, 0);
+                    snapshot.activity.description = Some(format!(
+                        "failed to download embeddings for {}",
+                        descriptor_id
+                    ));
+                    snapshot
+                        .issues
+                        .retain(|issue| issue.code != EMBEDDING_DOWNLOAD_ISSUE_CODE);
+                    let mut issue = StatusIssue::new(
+                        EMBEDDING_DOWNLOAD_ISSUE_CODE,
+                        format!("failed to download embedding assets for {}", descriptor_id),
+                        IssueSeverity::Error,
+                    );
+                    issue.detail = Some(message.clone());
+                    snapshot.issues.push(issue);
+                })
+                .await?;
+            }
+        }
+    }
+
+    Ok(failed)
+}
+
+#[cfg(feature = "vector-lancedb")]
+fn ensure_download_entry<'a>(status: &'a mut DeamonStatus, item: &str) -> &'a mut DownloadStatus {
+    if let Some(index) = status.downloads.iter().position(|entry| entry.item == item) {
+        &mut status.downloads[index]
+    } else {
+        status
+            .downloads
+            .push(DownloadStatus::pending(item.to_string()));
+        status
+            .downloads
+            .last_mut()
+            .expect("download entry should exist")
+    }
+}
+
+#[cfg(feature = "vector-lancedb")]
+async fn record_embedding_failure(
+    status: &Arc<Mutex<DeamonStatus>>,
+    status_path: &Path,
+    descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
+    detail: String,
+) -> Result<()> {
+    let descriptor_id = descriptor.identifier().to_string();
+    persist_status_to_path(status, status_path, move |snapshot| {
+        snapshot
+            .issues
+            .retain(|issue| issue.code != EMBEDDING_INIT_ISSUE_CODE);
+        if let Some(entry) = snapshot
+            .downloads
+            .iter_mut()
+            .find(|entry| entry.item.starts_with(&descriptor_id))
+        {
+            entry.state = DownloadState::Failed;
+            entry.message = Some(detail.clone());
+        }
+        let mut issue = StatusIssue::new(
+            EMBEDDING_INIT_ISSUE_CODE,
+            format!(
+                "semantic embeddings unavailable for model {}",
+                descriptor_id
+            ),
+            IssueSeverity::Error,
+        );
+        issue.detail = Some(detail.clone());
+        snapshot.issues.push(issue);
+    })
+    .await
+}
+
+async fn record_embedding_unavailable(
+    status: &Arc<Mutex<DeamonStatus>>,
+    status_path: &Path,
+    model_id: &str,
+) -> Result<()> {
+    persist_status_to_path(status, status_path, |snapshot| {
+        snapshot
+            .issues
+            .retain(|issue| issue.code != EMBEDDINGS_UNAVAILABLE_ISSUE_CODE);
+        if let Some(entry) = snapshot
+            .downloads
+            .iter_mut()
+            .find(|entry| entry.item == model_id)
+        {
+            entry.state = DownloadState::Failed;
+            entry.message = Some("binary lacks LanceDB support".to_string());
+        } else {
+            let mut entry = DownloadStatus::pending(model_id.to_string());
+            entry.state = DownloadState::Failed;
+            entry.message = Some("binary lacks LanceDB support".to_string());
+            snapshot.downloads.push(entry);
+        }
+        let mut issue = StatusIssue::new(
+            EMBEDDINGS_UNAVAILABLE_ISSUE_CODE,
+            format!(
+                "semantic embeddings disabled (model `{model_id}` requires vector-lancedb feature)"
+            ),
+            IssueSeverity::Warning,
+        );
+        issue.detail = Some(
+            "Rebuild Arrowhead with --features vector-lancedb to enable semantic search."
+                .to_string(),
+        );
+        snapshot.issues.push(issue);
+    })
+    .await
+}
+
+#[cfg(not(feature = "vector-lancedb"))]
+async fn prepare_embeddings(
+    config: &DeamonConfig,
+    status: Arc<Mutex<DeamonStatus>>,
+) -> Result<Option<Arc<EmbeddingPipeline>>> {
+    if let Some(model_id) = config.embedding_model.as_ref().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }) {
+        warn!(
+            model = model_id.as_str(),
+            "semantic embeddings requested but the binary was built without LanceDB support"
+        );
+        record_embedding_unavailable(&status, &config.status_path, &model_id).await?;
+    }
+    Ok(None)
+}
+
+async fn persist_status_to_path<F>(
+    status: &Arc<Mutex<DeamonStatus>>,
+    path: &Path,
+    mut update: F,
+) -> Result<()>
+where
+    F: FnMut(&mut DeamonStatus),
+{
+    let mut guard = status.lock().await;
+    update(&mut guard);
+    guard.touch();
+    guard
+        .save_to_path(path)
+        .context("failed to persist deamon status")
+}
+
 const INDEX_ERROR_CODE: &str = "index_errors";
+#[cfg(feature = "vector-lancedb")]
+const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
+#[cfg(feature = "vector-lancedb")]
+const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
+const EMBEDDINGS_UNAVAILABLE_ISSUE_CODE: &str = "embedding_unavailable";
 
 fn update_index_error_issue(status: &mut DeamonStatus, errors: u64) {
     status.error_notes = errors;
@@ -425,7 +1115,25 @@ pub async fn cli_main() -> Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("ARROWHEAD_VAULT environment variable must be set"))?;
 
-    let handle = DeamonRuntimeBuilder::new(root).spawn().await?;
+    let embedding_model = match std::env::var("ARROWHEAD_EMBEDDING_MODEL") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            let normalized = trimmed.to_ascii_lowercase();
+            if trimmed.is_empty()
+                || matches!(normalized.as_str(), "none" | "off" | "fts-only" | "fts")
+            {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(_) => Some("fast".to_string()),
+    };
+
+    let handle = DeamonRuntimeBuilder::new(root)
+        .embedding_model(embedding_model)
+        .spawn()
+        .await?;
     info!("arrowhead deamon started; waiting for shutdown signal");
 
     tokio::signal::ctrl_c()

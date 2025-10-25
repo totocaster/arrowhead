@@ -12,14 +12,15 @@ Arrowhead references the precision obsidian tools used by prehistoric humans for
 
 ### Available today
 
-- **Smart Indexing**: On-demand indexing with staleness detection (only reindex changed notes)
-- **Obsidian-Aware**: Automatically honours `.obsidian/app.json` settings (ignored folders, attachments)
-- **Notes CLI**: `arrowhead notes read/list/create/update/delete` manages Markdown notes directly
-- **Full-Text Search**: SQLite FTS5-based keyword search with field:value syntax
-- **Semantic Search**: Vector embeddings for conceptual similarity search (enable with `--features vector-lancedb`)
-- **Hybrid Search**: Combined FTS + semantic scoring with per-result reasoning
-- **Match Explanations**: Each search result shows why it ranked (FTS rank vs semantic similarity)
-- **Progress & Logging**: `arrowhead index --progress` shows live progress; set `ARROWHEAD_ENABLE_FILE_LOGS=1` to emit per-command log files when running with LanceDB
+- **Background daemon**: `arrowhead init` provisions `.arrowhead/` scaffolding, launches `arrowheadd`, and keeps the SQLite + LanceDB indexes hot via filesystem watching.
+- **Auto-start integration**: `arrowhead vault autostart enable|disable|status` manages launchd (macOS) or systemd --user (Linux) units so the daemon comes up automatically on login.
+- **Status telemetry**: `arrowhead vault status` surfaces the daemon’s live activity, download progress, note/error counts, and log locations (`.arrowhead/logs/cli.log`, `.arrowhead/logs/daemon.log`).
+- **Smart indexing**: Incremental reindexing with staleness detection so only changed notes are processed.
+- **Obsidian-aware**: Automatically honours `.obsidian/app.json` settings (ignored folders, attachments) when scanning the vault.
+- **Notes CLI**: `arrowhead notes read/list/create/update/delete` manages Markdown notes directly from the terminal.
+- **Full-text search**: SQLite FTS5-based keyword search with `field:value` syntax and porter stemming.
+- **Semantic + hybrid search**: fastembed models (build with `--features vector-lancedb`) deliver semantic and combined scoring with per-result reasoning snippets.
+- **Model management**: Daemon coordinates Hugging Face downloads with progress surfaced in `vault status`.
 
 ### Coming soon
 
@@ -65,8 +66,8 @@ cargo build
 # Build release version
 cargo build --release
 
-# Install the CLI (optional)
-make install PREFIX=$HOME/.local
+# Install CLI + daemon (installs both `arrowhead` and `arrowheadd` with LanceDB support)
+make install PREFIX=$HOME/.local LOCKED=0 FORCE=1
 
 # Run CLI
 arrowhead --help
@@ -74,6 +75,35 @@ arrowhead --help
 # Run tests
 cargo test
 ```
+
+## Usage overview
+
+```bash
+# Initialise a vault (creates .arrowhead/, starts the daemon, optional semantic preset)
+arrowhead init --vault /path/to/vault [--embeddings fast|good|better]
+
+# Check daemon status (activity, note counts, download progress, log paths)
+arrowhead vault status
+
+# Manage auto-start registration
+arrowhead vault autostart enable
+arrowhead vault autostart status
+arrowhead vault autostart disable
+
+# Read live logs (CLI + daemon)
+tail -f /path/to/vault/.arrowhead/logs/cli.log
+tail -f /path/to/vault/.arrowhead/logs/daemon.log
+
+# Stop the daemon or clean up all Arrowhead artefacts
+arrowhead vault stop
+arrowhead vault cleanup
+```
+
+## Known issues
+
+- **Sparse daemon logging**: Some environments only emit the start banner in `daemon.log`. A follow-up task is tracking the active tracing subscriber so indexing/download entries are preserved.
+- **Watcher visibility**: Incremental reindexing currently updates status snapshots but may not log per-note progress yet.
+- **Indexing failures**: A handful of notes can still fail to index without detailed diagnostics; richer error logging is on the roadmap.
 
 ## License
 
