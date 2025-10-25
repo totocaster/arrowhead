@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use anyhow::Result;
 use serde_json::Value;
+use tracing::debug;
 
 use crate::{MetadataMap, NoteRecord};
 
@@ -57,6 +58,13 @@ impl MetadataExtractor {
         metadata.insert(
             "wikilinks".to_string(),
             Value::Array(wikilinks.iter().cloned().map(Value::String).collect()),
+        );
+
+        debug!(
+            note_id = %note.id,
+            tag_count = tags_vec.len(),
+            wikilink_count = wikilinks.len(),
+            "extracted metadata from note"
         );
 
         Ok(MetadataExtraction {

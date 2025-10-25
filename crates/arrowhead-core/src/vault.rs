@@ -18,7 +18,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::types::VaultPaths;
 use crate::{MetadataMap, NoteId, NoteRecord};
@@ -119,6 +119,29 @@ impl Vault {
             .attachments_folder()
             .map(|relative| root.join(relative));
 
+        let attachments_dir_display = attachments_dir
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| "<default>".to_string());
+        let ignored_paths: Vec<String> = settings
+            .ignored_folders()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let ignored_summary = if ignored_paths.is_empty() {
+            "<none>".to_string()
+        } else {
+            ignored_paths.join(", ")
+        };
+
+        info!(
+            root = %root.display(),
+            arrowhead_dir = %arrowhead_dir.display(),
+            attachments_dir = attachments_dir_display.as_str(),
+            ignored_folders = ignored_summary.as_str(),
+            "initialised vault configuration"
+        );
+
         Ok(Self {
             paths: Arc::new(VaultPaths::new(
                 root,
@@ -142,6 +165,10 @@ impl Vault {
 
     /// Ensure the Arrowhead working directory exists inside the vault.
     pub fn ensure_arrowhead_dirs(&self) -> Result<()> {
+        debug!(
+            arrowhead_dir = %self.paths.arrowhead_dir.display(),
+            "ensuring arrowhead working directories"
+        );
         if let Some(parent) = self.paths.arrowhead_dir.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create parent directory {}", parent.display())
@@ -155,6 +182,10 @@ impl Vault {
             )
         })?;
 
+        info!(
+            arrowhead_dir = %self.paths.arrowhead_dir.display(),
+            "arrowhead working directories ready"
+        );
         Ok(())
     }
 
@@ -181,6 +212,12 @@ impl Vault {
         let mut relative = self.relative_path_from_id(note_id)?;
         relative.set_extension("md");
         let absolute = self.note_path(&relative);
+
+        info!(
+            note_id = note_id,
+            path = %absolute.display(),
+            "writing note to disk"
+        );
 
         if let Some(parent) = absolute.parent() {
             fs::create_dir_all(parent)
@@ -223,6 +260,12 @@ impl Vault {
         let mut entries = Vec::new();
         let mut ids = BTreeMap::new();
 
+        debug!(
+            root = %self.paths.root.display(),
+            ignored = self.settings.ignored_folders().len(),
+            "building vault inventory"
+        );
+
         for relative_path in collect_markdown_files(
             &self.paths.root,
             Some(&self.paths.arrowhead_dir),
@@ -231,6 +274,11 @@ impl Vault {
         )? {
             let note_id = derive_note_id(&relative_path)?;
             if ids.contains_key(&note_id) {
+                warn!(
+                    note_id = %note_id,
+                    path = %relative_path.display(),
+                    "duplicate note identifier detected during inventory"
+                );
                 bail!("duplicate note identifier detected: {note_id}");
             }
 
@@ -255,6 +303,7 @@ impl Vault {
             entries.push(entry);
         }
 
+        info!(count = entries.len(), "completed vault inventory build");
         Ok(entries)
     }
 
@@ -272,6 +321,12 @@ impl Vault {
         })?;
 
         let title = derive_title(&metadata, body);
+
+        debug!(
+            note_id = %entry.id,
+            path = %entry.relative_path.display(),
+            "loaded note from inventory entry"
+        );
 
         Ok(NoteRecord {
             id: entry.id.clone(),
@@ -449,6 +504,11 @@ fn collect_markdown_files(
     }
 
     files.sort();
+    debug!(
+        root = %root.display(),
+        collected = files.len(),
+        "collected markdown files for inventory"
+    );
     Ok(files)
 }
 

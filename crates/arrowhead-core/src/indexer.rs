@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use futures::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::Semaphore, task};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     IndexingStats, Vault,
@@ -87,6 +87,12 @@ impl Indexer {
     {
         let inventory = self.vault.inventory()?;
         let total = inventory.len() as u64;
+        info!(
+            total_notes = total,
+            parallelism = self.config.parallelism,
+            force = self.config.force,
+            "starting full indexing pass"
+        );
         let note_set: Arc<HashSet<String>> =
             Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
         let state_table: Arc<HashMap<String, NoteIndexState>> =
@@ -102,6 +108,7 @@ impl Indexer {
             let states = Arc::clone(&state_table);
             let entry_id = entry.id.clone();
 
+            debug!(note_id = %entry.id, "queueing note for indexing");
             tasks.push(tokio::spawn(async move {
                 let _permit = semaphore
                     .acquire_owned()
@@ -159,6 +166,7 @@ impl Indexer {
                 Ok(NoteProcessing::Skipped) => {
                     stats.skipped += 1;
                     processed += 1;
+                    debug!(note_id = %note_id, "note is fresh; skipping reindex");
                     observer(IndexProgressEvent {
                         note_id,
                         processed,
@@ -191,11 +199,19 @@ impl Indexer {
             }
         }
 
+        info!(
+            total = stats.total_notes,
+            indexed = stats.indexed,
+            skipped = stats.skipped,
+            errors = stats.errors,
+            "completed indexing pass"
+        );
         Ok(stats)
     }
 
     /// Reindexes a single note identified by the given ID.
     pub async fn index_note(&self, note_id: &str) -> Result<()> {
+        info!(note_id = note_id, "starting single-note indexing");
         let inventory = self.vault.inventory()?;
         let note_set: Arc<HashSet<String>> =
             Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
@@ -226,6 +242,7 @@ impl Indexer {
             }
             NoteProcessing::Skipped => {}
         }
+        info!(note_id = note_id, "completed single-note indexing");
         Ok(())
     }
 
@@ -251,6 +268,11 @@ impl Indexer {
             .vault
             .load_note_from_entry(entry)
             .with_context(|| format!("failed to load note {}", entry.id))?;
+        debug!(
+            note_id = %entry.id,
+            path = %entry.relative_path.display(),
+            "processing note inventory entry"
+        );
 
         let state = index_states.get(&entry.id).cloned();
         let is_stale = if self.config.force {
@@ -262,11 +284,23 @@ impl Indexer {
         };
 
         if !is_stale {
+            debug!(note_id = %entry.id, "note unchanged since last index; skipping");
             return Ok(NoteProcessing::Skipped);
         }
 
         let extraction = self.metadata.extract(&note)?;
+        debug!(
+            note_id = %entry.id,
+            metadata_fields = extraction.metadata.len(),
+            wikilinks = extraction.wikilinks.len(),
+            "extracted note metadata"
+        );
         let resolved_links = resolve_wikilinks(&extraction.wikilinks, known_notes);
+        debug!(
+            note_id = %entry.id,
+            link_count = resolved_links.len(),
+            "resolved wikilinks for note"
+        );
         let indexed_at = Utc::now();
         self.database
             .upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
@@ -300,7 +334,12 @@ impl Indexer {
         } else {
             None
         };
-        info!(note_id = %entry.id, "indexed note");
+        info!(
+            note_id = %entry.id,
+            metadata_fields = extraction.metadata.len(),
+            link_count = resolved_links.len(),
+            "indexed note"
+        );
         Ok(NoteProcessing::Indexed(embedding_update))
     }
 }

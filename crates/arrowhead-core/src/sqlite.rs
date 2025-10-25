@@ -15,7 +15,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{MetadataMap, NoteRecord, metadata::MetadataExtraction};
 
@@ -49,6 +49,7 @@ impl IndexDatabase {
     /// Open (and initialise) the database at the supplied path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        debug!(path = %path.display(), "initialising SQLite index database");
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -93,6 +94,11 @@ impl IndexDatabase {
         }
 
         let id = NEXT_DATABASE_ID.fetch_add(1, Ordering::SeqCst);
+        debug!(
+            path = %path.display(),
+            database_id = id,
+            "SQLite index database ready"
+        );
 
         Ok(Self { pool, id })
     }

@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use tokio::task;
+use tracing::{debug, info};
 
 use crate::{MetadataMap, NoteId, embeddings::EmbeddingPipeline, sqlite::IndexDatabase};
 
@@ -106,6 +107,12 @@ impl SearchService {
         let limit = limit.max(1);
         let rewritten = process_query(query);
         let database = Arc::clone(&self.database);
+        info!(query = query, limit, "executing full-text search");
+        debug!(
+            query = query,
+            rewritten = rewritten.as_str(),
+            "rewrote query for FTS"
+        );
 
         let results = task::spawn_blocking(move || -> Result<Vec<SearchResult>> {
             let matches = database.search_fts(&rewritten, limit)?;
@@ -136,6 +143,8 @@ impl SearchService {
         .await
         .context("search task aborted")??;
 
+        let result_count = results.len();
+        info!(query = query, result_count, "full-text search completed");
         Ok(results)
     }
 
@@ -159,6 +168,12 @@ impl SearchService {
             ))?;
 
         let limit = limit.unwrap_or(self.config.default_limit).max(1);
+        info!(query = query, limit, "executing semantic search");
+        debug!(
+            query = query,
+            model = pipeline.descriptor().identifier(),
+            "using embedding pipeline for semantic search"
+        );
         let query_vector = pipeline
             .generator()
             .embed_query(query)
@@ -213,6 +228,11 @@ impl SearchService {
         }
 
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        info!(
+            query = query,
+            result_count = results.len(),
+            "semantic search completed"
+        );
         Ok(results)
     }
 
@@ -239,6 +259,12 @@ impl SearchService {
             ))?;
 
         let limit = limit.unwrap_or(self.config.default_limit).max(1);
+        info!(query = query, limit, "executing hybrid search");
+        debug!(
+            query = query,
+            model = pipeline.descriptor().identifier(),
+            "using embedding pipeline for hybrid search"
+        );
 
         let query_vector = pipeline
             .generator()
@@ -348,6 +374,11 @@ impl SearchService {
         if results.len() > limit {
             results.truncate(limit);
         }
+        info!(
+            query = query,
+            result_count = results.len(),
+            "hybrid search completed"
+        );
         Ok(results)
     }
 

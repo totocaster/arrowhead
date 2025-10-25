@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 #[cfg(feature = "vector-lancedb")]
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
 
 use crate::Vault;
 
@@ -198,6 +199,11 @@ pub struct EmbeddingGenerator {
 impl EmbeddingGenerator {
     /// Load the configured embedding model, downloading weights as needed.
     pub fn initialise(config: EmbeddingConfig) -> Result<Self> {
+        info!(
+            model = config.descriptor().identifier(),
+            cache_dir = %config.cache_dir.display(),
+            "initialising embedding generator"
+        );
         if let Some(parent) = config.cache_dir.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -214,6 +220,10 @@ impl EmbeddingGenerator {
         })?;
 
         let pool_size = embedding_pool_size();
+        debug!(
+            model = config.descriptor().identifier(),
+            pool_size, "preparing embedding model pool"
+        );
         let mut models = Vec::with_capacity(pool_size);
 
         for _ in 0..pool_size {
@@ -229,10 +239,15 @@ impl EmbeddingGenerator {
             models.push(model);
         }
 
-        Ok(Self {
+        let generator = Self {
             config,
             pool: Arc::new(ModelPool::new(models)),
-        })
+        };
+        info!(
+            model = generator.config.descriptor().identifier(),
+            pool_size, "embedding generator ready"
+        );
+        Ok(generator)
     }
 
     /// Access the generator configuration.
@@ -464,6 +479,13 @@ impl EmbeddingPipeline {
             .join(descriptor.identifier());
         let vectors_dir = vault_paths.arrowhead_dir.join("vectors");
 
+        info!(
+            model = descriptor.identifier(),
+            models_dir = %models_dir.display(),
+            vectors_dir = %vectors_dir.display(),
+            "initialising embedding pipeline"
+        );
+
         fs::create_dir_all(&models_dir).with_context(|| {
             format!(
                 "failed to create embedding model directory {}",
@@ -481,14 +503,20 @@ impl EmbeddingPipeline {
 
         write_metadata(&vectors_dir, &descriptor).context("failed to write embedding metadata")?;
 
-        Ok(Self {
+        let pipeline = Self {
             inner: Arc::new(EmbeddingPipelineInner {
                 descriptor,
                 generator: Arc::new(generator),
                 store: Arc::new(store),
                 model_changed,
             }),
-        })
+        };
+        info!(
+            model = pipeline.descriptor().identifier(),
+            reset = model_changed,
+            "embedding pipeline ready"
+        );
+        Ok(pipeline)
     }
 
     /// Access the generator component.
@@ -554,6 +582,11 @@ pub struct EmbeddingStore {
 impl EmbeddingStore {
     /// Open (or create) the embeddings table for the supplied vault/model pair.
     pub async fn connect(path: &Path, descriptor: &EmbeddingDescriptor) -> Result<Self> {
+        info!(
+            model = descriptor.identifier(),
+            path = %path.display(),
+            "connecting LanceDB embedding store"
+        );
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create vectors directory {}", parent.display())
@@ -574,21 +607,37 @@ impl EmbeddingStore {
             .await
             .context("failed to prepare LanceDB table for embeddings")?;
 
-        Ok(Self {
+        let store = Self {
             connection: Arc::new(connection),
             table_name: EMBEDDING_TABLE_NAME.to_string(),
             dimension: descriptor.dimension(),
             model_id: descriptor.identifier().to_string(),
             write_lock: Arc::new(AsyncMutex::new(())),
-        })
+        };
+        info!(
+            model = descriptor.identifier(),
+            table = EMBEDDING_TABLE_NAME,
+            "embedding store ready"
+        );
+        Ok(store)
     }
 
     /// Upsert the supplied embeddings into the LanceDB table.
     pub async fn upsert_embeddings(&self, records: &[EmbeddingRecord]) -> Result<()> {
         if records.is_empty() {
+            debug!(
+                table = self.table_name.as_str(),
+                "skipping embedding upsert for empty batch"
+            );
             return Ok(());
         }
 
+        info!(
+            table = self.table_name.as_str(),
+            model = self.model_id.as_str(),
+            count = records.len(),
+            "upserting embeddings batch"
+        );
         let _guard = self.write_lock.lock().await;
         let table = self
             .connection
