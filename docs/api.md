@@ -7,7 +7,6 @@ developed; this file serves as the agreed plan of record.
 ## CLI Commands
 
 - `arrowhead init` — bootstrap a vault and configuration.
-- `arrowhead index` — run indexing jobs over the vault.
 - `arrowhead search` — execute FTS/semantic/hybrid searches.
 - `arrowhead notes` — CRUD operations for working with notes.
 - `arrowhead graph` — inspect WikiLink graph relationships.
