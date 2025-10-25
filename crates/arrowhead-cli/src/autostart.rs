@@ -607,7 +607,7 @@ fn current_uid() -> Result<u32> {
             );
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        return stdout.trim().parse::<u32>().context("failed to parse uid");
+        stdout.trim().parse::<u32>().context("failed to parse uid")
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -642,7 +642,7 @@ fn extract_launchd_pid(label: &str) -> Result<Option<u32>> {
             }
         }
 
-        return Ok(None);
+        Ok(None)
     }
 
     #[cfg(not(target_os = "macos"))]

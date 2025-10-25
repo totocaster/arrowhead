@@ -23,6 +23,7 @@ pub mod types;
 pub mod vault;
 
 // Re-export commonly used types for convenience across crates.
+pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolutionRecord};
 pub use indexer::IndexProgressEvent;
 pub use search::{SearchConfig, SearchResult, SearchService};
 pub use status::{

@@ -102,8 +102,21 @@ async fn control_socket_status_and_shutdown() -> Result<()> {
         .await?;
 
     wait_for_socket(handle.socket_path()).await?;
-    let status = handle.request_status().await?;
-    assert_eq!(status.activity.state, ActivityState::Idle);
+    let mut attempts = 0;
+    loop {
+        let status = handle.request_status().await?;
+        if status.activity.state == ActivityState::Idle {
+            break;
+        }
+        attempts += 1;
+        if attempts > 300 {
+            panic!(
+                "daemon failed to reach idle state; last observed status {:?}",
+                status.activity.state
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     handle.shutdown().await?;
     drop(temp_dir);

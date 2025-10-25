@@ -17,7 +17,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use tracing::{debug, info};
 
-use crate::{MetadataMap, NoteRecord, metadata::MetadataExtraction};
+use crate::{
+    MetadataMap, NoteRecord,
+    graph::{LinkResolutionRecord, normalise_link_lookup},
+    metadata::MetadataExtraction,
+};
 
 thread_local! {
     static THREAD_CONNECTIONS: RefCell<HashMap<usize, Vec<PooledConnection<SqliteConnectionManager>>>> =
@@ -27,7 +31,7 @@ thread_local! {
 static NEXT_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Current schema version for the Arrowhead index database.
-const INDEX_SCHEMA_VERSION: i32 = 2;
+const INDEX_SCHEMA_VERSION: i32 = 3;
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +195,60 @@ impl IndexDatabase {
         Ok(ids)
     }
 
+    /// Load resolution hints to support WikiLink matching (titles and aliases).
+    pub fn link_resolution_maps(&self) -> Result<LinkResolutionMaps> {
+        let conn = self.connection()?;
+        let mut maps = LinkResolutionMaps::default();
+
+        {
+            let mut stmt = conn.prepare("SELECT id, title FROM notes WHERE title IS NOT NULL")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let title: String = row.get(1)?;
+                let key = normalise_link_lookup(&title);
+                if !key.is_empty() {
+                    maps.titles.entry(key).or_insert(id);
+                }
+            }
+        }
+
+        {
+            let mut stmt =
+                conn.prepare("SELECT note_id, value FROM metadata WHERE key = 'aliases'")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let note_id: String = row.get(0)?;
+                let raw_value: String = row.get(1)?;
+                match serde_json::from_str::<Value>(&raw_value)? {
+                    Value::Array(items) => {
+                        for item in items {
+                            if let Value::String(alias) = item {
+                                let key = normalise_link_lookup(&alias);
+                                if key.is_empty() {
+                                    continue;
+                                }
+                                let entry = maps.aliases.entry(key).or_default();
+                                if !entry.iter().any(|existing| existing == &note_id) {
+                                    entry.push(note_id.clone());
+                                }
+                            }
+                        }
+                    }
+                    Value::Null => {}
+                    _ => {
+                        debug!(
+                            note_id = %note_id,
+                            "skipping non-array aliases metadata while building resolution maps"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(maps)
+    }
+
     /// Remove a note (and associated metadata) from the index.
     pub fn remove_note(&self, note_id: &str) -> Result<bool> {
         let mut conn = self.connection_for_thread()?;
@@ -222,7 +280,7 @@ impl IndexDatabase {
         &self,
         note: &NoteRecord,
         extraction: &MetadataExtraction,
-        resolved_links: &[(String, Option<String>)],
+        resolved_links: &[LinkResolutionRecord],
         indexed_at: DateTime<Utc>,
     ) -> Result<()> {
         let mut conn = self.connection_for_thread()?;
@@ -271,15 +329,18 @@ impl IndexDatabase {
 
         tx.execute("DELETE FROM note_links WHERE source_id = ?1", [&note.id])
             .context("failed to clear existing note links")?;
-        for (link_text, target_id) in resolved_links {
+        for link in resolved_links {
             tx.execute(
-                "INSERT INTO note_links (source_id, target_id, link_text, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO note_links (source_id, target_id, raw_text, display_text, heading, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     &note.id,
-                    target_id.as_deref(),
-                    link_text,
-                    indexed_at.timestamp()
+                    link.target.as_deref(),
+                    &link.raw,
+                    link.display.as_deref(),
+                    link.heading.as_deref(),
+                    link.reason.as_str(),
+                    indexed_at.timestamp_micros()
                 ],
             )
             .context("failed to insert note link")?;
@@ -329,10 +390,7 @@ impl IndexDatabase {
         }
 
         let conn = self.connection()?;
-        let placeholders = std::iter::repeat("?")
-            .take(note_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = vec!["?"; note_ids.len()].join(", ");
         let sql = format!(
             "SELECT note_id, key, value FROM metadata WHERE note_id IN ({})",
             placeholders
@@ -353,10 +411,7 @@ impl IndexDatabase {
             let value: Value = serde_json::from_str(&raw_value).with_context(|| {
                 format!("failed to deserialize metadata value for {note_id}:{key}")
             })?;
-            result
-                .entry(note_id)
-                .or_insert_with(MetadataMap::default)
-                .insert(key, value);
+            result.entry(note_id).or_default().insert(key, value);
         }
 
         Ok(result)
@@ -370,10 +425,7 @@ impl IndexDatabase {
         }
 
         let conn = self.connection()?;
-        let placeholders = std::iter::repeat("?")
-            .take(note_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = vec!["?"; note_ids.len()].join(", ");
         let sql = format!("SELECT id, title FROM notes WHERE id IN ({})", placeholders);
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -452,7 +504,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS note_links (
             source_id TEXT NOT NULL,
             target_id TEXT,
-            link_text TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            display_text TEXT,
+            heading TEXT,
+            reason TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             FOREIGN KEY(source_id) REFERENCES notes(id) ON DELETE CASCADE
         );
@@ -485,8 +540,7 @@ impl std::ops::Deref for ThreadConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        &*self
-            .conn
+        self.conn
             .as_ref()
             .expect("thread connection missing handle")
     }
@@ -494,8 +548,7 @@ impl std::ops::Deref for ThreadConnection {
 
 impl std::ops::DerefMut for ThreadConnection {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self
-            .conn
+        self.conn
             .as_mut()
             .expect("thread connection missing handle")
     }
@@ -609,6 +662,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
+        graph::{LinkReason, LinkResolutionRecord},
         metadata::MetadataExtractor,
         vault::{Vault, VaultConfig},
     };
@@ -628,6 +682,20 @@ mod tests {
         vault
             .load_note(id)
             .unwrap_or_else(|_| panic!("expected note {id} to load"))
+    }
+
+    fn make_resolved_links(extraction: &MetadataExtraction) -> Vec<LinkResolutionRecord> {
+        extraction
+            .wikilinks
+            .iter()
+            .map(|link| LinkResolutionRecord {
+                raw: link.raw.clone(),
+                target: Some(link.target.clone()),
+                display: link.display.clone(),
+                heading: link.heading.clone(),
+                reason: LinkReason::Direct,
+            })
+            .collect()
     }
 
     #[test]
@@ -660,11 +728,7 @@ mod tests {
             .extract(&note)
             .expect("extract succeeds");
 
-        let resolved_links: Vec<(String, Option<String>)> = extraction
-            .wikilinks
-            .iter()
-            .map(|link| (link.clone(), Some(link.clone())))
-            .collect();
+        let resolved_links = make_resolved_links(&extraction);
 
         db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
             .expect("upsert succeeds");
@@ -717,11 +781,7 @@ mod tests {
             .expect("extract succeeds");
 
         let indexed_at = Utc::now();
-        let resolved_links: Vec<(String, Option<String>)> = extraction
-            .wikilinks
-            .iter()
-            .map(|link| (link.clone(), Some(link.clone())))
-            .collect();
+        let resolved_links = make_resolved_links(&extraction);
 
         db.upsert_note(&note, &extraction, &resolved_links, indexed_at)
             .expect("upsert succeeds");
@@ -751,11 +811,7 @@ mod tests {
             let extraction = MetadataExtractor::new()
                 .extract(&note)
                 .expect("extract succeeds");
-            let resolved_links: Vec<(String, Option<String>)> = extraction
-                .wikilinks
-                .iter()
-                .map(|link| (link.clone(), Some(link.clone())))
-                .collect();
+            let resolved_links = make_resolved_links(&extraction);
             db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
                 .expect("upsert succeeds");
         }
@@ -800,11 +856,7 @@ mod tests {
             let extraction = MetadataExtractor::new()
                 .extract(&note)
                 .expect("extract succeeds");
-            let resolved_links: Vec<(String, Option<String>)> = extraction
-                .wikilinks
-                .iter()
-                .map(|link| (link.clone(), Some(link.clone())))
-                .collect();
+            let resolved_links = make_resolved_links(&extraction);
             db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
                 .expect("upsert succeeds");
         }
@@ -836,11 +888,7 @@ mod tests {
         let extraction = MetadataExtractor::new()
             .extract(&note)
             .expect("extract succeeds");
-        let resolved_links: Vec<(String, Option<String>)> = extraction
-            .wikilinks
-            .iter()
-            .map(|link| (link.clone(), Some(link.clone())))
-            .collect();
+        let resolved_links = make_resolved_links(&extraction);
         db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
             .expect("upsert succeeds");
 
@@ -909,11 +957,7 @@ mod tests {
         let extraction = MetadataExtractor::new()
             .extract(&note)
             .expect("extract succeeds");
-        let resolved_links: Vec<(String, Option<String>)> = extraction
-            .wikilinks
-            .iter()
-            .map(|link| (link.clone(), Some(link.clone())))
-            .collect();
+        let resolved_links = make_resolved_links(&extraction);
         db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
             .expect("upsert succeeds");
 
@@ -925,4 +969,12 @@ mod tests {
         assert!(matches[0].rank.is_finite());
         assert!(matches[0].snippet.is_some());
     }
+}
+/// Cached lookup tables used when resolving WikiLinks.
+#[derive(Debug, Default, Clone)]
+pub struct LinkResolutionMaps {
+    /// Lower-cased note titles mapped to note identifiers.
+    pub titles: HashMap<String, String>,
+    /// Lower-cased aliases mapped to note identifiers (multiple entries when ambiguous).
+    pub aliases: HashMap<String, Vec<String>>,
 }

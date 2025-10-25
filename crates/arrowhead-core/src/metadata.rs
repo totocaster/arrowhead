@@ -1,6 +1,6 @@
 //! Metadata extraction utilities.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -13,10 +13,23 @@ use crate::{MetadataMap, NoteRecord};
 pub struct MetadataExtraction {
     /// Metadata fields as key/value pairs ready for persistence.
     pub metadata: MetadataMap,
-    /// WikiLink targets discovered in the note body.
-    pub wikilinks: Vec<String>,
+    /// WikiLinks discovered in the note body.
+    pub wikilinks: Vec<WikiLink>,
     /// Inline tags extracted from content.
     pub tags: Vec<String>,
+}
+
+/// Parsed representation of an Obsidian-style WikiLink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WikiLink {
+    /// Entire raw link text captured between the `[[` and `]]` delimiters.
+    pub raw: String,
+    /// Target path (before any alias or heading components).
+    pub target: String,
+    /// Optional alias/display text after a `|` separator.
+    pub display: Option<String>,
+    /// Optional heading anchor following a `#` separator.
+    pub heading: Option<String>,
 }
 
 /// Parses notes and produces structured metadata for indexing.
@@ -57,7 +70,12 @@ impl MetadataExtractor {
         let wikilinks = extract_wikilinks(&note.content);
         metadata.insert(
             "wikilinks".to_string(),
-            Value::Array(wikilinks.iter().cloned().map(Value::String).collect()),
+            Value::Array(
+                wikilinks
+                    .iter()
+                    .map(|link| Value::String(link.target.clone()))
+                    .collect(),
+            ),
         );
 
         debug!(
@@ -207,8 +225,9 @@ fn extract_inline_tags(content: &str) -> BTreeSet<String> {
     tags
 }
 
-fn extract_wikilinks(content: &str) -> Vec<String> {
-    let mut links = BTreeSet::new();
+fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
+    let mut dedupe = HashSet::new();
+    let mut results = Vec::new();
     let bytes = content.as_bytes();
     let mut cursor = 0;
 
@@ -223,24 +242,52 @@ fn extract_wikilinks(content: &str) -> Vec<String> {
         let search_start = start + 2;
         if let Some(relative_end) = content[search_start..].find("]]") {
             let end = search_start + relative_end;
-            let mut target = &content[search_start..end];
-            if let Some((before_pipe, _)) = target.split_once('|') {
-                target = before_pipe;
+            let raw = &content[search_start..end];
+            let trimmed_raw = raw.trim();
+            if trimmed_raw.is_empty() {
+                cursor = end + 2;
+                continue;
             }
-            if let Some((before_hash, _)) = target.split_once('#') {
-                target = before_hash;
+
+            if dedupe.insert(trimmed_raw.to_string()) {
+                let mut target_section = trimmed_raw;
+                let mut display = None;
+
+                if let Some((before_pipe, after_pipe)) = target_section.split_once('|') {
+                    target_section = before_pipe;
+                    let alias = after_pipe.trim();
+                    if !alias.is_empty() {
+                        display = Some(alias.to_string());
+                    }
+                }
+
+                let mut heading = None;
+                if let Some((before_hash, after_hash)) = target_section.split_once('#') {
+                    target_section = before_hash;
+                    let anchor = after_hash.trim();
+                    if !anchor.is_empty() {
+                        heading = Some(anchor.to_string());
+                    }
+                }
+
+                let target = target_section.trim();
+                if !target.is_empty() {
+                    results.push(WikiLink {
+                        raw: trimmed_raw.to_string(),
+                        target: target.to_string(),
+                        display,
+                        heading,
+                    });
+                }
             }
-            let trimmed = target.trim();
-            if !trimmed.is_empty() {
-                links.insert(trimmed.to_string());
-            }
+
             cursor = end + 2;
         } else {
             break;
         }
     }
 
-    links.into_iter().collect()
+    results
 }
 
 #[cfg(test)]
@@ -289,8 +336,8 @@ mod tests {
         assert!(tags.contains(&"reference".to_string()));
 
         let wikilinks = extraction.wikilinks;
-        assert!(wikilinks.contains(&"Sigma 35mm Art".to_string()));
-        assert!(wikilinks.contains(&"2024-01-15".to_string()));
+        assert!(wikilinks.iter().any(|link| link.target == "Sigma 35mm Art"));
+        assert!(wikilinks.iter().any(|link| link.target == "2024-01-15"));
     }
 
     #[test]
@@ -301,14 +348,45 @@ mod tests {
             .extract(&note)
             .expect("metadata extraction succeeds");
 
-        assert!(
-            extraction
-                .wikilinks
-                .iter()
-                .all(|link| !link.ends_with(".jpg")
-                    && !link.ends_with(".png")
-                    && !link.ends_with(".pdf"))
+        assert!(extraction.wikilinks.iter().all(|link| {
+            let target = link.target.as_str();
+            !target.ends_with(".jpg") && !target.ends_with(".png") && !target.ends_with(".pdf")
+        }));
+    }
+
+    #[test]
+    fn parses_alias_and_heading_components() {
+        let content = String::from(
+            "\
+Intro text [[Projects/Archive|Archive Notes]] and \
+another link [[Daily Notes/2024-01-15#Morning|Morning Entry]].\
+",
         );
+        let record = NoteRecord {
+            content,
+            ..load_note("Photography Equipment")
+        };
+        let extraction = MetadataExtractor::new()
+            .extract(&record)
+            .expect("metadata extraction succeeds");
+
+        let mut archive = None;
+        let mut morning = None;
+        for link in extraction.wikilinks {
+            match link.target.as_str() {
+                "Projects/Archive" => archive = Some(link),
+                "Daily Notes/2024-01-15" => morning = Some(link),
+                _ => {}
+            }
+        }
+
+        let archive = archive.expect("archive link present");
+        assert_eq!(archive.display.as_deref(), Some("Archive Notes"));
+        assert_eq!(archive.heading, None);
+
+        let morning = morning.expect("morning link present");
+        assert_eq!(morning.display.as_deref(), Some("Morning Entry"));
+        assert_eq!(morning.heading.as_deref(), Some("Morning"));
     }
 
     #[test]

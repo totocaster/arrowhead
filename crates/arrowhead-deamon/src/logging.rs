@@ -78,11 +78,10 @@ pub fn init_logging(log_path: &Path) -> Result<LoggingGuard> {
             eprintln!("global tracing subscriber already installed: {err}");
         }
 
-        if LOGGING_STATE.set(LoggingState { path }).is_err() {
-            LOGGING_STATE.get().expect("logging state initialised")
-        } else {
-            LOGGING_STATE.get().expect("logging state initialised")
+        if let Err(existing) = LOGGING_STATE.set(LoggingState { path }) {
+            drop(existing);
         }
+        LOGGING_STATE.get().expect("logging state initialised")
     };
 
     {

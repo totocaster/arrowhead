@@ -325,6 +325,7 @@ arrowhead/
 - Complete context: all links + statistics for a note
 - Link counts and graph metrics
 - Support for future graph analysis algorithms
+- Persisted edges capture raw link text, optional display aliases, heading anchors, and a resolution reason (`direct`, `title`, `alias`, `unresolved`) so CLI/MCP clients can explain relationships while mirroring Obsidian semantics.
 
 ---
 
@@ -355,7 +356,7 @@ arrowhead/
 
 4. **note_links**
    - WikiLinks graph relationships
-   - Fields: source_id, target_id (nullable), link_text, link_type, created_at
+   - Fields: source_id, target_id (nullable), raw_text, display_text, heading, reason, created_at
    - Indexed on both source and target for bidirectional queries
 
 **Triggers:**
@@ -892,6 +893,7 @@ auto_start_enabled = true
 - Orphan detection
 - Unresolved link tracking
 - Commands: `graph backlinks/forward-links/orphans/unresolved/context`
+  emit human-readable reasons (direct/title/alias/unresolved) for each relationship
 
 ### Phase 4: MCP stdio (Week 6)
 

@@ -67,7 +67,7 @@ impl AppConfig {
 }
 
 /// Configuration persisted for the Arrowhead deamon.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DeamonConfig {
     /// Optional override for the control socket path.
     #[serde(default)]
@@ -81,17 +81,6 @@ pub struct DeamonConfig {
     /// Last known summary of the deamon status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_status: Option<DeamonStatusSummary>,
-}
-
-impl Default for DeamonConfig {
-    fn default() -> Self {
-        Self {
-            socket_path: None,
-            status_path: None,
-            auto_start_enabled: None,
-            last_status: None,
-        }
-    }
 }
 
 impl DeamonConfig {

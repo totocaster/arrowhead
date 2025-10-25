@@ -335,12 +335,10 @@ async fn handle_init(ctx: &mut CommandContext, args: &VaultInitArgs) -> Result<(
             let enable = if let Some(preference) = auto_start_preference {
                 preference
             } else {
-                match prompt_yes_no(
+                prompt_yes_no(
                     "Enable Arrowhead auto-start so the deamon launches automatically on login?",
-                )? {
-                    Some(value) => value,
-                    None => false,
-                }
+                )?
+                .unwrap_or_default()
             };
 
             if enable {
@@ -988,13 +986,15 @@ mod tests {
         fs::create_dir_all(arrowhead_dir.join("logs")).expect("create logs dir");
         fs::write(arrowhead_dir.join("index.db"), b"test").expect("write index");
 
-        let mut app_config = AppConfig::default();
-        app_config.vault = Some(vault_path.clone());
-        app_config.deamon = CliDeamonConfig {
-            socket_path: Some(arrowhead_dir.join("deamon/control.sock")),
-            status_path: Some(arrowhead_dir.join("deamon/status.json")),
-            auto_start_enabled: Some(true),
-            last_status: None,
+        let app_config = AppConfig {
+            vault: Some(vault_path.clone()),
+            deamon: CliDeamonConfig {
+                socket_path: Some(arrowhead_dir.join("deamon/control.sock")),
+                status_path: Some(arrowhead_dir.join("deamon/status.json")),
+                auto_start_enabled: Some(true),
+                last_status: None,
+            },
+            ..AppConfig::default()
         };
 
         let mut ctx = CommandContext::new(app_config, Some(config_path), 0);

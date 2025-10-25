@@ -9,20 +9,22 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use futures::{StreamExt, stream::FuturesUnordered};
+use serde_json::Value;
 use tokio::{sync::Semaphore, task};
 use tracing::{debug, error, info};
 
 use crate::{
     IndexingStats, Vault,
     embeddings::EmbeddingPipeline,
-    metadata::MetadataExtractor,
-    sqlite::{IndexDatabase, NoteIndexState},
+    graph::{LinkReason, LinkResolutionRecord, normalise_link_lookup},
+    metadata::{MetadataExtraction, MetadataExtractor, WikiLink},
+    sqlite::{IndexDatabase, LinkResolutionMaps, NoteIndexState},
     vault::NoteInventoryEntry,
     vault::{normalise_relative_path, normalise_relative_str},
 };
 
 #[cfg(feature = "vector-lancedb")]
-use crate::{NoteRecord, metadata::MetadataExtraction};
+use crate::NoteRecord;
 
 #[cfg(feature = "vector-lancedb")]
 use crate::embeddings::EmbeddingRecord;
@@ -95,6 +97,11 @@ impl Indexer {
         );
         let note_set: Arc<HashSet<String>> =
             Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
+        let resolution_maps = self.collect_resolution_maps(&inventory)?;
+        let resolution = Arc::new(ResolutionContext::new(
+            Arc::clone(&note_set),
+            resolution_maps,
+        ));
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
 
@@ -103,7 +110,7 @@ impl Indexer {
 
         for entry in inventory {
             let indexer = self.clone();
-            let known = Arc::clone(&note_set);
+            let resolution = Arc::clone(&resolution);
             let semaphore = Arc::clone(&semaphore);
             let states = Arc::clone(&state_table);
             let entry_id = entry.id.clone();
@@ -114,7 +121,7 @@ impl Indexer {
                     .acquire_owned()
                     .await
                     .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
-                let result = indexer.run_single(entry, known, states).await;
+                let result = indexer.run_single(entry, resolution, states).await;
                 Ok::<_, anyhow::Error>((entry_id, result))
             }));
         }
@@ -234,13 +241,28 @@ impl Indexer {
         let inventory = self.vault.inventory()?;
         let note_set: Arc<HashSet<String>> =
             Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
+        let mut resolution_maps = self.database.link_resolution_maps()?;
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
         let entry = inventory
-            .into_iter()
+            .iter()
             .find(|entry| entry.id == note_id)
+            .cloned()
             .with_context(|| format!("note {note_id} not found in vault"))?;
-        let outcome = self.run_single(entry, note_set, state_table).await?;
+
+        let note = self
+            .vault
+            .load_note_from_entry(&entry)
+            .with_context(|| format!("failed to load note {note_id} for resolution hints"))?;
+        let extraction = self.metadata.extract(&note)?;
+        let aliases = extract_aliases(&extraction);
+        resolution_maps.ingest_note(&note.id, note.title.as_deref(), &aliases);
+
+        let resolution = Arc::new(ResolutionContext::new(
+            Arc::clone(&note_set),
+            resolution_maps,
+        ));
+        let outcome = self.run_single(entry, resolution, state_table).await?;
 
         match outcome {
             NoteProcessing::Indexed(embedding) => {
@@ -294,6 +316,18 @@ impl Indexer {
             known_notes.insert(note_id.clone());
         }
         let known = Arc::new(known_notes);
+        let mut resolution_maps = self.database.link_resolution_maps()?;
+        for absolute_path in targets.values() {
+            if let Some(entry) = self.vault.inventory_entry_for_path(absolute_path)? {
+                let note = self.vault.load_note_from_entry(&entry).with_context(|| {
+                    format!("failed to load note {} for resolution hints", entry.id)
+                })?;
+                let extraction = self.metadata.extract(&note)?;
+                let aliases = extract_aliases(&extraction);
+                resolution_maps.ingest_note(&note.id, note.title.as_deref(), &aliases);
+            }
+        }
+        let resolution = Arc::new(ResolutionContext::new(Arc::clone(&known), resolution_maps));
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
         let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
@@ -303,7 +337,7 @@ impl Indexer {
 
         for (note_id, absolute_path) in targets {
             let indexer = self.clone();
-            let known_clone = Arc::clone(&known);
+            let resolution_clone = Arc::clone(&resolution);
             let states_clone = Arc::clone(&state_table);
             let semaphore_clone = Arc::clone(&semaphore);
             let task_dispatch = dispatch.clone();
@@ -316,7 +350,9 @@ impl Indexer {
                     let key = note_id.clone();
                     let outcome = match indexer.vault.inventory_entry_for_path(&absolute_path) {
                         Ok(Some(entry)) => {
-                            indexer.run_single(entry, known_clone, states_clone).await
+                            indexer
+                                .run_single(entry, resolution_clone, states_clone)
+                                .await
                         }
                         Ok(None) => indexer.handle_missing_note(note_id).await,
                         Err(err) => Err(err),
@@ -446,27 +482,44 @@ impl Indexer {
         let mut removed = Vec::new();
 
         for note_id in indexed_ids {
-            if !known_inventory.contains(&note_id) {
-                if self.remove_note(&note_id).await? {
-                    removed.push(note_id);
-                }
+            if !known_inventory.contains(&note_id) && self.remove_note(&note_id).await? {
+                removed.push(note_id);
             }
         }
 
         Ok(removed)
     }
 
+    fn collect_resolution_maps(
+        &self,
+        inventory: &[NoteInventoryEntry],
+    ) -> Result<LinkResolutionMaps> {
+        let mut maps = self.database.link_resolution_maps()?;
+
+        for entry in inventory {
+            let note = self
+                .vault
+                .load_note_from_entry(entry)
+                .with_context(|| format!("failed to load note {}", entry.id))?;
+            let extraction = self.metadata.extract(&note)?;
+            let aliases = extract_aliases(&extraction);
+            maps.ingest_note(&note.id, note.title.as_deref(), &aliases);
+        }
+
+        Ok(maps)
+    }
+
     async fn run_single(
         &self,
         entry: NoteInventoryEntry,
-        known_notes: Arc<HashSet<String>>,
+        resolution: Arc<ResolutionContext>,
         index_states: Arc<HashMap<String, NoteIndexState>>,
     ) -> Result<NoteProcessing> {
         let indexer = self.clone();
         let dispatch = tracing::dispatcher::get_default(|current| current.clone());
         task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                indexer.process_note(&entry, &known_notes, &index_states)
+                indexer.process_note(&entry, &resolution, &index_states)
             })
         })
         .await
@@ -476,7 +529,7 @@ impl Indexer {
     fn process_note(
         &self,
         entry: &NoteInventoryEntry,
-        known_notes: &HashSet<String>,
+        resolution: &ResolutionContext,
         index_states: &HashMap<String, NoteIndexState>,
     ) -> Result<NoteProcessing> {
         let note = self
@@ -510,7 +563,7 @@ impl Indexer {
             wikilinks = extraction.wikilinks.len(),
             "extracted note metadata"
         );
-        let resolved_links = resolve_wikilinks(&extraction.wikilinks, known_notes);
+        let resolved_links = resolve_wikilinks(&entry.id, &extraction.wikilinks, resolution);
         debug!(
             note_id = %entry.id,
             link_count = resolved_links.len(),
@@ -585,6 +638,79 @@ enum NoteProcessing {
     Removed,
 }
 
+#[derive(Debug, Clone)]
+struct ResolutionContext {
+    note_ids: Arc<HashSet<String>>,
+    lowercase_ids: Arc<HashMap<String, String>>,
+    maps: Arc<LinkResolutionMaps>,
+}
+
+impl ResolutionContext {
+    fn new(note_ids: Arc<HashSet<String>>, maps: LinkResolutionMaps) -> Self {
+        let lowercase_ids = note_ids
+            .iter()
+            .map(|id| (normalise_link_lookup(id), id.clone()))
+            .collect();
+        Self {
+            note_ids,
+            lowercase_ids: Arc::new(lowercase_ids),
+            maps: Arc::new(maps),
+        }
+    }
+
+    fn resolve(&self, candidate: &str) -> (Option<String>, LinkReason) {
+        if let Some(id) = self.resolve_direct(candidate) {
+            return (Some(id), LinkReason::Direct);
+        }
+        if let Some(id) = self.resolve_title(candidate) {
+            return (Some(id), LinkReason::Title);
+        }
+        if let Some(id) = self.resolve_alias(candidate) {
+            return (Some(id), LinkReason::Alias);
+        }
+        (None, LinkReason::Unresolved)
+    }
+
+    fn resolve_direct(&self, candidate: &str) -> Option<String> {
+        if self.note_ids.contains(candidate) {
+            return Some(candidate.to_string());
+        }
+        let key = normalise_link_lookup(candidate);
+        self.lowercase_ids.get(&key).cloned()
+    }
+
+    fn resolve_title(&self, candidate: &str) -> Option<String> {
+        let key = normalise_link_lookup(candidate);
+        self.maps.titles.get(&key).cloned()
+    }
+
+    fn resolve_alias(&self, candidate: &str) -> Option<String> {
+        let key = normalise_link_lookup(candidate);
+        match self.maps.aliases.get(&key) {
+            Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
+            _ => None,
+        }
+    }
+}
+
+fn extract_aliases(extraction: &MetadataExtraction) -> Vec<String> {
+    extraction
+        .metadata
+        .get("aliases")
+        .and_then(|value| match value {
+            Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(|alias| alias.trim()))
+                    .filter(|alias| !alias.is_empty())
+                    .map(|alias| alias.to_string())
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(feature = "vector-lancedb")]
 fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) -> String {
     let mut sections = Vec::new();
@@ -619,29 +745,50 @@ fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) ->
 }
 
 fn resolve_wikilinks(
-    links: &[String],
-    known_notes: &HashSet<String>,
-) -> Vec<(String, Option<String>)> {
+    _source_id: &str,
+    links: &[WikiLink],
+    context: &ResolutionContext,
+) -> Vec<LinkResolutionRecord> {
     links
         .iter()
         .map(|link| {
-            let normalised = normalise_link(link);
-            let target = normalised.as_ref().and_then(|candidate| {
-                if known_notes.contains(candidate) {
-                    Some(candidate.clone())
-                } else {
-                    None
-                }
-            });
-            (link.clone(), target)
+            let (target, reason) = match normalise_link(&link.target) {
+                Some(candidate) => context.resolve(&candidate),
+                None => (None, LinkReason::Unresolved),
+            };
+            LinkResolutionRecord {
+                raw: link.raw.clone(),
+                target,
+                display: link.display.clone(),
+                heading: link.heading.clone(),
+                reason,
+            }
         })
         .collect()
 }
 
 fn normalise_link(link: &str) -> Option<String> {
-    normalise_relative_str(link)
-        .or_else(|| normalise_relative_path(Path::new(link)))
-        .map(|path| path.to_string_lossy().replace(char::from(b'\\'), "/"))
+    let mut candidate =
+        normalise_relative_str(link).or_else(|| normalise_relative_path(Path::new(link)))?;
+
+    if candidate.as_os_str().is_empty() {
+        return None;
+    }
+
+    if let Some(ext) = candidate.extension() {
+        if ext.eq_ignore_ascii_case("md") {
+            candidate.set_extension("");
+        }
+    }
+
+    let value = candidate
+        .to_string_lossy()
+        .replace(char::from(b'\\'), "/")
+        .trim()
+        .trim_matches('/')
+        .to_string();
+
+    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
@@ -684,7 +831,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp vault");
         let vault_dir = temp_dir.path().to_path_buf();
         Box::leak(Box::new(temp_dir));
-        fs::create_dir_all(&vault_dir.join(".obsidian"))
+        fs::create_dir_all(vault_dir.join(".obsidian"))
             .expect("create obsidian directory for settings");
 
         let raw_note_path = vault_dir.join("Sample.md");
@@ -699,6 +846,31 @@ mod tests {
         let database = temp_db();
         let canonical_note_path = vault.note_path("Sample.md");
         (vault, database, canonical_note_path)
+    }
+
+    fn temp_vault_with_alias() -> (Arc<Vault>, Arc<IndexDatabase>) {
+        let temp_dir = TempDir::new().expect("temp vault");
+        let vault_dir = temp_dir.path().to_path_buf();
+        Box::leak(Box::new(temp_dir));
+        fs::create_dir_all(vault_dir.join(".obsidian"))
+            .expect("create obsidian directory for settings");
+
+        fs::write(
+            vault_dir.join("Target.md"),
+            "---\naliases:\n  - Alias Note\n---\n\n# Target\n",
+        )
+        .expect("write target note");
+
+        fs::write(
+            vault_dir.join("Source.md"),
+            "---\n---\n\nReferences [[Alias Note]] and [[Target]].\n",
+        )
+        .expect("write source note");
+
+        let vault =
+            Arc::new(Vault::new(VaultConfig::new(vault_dir.clone())).expect("vault initialises"));
+        let database = temp_db();
+        (vault, database)
     }
 
     #[tokio::test]
@@ -783,6 +955,32 @@ mod tests {
         assert_eq!(events.len() as u64, stats.total_notes);
         assert!(events.iter().any(|event| event.indexed));
         assert_eq!(events.last().unwrap().processed, stats.total_notes);
+    }
+
+    #[tokio::test]
+    async fn resolves_alias_wikilinks() {
+        let (vault, database) = temp_vault_with_alias();
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+
+        indexer.index_all().await.expect("index succeeds");
+
+        let conn = database.connection().expect("connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT target_id, reason FROM note_links WHERE source_id = 'Source' AND raw_text = 'Alias Note'",
+            )
+            .expect("prepare alias query");
+        let mut rows = stmt.query([]).expect("execute alias query");
+        let row = rows.next().expect("row present").expect("row ok");
+        let target: Option<String> = row.get(0).expect("read target");
+        let reason: String = row.get(1).expect("read reason");
+        assert_eq!(target.as_deref(), Some("Target"));
+        assert_eq!(reason, LinkReason::Alias.as_str());
     }
 
     #[tokio::test]

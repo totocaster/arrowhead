@@ -336,7 +336,7 @@ struct ModelLease<'a> {
     model: Option<TextEmbedding>,
 }
 
-impl<'a> std::ops::Deref for ModelLease<'a> {
+impl std::ops::Deref for ModelLease<'_> {
     type Target = TextEmbedding;
 
     fn deref(&self) -> &Self::Target {
@@ -346,7 +346,7 @@ impl<'a> std::ops::Deref for ModelLease<'a> {
     }
 }
 
-impl<'a> std::ops::DerefMut for ModelLease<'a> {
+impl std::ops::DerefMut for ModelLease<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.model
             .as_mut()
@@ -354,7 +354,7 @@ impl<'a> std::ops::DerefMut for ModelLease<'a> {
     }
 }
 
-impl<'a> Drop for ModelLease<'a> {
+impl Drop for ModelLease<'_> {
     fn drop(&mut self) {
         if let Some(model) = self.model.take() {
             self.pool.checkin(model);
