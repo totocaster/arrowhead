@@ -38,7 +38,7 @@ struct Cli {
 enum Commands {
     /// Initialise a vault and configuration.
     Init(init::InitCommand),
-    /// Run indexing tasks.
+    /// Deprecated: indexing is handled by the background deamon.
     Index(index::IndexCommand),
     /// Execute searches.
     Search(search::SearchCommand),
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
             graph::run(&ctx, &command).await?;
         }
         Commands::Vault(command) => {
-            vault::run(&ctx, &command).await?;
+            vault::run(&mut ctx, &command).await?;
         }
     }
 

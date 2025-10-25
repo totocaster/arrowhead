@@ -8,7 +8,7 @@ use clap::Args;
 use arrowhead_core::{Vault, VaultConfig, embeddings::EmbeddingPreset};
 use tracing::info;
 
-use crate::logging;
+use crate::commands::vault::{VaultAction, VaultCommand, VaultInitArgs};
 
 use super::CommandContext;
 
@@ -49,16 +49,6 @@ pub async fn run(ctx: &mut CommandContext, command: &InitCommand) -> Result<()> 
     }
 
     let vault = Vault::new(VaultConfig::new(vault_path.clone()))?;
-    if vault.paths().arrowhead_dir.exists() && !command.force {
-        bail!(
-            "Arrowhead has already been initialised for this vault. Rerun with --force to reinitialise."
-        );
-    }
-
-    vault.ensure_arrowhead_dirs()?;
-
-    let logs_dir = vault.paths().logs_dir();
-    let _logging_guard = logging::scoped_file_logging(&logs_dir, ctx.verbosity())?;
 
     info!(path = %vault_path.display(), force = command.force, "initialising vault");
 
@@ -69,6 +59,15 @@ pub async fn run(ctx: &mut CommandContext, command: &InitCommand) -> Result<()> 
         ctx.config.embedding_model = Some(model.clone());
         info!(model = model.as_str(), "set default embedding model");
     }
+
+    let init_command = VaultCommand {
+        action: VaultAction::Init(VaultInitArgs {
+            force: command.force,
+            no_start: true,
+        }),
+    };
+
+    super::vault::run(ctx, &init_command).await?;
 
     info!("initialisation complete");
 

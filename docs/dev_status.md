@@ -1,4 +1,4 @@
-# Arrowhead Development Status — 2025-10-21
+# Arrowhead Development Status — 2025-10-21 (updated)
 
 ## Snapshot
 
@@ -7,11 +7,11 @@
 - **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
 - **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically and respecting Obsidian ignore filters.
 - **Vault settings:** `.obsidian/app.json` is parsed for attachments and user ignore filters so templates stay out of the index.
-- **CLI:** `init`, `index`, and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/arrowhead.log` with multi-day retention.
-- **Search:** `arrowhead search fts` executes against SQLite FTS5 with `field:value` and boolean syntax, stemming (`porter`) enabled, richer relevance scores, cleaner snippets, and self-refreshing the index beforehand.
+- **CLI:** `init`, `index` (informational), and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/arrowhead.log` with multi-day retention. Vault subcommands (`vault init/start/status/stop/cleanup`) manage the background deamon, cache socket/status metadata in config, render runtime health (JSON or human-readable), and provide teardown. Search commands rely on the deamon status instead of running local indexing passes.
+- **Search:** `arrowhead search fts` executes against SQLite FTS5 with `field:value` and boolean syntax, stemming (`porter`) enabled, richer relevance scores, and cleaner snippets while relying on the deamon-maintained index (no inline refresh).
+- **Deamon runtime:** New `arrowhead-deamon` crate (Tokio binary + library) exposes `status`/`shutdown` JSON socket commands, persists PID/status/log files under `.arrowhead/deamon`, and streams filesystem events via `notify` to `Indexer::reindex_paths`. Poll-based watcher integration tests verify path reindex + status updates.
 - **CI:** GitHub Actions workflow (`CI`) runs on push/PR/workflow_dispatch, enforcing fmt, clippy, check, and test across the workspace.
-- **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), feature development guide established, integration fixtures ready.
-- **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`), API/MCP reference stubs added, integration test harness directories created.
+- **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`) and updated to include the deamon crate/runtime responsibilities; feature development guide established; integration fixtures ready.
 - **Vectors:** Semantic pipeline (fastembed + LanceDB) integrates with indexing and CLI search when the optional `vector-lancedb` feature is enabled; defaults to FTS-only when the feature is off. Vector builds skip per-command file logging by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1` to opt in) while we stabilise LanceDB tracing behaviour.
 
 ## Completed Work (Phase 0-1)
@@ -40,6 +40,7 @@
 
 3. **Graph Pipeline (Phase 3)**
    - Defer WikiLink resolution persistence to the upcoming graph implementation; schedule planning session ahead of Phase 3 kickoff.
+   - Document the new deamon-managed workflows (CLI help + API docs) and plan auto-start integration ahead of Phase 3 work on graph services.
 
 4. **MCP Surface (Phase 4-5)**
    - Finalise JSON-RPC types and tool schemas.

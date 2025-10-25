@@ -117,6 +117,17 @@ arrowhead/
 │   │   │   └── handlers.rs
 │   │   └── Cargo.toml
 │   │
+│   ├── arrowhead-deamon/      # Background runtime (watcher + control socket)
+│   │   ├── src/
+│   │   │   ├── lib.rs
+│   │   │   ├── runtime.rs
+│   │   │   ├── control.rs
+│   │   │   ├── watcher.rs
+│   │   │   └── main.rs
+│   │   ├── tests/
+│   │   │   └── runtime.rs
+│   │   └── Cargo.toml
+│   │
 │   └── arrowhead-cli/         # CLI application
 │       ├── src/
 │       │   ├── main.rs
@@ -246,6 +257,25 @@ arrowhead/
    - Weighted score merging (configurable weights)
    - Confidence threshold filtering
    - Run both searches in parallel
+
+### 5. Deamon Runtime
+
+**Responsibility:** Maintain a hot index by reacting to filesystem changes and exposing a control surface for the CLI.
+
+**Runtime Behaviour:**
+- Launches from the `arrowhead-deamon` crate (Tokio binary) and expects `ARROWHEAD_VAULT` to point at the vault root.
+- Records status snapshots under `.arrowhead/deamon/status.json`, including indexed/error counts, current activity, queued jobs, download progress, and surfaced issues.
+- Writes structured logs to `.arrowhead/logs/arrowhead-deamon.log`.
+- Watches the vault (excluding `.arrowhead/`, ignored folders, and attachments) via `notify`, coalescing events into a bounded queue before calling `Indexer::reindex_paths`.
+- Persists a PID file and owns the control socket at `.arrowhead/deamon/control.sock`.
+
+**Control Plane (Phase 2 scope):**
+- JSON-over-Unix-socket protocol with `status` and `shutdown` commands.
+- Responses reuse the shared `DeamonStatus` types so the CLI and future services share a schema.
+- Socket binds with owner-only permissions; stale sockets are removed on startup/shutdown.
+
+**Future Phases:**
+- Auto-start integration (launchd/systemd) and richer command set (`health`, `reload-config`) are scheduled for Phase 3+.
 
 **Search Results:**
 - Note ID, metadata, relevance score
@@ -666,7 +696,7 @@ COMMANDS:
     search                  Search notes
     notes                   Note operations
     graph                   Graph navigation
-    vault                   Vault information and stats
+    vault                   Vault management commands
 ```
 
 ### Command Details
@@ -683,24 +713,16 @@ Creates configuration file and vault directories.
 **Actions:**
 - Create config file at `~/.config/arrowhead/config.toml`
 - Create `.arrowhead/` directory in vault
-- Initialize empty databases
 - Validate vault structure
+- Delegate final setup to `arrowhead vault init` (which can launch the deamon)
 
 #### `index` - Index Vault
 
-Index notes with smart staleness detection.
-
-**Options:**
-- `--force`: Force reindex all notes (ignore mtime)
-- `--note <ID>`: Index specific note only
-- `--parallel <N>`: Number of parallel workers
-- `--progress`: Show progress bar
+Informational command that explains the deamon-managed indexing workflow.
 
 **Behavior:**
-- Check each note for staleness
-- Skip unchanged notes (unless --force)
-- Display indexing statistics
-- Report errors without stopping
+- Prints guidance directing users to `arrowhead vault start` and `arrowhead vault status`
+- Remains available for backwards compatibility but performs no indexing work
 
 #### `search` - Search Notes
 
@@ -757,14 +779,16 @@ Navigate WikiLinks relationships.
 - `unresolved`: Find broken WikiLinks
 - `context <ID>`: Show complete graph context
 
-#### `vault` - Vault Information
+#### `vault` - Vault Management
 
-Vault statistics and conventions.
+Manage the background deamon and Arrowhead working directories.
 
 **Subcommands:**
-- `stats`: Show vault statistics (note count, index status, etc.)
-- `conventions`: Show vault conventions (for AI agents)
-- `check`: Check vault integrity
+- `init`: Prepare `.arrowhead/` directories and (by default) launch the deamon
+- `start`: Launch or relaunch the deamon, waiting for the control socket
+- `status`: Query the control socket or fallback status file for health and progress
+- `stop`: Request a graceful shutdown via the control socket
+- `cleanup`: Stop the deamon if running, then remove `.arrowhead/` caches (index, vectors, logs, status, socket, PID)
 
 ### Configuration File
 
