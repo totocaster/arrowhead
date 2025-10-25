@@ -59,6 +59,8 @@ pub struct IndexingStats {
     pub indexed: u64,
     /// Number of notes skipped because they were fresh in the index.
     pub skipped: u64,
+    /// Number of notes removed from the index.
+    pub removed: u64,
     /// Number of notes that failed to index.
     pub errors: u64,
 }

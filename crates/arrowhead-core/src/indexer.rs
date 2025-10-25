@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -174,6 +174,17 @@ impl Indexer {
                         indexed: false,
                     });
                 }
+                Ok(NoteProcessing::Removed) => {
+                    stats.removed += 1;
+                    processed += 1;
+                    info!(note_id = %note_id, "removed note during full indexing pass");
+                    observer(IndexProgressEvent {
+                        note_id,
+                        processed,
+                        total,
+                        indexed: true,
+                    });
+                }
                 Err(err) => {
                     stats.errors += 1;
                     processed += 1;
@@ -199,10 +210,18 @@ impl Indexer {
             }
         }
 
+        let pruned = self.prune_missing_notes(note_set.as_ref()).await?;
+        if !pruned.is_empty() {
+            stats.removed += pruned.len() as u64;
+            stats.total_notes += pruned.len() as u64;
+            info!(removed = pruned.len(), "pruned stale notes from index");
+        }
+
         info!(
             total = stats.total_notes,
             indexed = stats.indexed,
             skipped = stats.skipped,
+            removed = stats.removed,
             errors = stats.errors,
             "completed indexing pass"
         );
@@ -241,9 +260,192 @@ impl Indexer {
                 }
             }
             NoteProcessing::Skipped => {}
+            NoteProcessing::Removed => {
+                debug!(
+                    note_id = note_id,
+                    "note removed during single-note indexing"
+                );
+            }
         }
         info!(note_id = note_id, "completed single-note indexing");
         Ok(())
+    }
+
+    /// Incrementally reindex the supplied filesystem paths.
+    pub async fn reindex_paths(&self, paths: &[PathBuf]) -> Result<IndexingStats> {
+        let mut targets: HashMap<String, PathBuf> = HashMap::new();
+        for path in paths {
+            if let Some((note_id, relative)) = self.vault.normalise_note_path(path) {
+                let absolute = self.vault.note_path(&relative);
+                targets.insert(note_id, absolute);
+            }
+        }
+
+        if targets.is_empty() {
+            debug!("reindex_paths called with no resolvable markdown notes");
+            return Ok(IndexingStats::default());
+        }
+
+        let total = targets.len() as u64;
+        info!(total_notes = total, "starting targeted reindex");
+
+        let mut known_notes: HashSet<String> = self.database.list_note_ids()?.into_iter().collect();
+        for note_id in targets.keys() {
+            known_notes.insert(note_id.clone());
+        }
+        let known = Arc::new(known_notes);
+        let state_table: Arc<HashMap<String, NoteIndexState>> =
+            Arc::new(self.database.note_states()?);
+        let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
+        let mut tasks = FuturesUnordered::new();
+
+        for (note_id, absolute_path) in targets {
+            let indexer = self.clone();
+            let known_clone = Arc::clone(&known);
+            let states_clone = Arc::clone(&state_table);
+            let semaphore_clone = Arc::clone(&semaphore);
+            tasks.push(tokio::spawn(async move {
+                let _permit = semaphore_clone
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
+                let key = note_id.clone();
+                let outcome = match indexer.vault.inventory_entry_for_path(&absolute_path) {
+                    Ok(Some(entry)) => indexer.run_single(entry, known_clone, states_clone).await,
+                    Ok(None) => indexer.handle_missing_note(note_id).await,
+                    Err(err) => Err(err),
+                };
+                Ok::<_, anyhow::Error>((key, outcome))
+            }));
+        }
+
+        let mut stats = IndexingStats {
+            total_notes: total,
+            ..IndexingStats::default()
+        };
+
+        #[cfg(feature = "vector-lancedb")]
+        let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
+        #[cfg(feature = "vector-lancedb")]
+        let embeddings_pipeline = self.embeddings.clone();
+
+        while let Some(result) = tasks.next().await {
+            let (note_id, outcome) = result??;
+            match outcome {
+                Ok(NoteProcessing::Indexed(embedding)) => {
+                    #[cfg(feature = "vector-lancedb")]
+                    {
+                        if let Some(record) = embedding {
+                            if let Some(pipeline) = embeddings_pipeline.as_ref() {
+                                embedding_buffer.push(record);
+                                if embedding_buffer.len() >= EMBEDDING_FLUSH_BATCH {
+                                    pipeline
+                                        .store()
+                                        .upsert_embeddings(&embedding_buffer)
+                                        .await
+                                        .with_context(|| "failed to persist note embeddings")?;
+                                    embedding_buffer.clear();
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "vector-lancedb"))]
+                    {
+                        let _ = embedding;
+                    }
+                    stats.indexed += 1;
+                    info!(
+                        note_id = note_id.as_str(),
+                        "reindexed note from targeted paths"
+                    );
+                }
+                Ok(NoteProcessing::Skipped) => {
+                    stats.skipped += 1;
+                    debug!(
+                        note_id = note_id.as_str(),
+                        "note is fresh; skipping targeted reindex"
+                    );
+                }
+                Ok(NoteProcessing::Removed) => {
+                    stats.removed += 1;
+                    info!(
+                        note_id = note_id.as_str(),
+                        "removed note during targeted reindex"
+                    );
+                }
+                Err(err) => {
+                    stats.errors += 1;
+                    error!(
+                        note = note_id.as_str(),
+                        error = ?err,
+                        "failed during targeted reindex"
+                    );
+                }
+            }
+        }
+
+        #[cfg(feature = "vector-lancedb")]
+        if let Some(pipeline) = embeddings_pipeline.as_ref() {
+            if !embedding_buffer.is_empty() {
+                pipeline
+                    .store()
+                    .upsert_embeddings(&embedding_buffer)
+                    .await
+                    .with_context(|| "failed to persist note embeddings")?;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Remove a note from the index and associated vector stores.
+    pub async fn remove_note(&self, note_id: &str) -> Result<bool> {
+        let existed = self.database.remove_note(note_id)?;
+
+        #[cfg(feature = "vector-lancedb")]
+        if existed {
+            if let Some(pipeline) = &self.embeddings {
+                pipeline
+                    .store()
+                    .delete_embeddings(&[note_id.to_string()])
+                    .await
+                    .with_context(|| format!("failed to delete embeddings for note {note_id}"))?;
+            }
+        }
+
+        if existed {
+            info!(note_id = note_id, "removed note from index");
+        } else {
+            debug!(
+                note_id = note_id,
+                "remove_note called for note not present in index"
+            );
+        }
+
+        Ok(existed)
+    }
+
+    async fn handle_missing_note(&self, note_id: String) -> Result<NoteProcessing> {
+        if self.remove_note(&note_id).await? {
+            Ok(NoteProcessing::Removed)
+        } else {
+            Ok(NoteProcessing::Skipped)
+        }
+    }
+
+    async fn prune_missing_notes(&self, known_inventory: &HashSet<String>) -> Result<Vec<String>> {
+        let indexed_ids = self.database.list_note_ids()?;
+        let mut removed = Vec::new();
+
+        for note_id in indexed_ids {
+            if !known_inventory.contains(&note_id) {
+                if self.remove_note(&note_id).await? {
+                    removed.push(note_id);
+                }
+            }
+        }
+
+        Ok(removed)
     }
 
     async fn run_single(
@@ -367,6 +569,7 @@ type EmbeddingUpdate = ();
 enum NoteProcessing {
     Indexed(Option<EmbeddingUpdate>),
     Skipped,
+    Removed,
 }
 
 #[cfg(feature = "vector-lancedb")]
@@ -431,9 +634,15 @@ fn normalise_link(link: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
 
     use tempfile::TempDir;
+    use tokio::time::sleep;
 
     use crate::{
         sqlite::IndexDatabase,
@@ -456,6 +665,27 @@ mod tests {
         // Keep tempdir alive by leaking; acceptable in tests for now.
         Box::leak(Box::new(dir));
         Arc::new(IndexDatabase::open(db_path).expect("open db"))
+    }
+
+    fn temp_vault_with_note() -> (Arc<Vault>, Arc<IndexDatabase>, PathBuf) {
+        let temp_dir = TempDir::new().expect("temp vault");
+        let vault_dir = temp_dir.path().to_path_buf();
+        Box::leak(Box::new(temp_dir));
+        fs::create_dir_all(&vault_dir.join(".obsidian"))
+            .expect("create obsidian directory for settings");
+
+        let raw_note_path = vault_dir.join("Sample.md");
+        fs::write(
+            &raw_note_path,
+            "---\ncategory: temp\n---\n\n# Sample\n\nInitial content\n",
+        )
+        .expect("write sample note");
+
+        let vault =
+            Arc::new(Vault::new(VaultConfig::new(vault_dir.clone())).expect("vault initialises"));
+        let database = temp_db();
+        let canonical_note_path = vault.note_path("Sample.md");
+        (vault, database, canonical_note_path)
     }
 
     #[tokio::test]
@@ -540,5 +770,81 @@ mod tests {
         assert_eq!(events.len() as u64, stats.total_notes);
         assert!(events.iter().any(|event| event.indexed));
         assert_eq!(events.last().unwrap().processed, stats.total_notes);
+    }
+
+    #[tokio::test]
+    async fn reindex_paths_updates_modified_note() {
+        let (vault, database, note_path) = temp_vault_with_note();
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+
+        indexer.index_all().await.expect("initial index");
+        let before = database
+            .note_state("Sample")
+            .expect("state query")
+            .expect("state present")
+            .indexed_at;
+
+        assert!(vault.normalise_note_path(&note_path).is_some());
+
+        sleep(Duration::from_millis(10)).await;
+        fs::write(
+            &note_path,
+            "---\ncategory: temp\n---\n\n# Sample\n\nUpdated content\n",
+        )
+        .expect("update note");
+
+        let stats = indexer
+            .reindex_paths(&[note_path.clone()])
+            .await
+            .expect("targeted reindex");
+        assert_eq!(stats.total_notes, 1);
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.removed, 0);
+
+        let after = database
+            .note_state("Sample")
+            .expect("state query")
+            .expect("state present")
+            .indexed_at;
+        assert!(after >= before);
+    }
+
+    #[tokio::test]
+    async fn reindex_paths_removes_deleted_note() {
+        let (vault, database, note_path) = temp_vault_with_note();
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+
+        indexer.index_all().await.expect("initial index");
+
+        fs::remove_file(&note_path).expect("remove note file");
+
+        assert!(vault.normalise_note_path(&note_path).is_some());
+
+        let stats = indexer
+            .reindex_paths(&[note_path.clone()])
+            .await
+            .expect("targeted reindex");
+        assert_eq!(stats.total_notes, 1);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.indexed, 0);
+
+        let ids = database.list_note_ids().expect("list note ids");
+        assert!(ids.is_empty());
+        assert!(
+            database
+                .note_state("Sample")
+                .expect("state query")
+                .is_none()
+        );
     }
 }

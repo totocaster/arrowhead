@@ -107,6 +107,7 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
     info!(
         indexed = stats.indexed,
         skipped = stats.skipped,
+        removed = stats.removed,
         errors = stats.errors,
         "ensured index before search"
     );

@@ -6,8 +6,9 @@
 //! live in dedicated modules so they can be unit tested independently.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
+    io::ErrorKind,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{SystemTime, UNIX_EPOCH},
@@ -36,6 +37,127 @@ pub struct NoteInventoryEntry {
     pub file_modified_at: DateTime<Utc>,
     /// Optional filesystem creation timestamp.
     pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Cached snapshot of vault inventory for fast lookups.
+#[derive(Debug, Clone)]
+pub struct InventorySnapshot {
+    paths: Arc<VaultPaths>,
+    settings: Arc<VaultSettings>,
+    arrowhead_relative: PathBuf,
+    attachments_relative: Option<PathBuf>,
+    entries: Vec<NoteInventoryEntry>,
+    by_id: HashMap<String, usize>,
+    by_path: HashMap<PathBuf, usize>,
+}
+
+impl InventorySnapshot {
+    fn new(
+        paths: Arc<VaultPaths>,
+        settings: Arc<VaultSettings>,
+        entries: Vec<NoteInventoryEntry>,
+    ) -> Self {
+        let mut by_id = HashMap::with_capacity(entries.len());
+        let mut by_path = HashMap::with_capacity(entries.len());
+
+        for (index, entry) in entries.iter().enumerate() {
+            by_id.insert(entry.id.clone(), index);
+            by_path.insert(entry.relative_path.clone(), index);
+        }
+
+        let arrowhead_relative = paths
+            .arrowhead_dir
+            .strip_prefix(&paths.root)
+            .unwrap_or_else(|_| Path::new(".arrowhead"))
+            .to_path_buf();
+
+        let attachments_relative = paths
+            .attachments_dir
+            .as_ref()
+            .and_then(|dir| dir.strip_prefix(&paths.root).ok())
+            .map(Path::to_path_buf);
+
+        Self {
+            paths,
+            settings,
+            arrowhead_relative,
+            attachments_relative,
+            entries,
+            by_id,
+            by_path,
+        }
+    }
+
+    /// Iterate over all inventory entries.
+    pub fn entries(&self) -> &[NoteInventoryEntry] {
+        &self.entries
+    }
+
+    /// Returns a reference to the underlying vault paths.
+    pub fn paths(&self) -> &VaultPaths {
+        &self.paths
+    }
+
+    /// Look up a note inventory entry by note identifier.
+    pub fn get_by_id(&self, note_id: &str) -> Option<&NoteInventoryEntry> {
+        self.by_id
+            .get(note_id)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    /// Look up a note inventory entry by relative or absolute filesystem path.
+    pub fn get_by_path<P: AsRef<Path>>(&self, path: P) -> Option<&NoteInventoryEntry> {
+        let relative = self.normalise_path(path.as_ref())?;
+        self.by_path
+            .get(&relative)
+            .and_then(|index| self.entries.get(*index))
+    }
+
+    /// Derive a note identifier for the supplied path if it belongs to the vault.
+    pub fn note_id_for_path<P: AsRef<Path>>(&self, path: P) -> Option<NoteId> {
+        let relative = self.normalise_path(path.as_ref())?;
+        if !is_markdown(&relative) {
+            return None;
+        }
+        derive_note_id(&relative).ok()
+    }
+
+    /// Consume the snapshot and return the owned entries.
+    pub fn into_entries(self) -> Vec<NoteInventoryEntry> {
+        self.entries
+    }
+
+    fn normalise_path(&self, path: &Path) -> Option<PathBuf> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+
+        let candidate = if path.is_absolute() {
+            path.strip_prefix(&self.paths.root).ok()?.to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+
+        let relative = normalise_relative_path(&candidate)?;
+        if self.is_ignored(&relative) {
+            return None;
+        }
+        Some(relative)
+    }
+
+    fn is_ignored(&self, relative: &Path) -> bool {
+        if relative.starts_with(&self.arrowhead_relative) {
+            return true;
+        }
+
+        if let Some(attachments) = &self.attachments_relative {
+            if relative.starts_with(attachments) {
+                return true;
+            }
+        }
+
+        is_ignored(relative, self.settings.ignored_folders())
+    }
 }
 
 /// Configuration values required to initialise a [`Vault`].
@@ -245,6 +367,98 @@ impl Vault {
         )
     }
 
+    /// Normalise a filesystem path to a vault-relative markdown path.
+    pub fn resolve_relative_note_path<P: AsRef<Path>>(&self, path: P) -> Option<PathBuf> {
+        let relative = self.normalise_path(path.as_ref())?;
+        if !is_markdown(&relative) {
+            return None;
+        }
+        Some(relative)
+    }
+
+    /// Normalise a path and return its note identifier alongside the relative path.
+    pub fn normalise_note_path<P: AsRef<Path>>(&self, path: P) -> Option<(NoteId, PathBuf)> {
+        let relative = self.resolve_relative_note_path(path)?;
+        let note_id = derive_note_id(&relative).ok()?;
+        Some((note_id, relative))
+    }
+
+    /// Derive a note identifier from a filesystem path pointing to a markdown file.
+    pub fn note_id_from_path<P: AsRef<Path>>(&self, path: P) -> Option<NoteId> {
+        self.normalise_note_path(path).map(|(id, _)| id)
+    }
+
+    /// Construct an inventory entry for the supplied path if the note exists.
+    pub fn inventory_entry_for_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<Option<NoteInventoryEntry>> {
+        let (note_id, relative_path) = match self.normalise_note_path(path.as_ref()) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        let absolute_path = self.note_path(&relative_path);
+
+        let meta = match fs::metadata(&absolute_path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect note {}", absolute_path.display())
+                });
+            }
+        };
+
+        let modified = system_time_to_utc(meta.modified().unwrap_or_else(|_| SystemTime::now()))?;
+        let created = meta
+            .created()
+            .ok()
+            .and_then(|time| system_time_to_utc(time).ok());
+
+        Ok(Some(NoteInventoryEntry {
+            id: note_id,
+            relative_path,
+            absolute_path,
+            file_modified_at: modified,
+            created_at: created,
+        }))
+    }
+
+    fn normalise_path(&self, path: &Path) -> Option<PathBuf> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+
+        let candidate = if path.is_absolute() {
+            path.strip_prefix(&self.paths.root).ok()?.to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+
+        let relative = normalise_relative_path(&candidate)?;
+
+        if let Ok(arrowhead_relative) = self.paths.arrowhead_dir.strip_prefix(&self.paths.root) {
+            if relative.starts_with(arrowhead_relative) {
+                return None;
+            }
+        }
+
+        if let Some(attachments_dir) = &self.paths.attachments_dir {
+            if let Ok(attachments_relative) = attachments_dir.strip_prefix(&self.paths.root) {
+                if relative.starts_with(attachments_relative) {
+                    return None;
+                }
+            }
+        }
+
+        if is_ignored(&relative, self.settings.ignored_folders()) {
+            return None;
+        }
+
+        Some(relative)
+    }
+
     /// Load a note by its identifier.
     pub fn load_note(&self, note_id: &str) -> Result<NoteRecord> {
         let inventory = self.inventory()?;
@@ -255,8 +469,22 @@ impl Vault {
         self.load_note_from_entry(&entry)
     }
 
+    /// Build and cache vault inventory for reuse across operations.
+    pub fn inventory_snapshot(&self) -> Result<InventorySnapshot> {
+        let entries = self.build_inventory_entries()?;
+        Ok(InventorySnapshot::new(
+            self.paths.clone(),
+            self.settings.clone(),
+            entries,
+        ))
+    }
+
     /// Build an inventory of all markdown notes without parsing their contents.
     pub fn inventory(&self) -> Result<Vec<NoteInventoryEntry>> {
+        Ok(self.inventory_snapshot()?.into_entries())
+    }
+
+    fn build_inventory_entries(&self) -> Result<Vec<NoteInventoryEntry>> {
         let mut entries = Vec::new();
         let mut ids = BTreeMap::new();
 
@@ -432,6 +660,54 @@ mod tests {
         assert_eq!(record.id, "2024-01-15");
         assert_eq!(record.relative_path, entry.relative_path);
         assert_eq!(record.file_modified_at, entry.file_modified_at);
+    }
+
+    #[test]
+    fn inventory_snapshot_supports_id_and_path_lookup() {
+        let vault = build_vault();
+        let snapshot = vault.inventory_snapshot().expect("snapshot builds");
+        let entry = snapshot
+            .get_by_id("2024-01-15")
+            .expect("note present in snapshot");
+
+        assert_eq!(entry.relative_path, PathBuf::from("2024-01-15.md"));
+
+        let absolute = vault.note_path(&entry.relative_path);
+        let by_absolute = snapshot
+            .get_by_path(&absolute)
+            .expect("snapshot resolves absolute path");
+        assert_eq!(by_absolute.id, entry.id);
+
+        let by_relative = snapshot
+            .get_by_path(&entry.relative_path)
+            .expect("snapshot resolves relative path");
+        assert_eq!(by_relative.id, entry.id);
+    }
+
+    #[test]
+    fn note_id_from_path_normalises_absolute_paths() {
+        let vault = build_vault();
+        let absolute = vault.note_path("2024-01-15.md");
+        let note_id = vault
+            .note_id_from_path(&absolute)
+            .expect("note id derived from absolute path");
+        assert_eq!(note_id, "2024-01-15");
+
+        assert!(
+            vault
+                .note_id_from_path(vault.note_path(".arrowhead/index.db"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inventory_entry_for_path_returns_none_for_missing_files() {
+        let vault = build_vault();
+        let missing = vault.note_path("does-not-exist.md");
+        let entry = vault
+            .inventory_entry_for_path(&missing)
+            .expect("inventory entry lookup");
+        assert!(entry.is_none());
     }
 
     #[test]

@@ -112,13 +112,14 @@ pub async fn run(ctx: &CommandContext, command: &IndexCommand) -> Result<()> {
             indexer.index_all().await?
         };
         println!(
-            "Indexed {} notes ({} updated, {} skipped, {} errors)",
-            stats.total_notes, stats.indexed, stats.skipped, stats.errors
+            "Indexed {} notes ({} updated, {} skipped, {} removed, {} errors)",
+            stats.total_notes, stats.indexed, stats.skipped, stats.removed, stats.errors
         );
         info!(
             total = stats.total_notes,
             indexed = stats.indexed,
             skipped = stats.skipped,
+            removed = stats.removed,
             errors = stats.errors,
             "completed full index"
         );
@@ -176,7 +177,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::commands::CommandContext;
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, DeamonConfig};
 
     fn write_note(path: &PathBuf) {
         fs::write(
@@ -195,6 +196,7 @@ mod tests {
         let config = AppConfig {
             vault: Some(vault_dir.path().to_path_buf()),
             embedding_model: None,
+            deamon: DeamonConfig::default(),
         };
         let ctx = CommandContext::new(config, None, 0);
         let command = IndexCommand {
