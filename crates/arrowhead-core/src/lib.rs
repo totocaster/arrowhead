@@ -18,11 +18,16 @@ pub mod indexer;
 pub mod metadata;
 pub mod search;
 pub mod sqlite;
+pub mod status;
 pub mod types;
 pub mod vault;
 
 // Re-export commonly used types for convenience across crates.
 pub use indexer::IndexProgressEvent;
 pub use search::{SearchConfig, SearchResult, SearchService};
+pub use status::{
+    ActivityState, ActivityStatus, DEAMON_STATUS_VERSION, DeamonStatus, DownloadState,
+    DownloadStatus, IssueSeverity, StatusIssue,
+};
 pub use types::{IndexingStats, MetadataMap, NoteId, NoteRecord, VaultPaths};
-pub use vault::{Vault, VaultConfig, VaultSettings};
+pub use vault::{InventorySnapshot, Vault, VaultConfig, VaultSettings};

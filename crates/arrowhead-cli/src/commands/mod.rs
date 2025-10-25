@@ -7,7 +7,6 @@ use anyhow::Result;
 use crate::config::AppConfig;
 
 pub mod graph;
-pub mod index;
 pub mod init;
 pub mod notes;
 pub mod search;

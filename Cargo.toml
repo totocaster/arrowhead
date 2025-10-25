@@ -4,6 +4,7 @@ members = [
     "crates/arrowhead-core",
     "crates/arrowhead-mcp",
     "crates/arrowhead-cli",
+    "crates/arrowhead-deamon",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ async-trait = "0.1.89"
 num_cpus = "1.17.0"
 futures = "0.3.30"
 tracing-appender = "0.2.3"
+notify = "6.1.1"
 
 # CLI dependencies
 clap = { version = "4.5.50", features = ["derive"] }
@@ -46,6 +48,7 @@ r2d2_sqlite = "0.31.0"
 fastembed = "5.2.0"
 ndarray = "0.16.1"
 lancedb = { version = "0.21.3", default-features = false }
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 
 # HTTP dependencies
 axum = "0.8.6"

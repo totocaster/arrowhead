@@ -1,23 +1,24 @@
 //! Arrowhead CLI
 //!
-//! Command-line interface for Obsidian vault indexing and search.
+//! Command-line interface for Arrowhead vault operations and search.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 
+mod autostart;
 mod commands;
 mod config;
 mod logging;
 
-use commands::{CommandContext, graph, index, init, notes, search, vault};
+use commands::{CommandContext, graph, init, notes, search, vault};
 use config::AppConfig;
 
 /// Arrowhead command-line interface options.
 #[derive(Debug, Parser)]
 #[command(name = "arrowhead")]
-#[command(about = "Obsidian vault indexing and search with MCP integration")]
+#[command(about = "Obsidian vault search and MCP integration")]
 struct Cli {
     /// Path to the vault that should be used for this invocation.
     #[arg(long, value_name = "PATH", global = true)]
@@ -38,8 +39,6 @@ struct Cli {
 enum Commands {
     /// Initialise a vault and configuration.
     Init(init::InitCommand),
-    /// Run indexing tasks.
-    Index(index::IndexCommand),
     /// Execute searches.
     Search(search::SearchCommand),
     /// Perform note CRUD operations.
@@ -72,9 +71,6 @@ async fn main() -> Result<()> {
             init::run(&mut ctx, &command).await?;
             ctx.persist()?;
         }
-        Commands::Index(command) => {
-            index::run(&ctx, &command).await?;
-        }
         Commands::Search(command) => {
             search::run(&ctx, &command).await?;
         }
@@ -85,7 +81,7 @@ async fn main() -> Result<()> {
             graph::run(&ctx, &command).await?;
         }
         Commands::Vault(command) => {
-            vault::run(&ctx, &command).await?;
+            vault::run(&mut ctx, &command).await?;
         }
     }
 

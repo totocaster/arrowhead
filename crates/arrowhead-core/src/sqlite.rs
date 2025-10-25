@@ -177,6 +177,46 @@ impl IndexDatabase {
         Ok(result)
     }
 
+    /// List every note identifier stored in the index.
+    pub fn list_note_ids(&self) -> Result<Vec<String>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare("SELECT id FROM notes ORDER BY id")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+
+        Ok(ids)
+    }
+
+    /// Remove a note (and associated metadata) from the index.
+    pub fn remove_note(&self, note_id: &str) -> Result<bool> {
+        let mut conn = self.connection_for_thread()?;
+        let tx = conn
+            .transaction()
+            .context("failed to start removal transaction")?;
+
+        tx.execute("DELETE FROM notes_fts WHERE id = ?1", [note_id])
+            .context("failed to remove note from FTS index")?;
+        let affected = tx
+            .execute("DELETE FROM notes WHERE id = ?1", [note_id])
+            .context("failed to remove note row")?;
+
+        if affected > 0 {
+            tx.execute(
+                "UPDATE note_links SET target_id = NULL WHERE target_id = ?1",
+                [note_id],
+            )
+            .context("failed to clear backlinks for removed note")?;
+        }
+
+        tx.commit()
+            .context("failed to commit removal transaction")?;
+        Ok(affected > 0)
+    }
+
     /// Upsert the supplied note content and metadata into the index.
     pub fn upsert_note(
         &self,
@@ -813,6 +853,52 @@ mod tests {
             Some("reference")
         );
         assert!(map.get("tags").is_some());
+    }
+
+    #[test]
+    fn list_note_ids_returns_inserted_notes() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let note = load_note("Photography Equipment");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract succeeds");
+        db.upsert_note(&note, &extraction, &[], Utc::now())
+            .expect("upsert succeeds");
+
+        let ids = db.list_note_ids().expect("list note ids");
+        assert_eq!(ids, vec![note.id.clone()]);
+    }
+
+    #[test]
+    fn remove_note_cleans_up_row_and_fts() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let note = load_note("Photography Equipment");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract succeeds");
+        db.upsert_note(&note, &extraction, &[], Utc::now())
+            .expect("upsert succeeds");
+
+        assert!(db.remove_note(&note.id).expect("remove note"));
+        assert!(
+            !db.remove_note(&note.id)
+                .expect("second removal returns false")
+        );
+
+        let ids = db.list_note_ids().expect("list note ids");
+        assert!(ids.is_empty());
+
+        let conn = db.connection().expect("connection");
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE id = ?1",
+                [&note.id],
+                |row| row.get(0),
+            )
+            .expect("query fts table");
+        assert_eq!(remaining, 0);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use tracing::Level;
 use tracing::dispatcher::DefaultGuard;
 use tracing_appender::{non_blocking, rolling};
 
-const LOG_FILE_NAME: &str = "arrowhead.log";
+const LOG_FILE_NAME: &str = "cli.log";
 const MAX_LOG_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 

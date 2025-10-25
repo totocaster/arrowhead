@@ -2,18 +2,16 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use tracing::info;
 
-use arrowhead_core::IndexingStats;
 use arrowhead_core::{
-    SearchConfig, SearchResult, SearchService, Vault, VaultConfig,
-    embeddings::EmbeddingPipeline,
-    indexer::{Indexer, IndexerConfig},
-    sqlite::IndexDatabase,
+    SearchConfig, SearchResult, SearchService, Vault, VaultConfig, embeddings::EmbeddingPipeline,
+    sqlite::IndexDatabase, status::DeamonStatus,
 };
+use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
 
 use crate::logging;
 
@@ -92,24 +90,16 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         None
     };
 
-    let force_full = embeddings
-        .as_ref()
-        .map(|pipeline| pipeline.model_changed())
-        .unwrap_or(false);
-
-    let stats = ensure_index_fresh(
-        Arc::clone(&vault),
-        Arc::clone(&database),
-        embeddings.clone(),
-        force_full,
-    )
-    .await?;
-    info!(
-        indexed = stats.indexed,
-        skipped = stats.skipped,
-        errors = stats.errors,
-        "ensured index before search"
-    );
+    let status = ensure_deamon_ready(ctx, vault.as_ref()).await?;
+    if status.indexed_notes == 0 {
+        info!("deamon status reports zero indexed notes; search results may be incomplete");
+    }
+    if status.error_notes > 0 {
+        info!(
+            errors = status.error_notes,
+            "latest deamon run reported indexing errors"
+        );
+    }
 
     let service = SearchService::new(database, SearchConfig::default(), embeddings);
 
@@ -151,16 +141,45 @@ async fn execute_fts_search(
         .context("failed to execute FTS search")
 }
 
-async fn ensure_index_fresh(
-    vault: Arc<Vault>,
-    database: Arc<IndexDatabase>,
-    embeddings: Option<Arc<EmbeddingPipeline>>,
-    force: bool,
-) -> Result<IndexingStats> {
-    let mut config = IndexerConfig::default();
-    config.force = force;
-    let indexer = Indexer::new(vault, database, config, embeddings);
-    indexer.index_all().await
+async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<DeamonStatus> {
+    let default_socket = vault.paths().arrowhead_dir.join("deamon/control.sock");
+    let socket_path = ctx
+        .config
+        .deamon
+        .socket_path
+        .clone()
+        .unwrap_or(default_socket);
+
+    match send_control_request(&socket_path, ControlRequest::Status).await {
+        Ok(ControlResponse::Status { status }) => Ok(status),
+        Ok(ControlResponse::Error { message }) => {
+            bail!("arrowhead deamon reported an error: {message}")
+        }
+        Ok(ControlResponse::ShutdownAck) => {
+            bail!("arrowhead deamon acknowledged shutdown; restart it with `arrowhead vault start`")
+        }
+        Err(err) => {
+            let default_status = vault.paths().arrowhead_dir.join("deamon/status.json");
+            let status_path = ctx
+                .config
+                .deamon
+                .status_path
+                .clone()
+                .unwrap_or(default_status);
+            if let Some(status) = DeamonStatus::load_from_path(&status_path)? {
+                Err(anyhow!(
+                    "arrowhead deamon appears offline (last update {}). Start it with `arrowhead vault start` and retry.",
+                    status.updated_at.to_rfc3339()
+                ))
+            } else {
+                Err(anyhow!(
+                    "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead vault start` and retry.",
+                    socket_path.display(),
+                    err
+                ))
+            }
+        }
+    }
 }
 
 fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
@@ -217,9 +236,10 @@ fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, sync::Arc};
+    use std::{fs, time::Duration};
 
-    use arrowhead_core::sqlite::IndexDatabase;
+    use arrowhead_core::ActivityState;
+    use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy};
     use tempfile::TempDir;
 
     use crate::commands::CommandContext;
@@ -234,7 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fts_search_returns_results() {
+    async fn search_errors_when_deamon_missing() {
         let vault_dir = TempDir::new().expect("vault");
         let note_path = vault_dir.path().join("Sample.md");
         write_note(&note_path);
@@ -248,32 +268,79 @@ mod tests {
             0,
         );
 
-        let query = QueryArgs {
-            query: "category:reference".to_string(),
-            limit: Some(5),
-            json: false,
+        let command = SearchCommand {
+            mode: SearchMode::Fts(QueryArgs {
+                query: "category:reference".to_string(),
+                limit: Some(5),
+                json: false,
+            }),
         };
 
-        let database = Arc::new(
-            IndexDatabase::open(vault_dir.path().join(".arrowhead").join("index.db"))
-                .expect("database opens"),
+        let err = run(&ctx, &command).await.expect_err("search should fail");
+        assert!(
+            err.to_string().contains("arrowhead deamon"),
+            "unexpected error: {err}"
         );
-        let vault =
-            Arc::new(Vault::new(VaultConfig::new(vault_dir.path().to_path_buf())).expect("vault"));
-        vault.ensure_arrowhead_dirs().expect("dirs");
-        ensure_index_fresh(Arc::clone(&vault), Arc::clone(&database), None, false)
+    }
+
+    #[tokio::test]
+    async fn fts_search_with_running_deamon() {
+        let vault_dir = TempDir::new().expect("vault");
+        let note_path = vault_dir.path().join("Sample.md");
+        write_note(&note_path);
+
+        let handle = DeamonRuntimeBuilder::new(vault_dir.path())
+            .disable_embeddings()
+            .watcher_strategy(WatcherStrategy::Poll {
+                interval: Duration::from_millis(50),
+            })
+            .spawn()
             .await
-            .expect("indexing succeeds");
-        let service = SearchService::new(database, SearchConfig::default(), None);
-        let results = execute_fts_search(&service, &query)
-            .await
-            .expect("fts query succeeds");
-        assert!(!results.is_empty());
+            .expect("spawn deamon");
+
+        let socket_path = vault_dir.path().join(".arrowhead/deamon/control.sock");
+        let mut wait_attempts = 0;
+        while !socket_path.exists() {
+            wait_attempts += 1;
+            if wait_attempts > 100 {
+                panic!("control socket did not appear in time");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Wait for the initial indexing pass to complete.
+        let mut attempts = 0;
+        loop {
+            let status = handle.request_status().await.expect("status available");
+            if status.activity.state == ActivityState::Idle && status.indexed_notes >= 1 {
+                break;
+            }
+            attempts += 1;
+            if attempts > 100 {
+                panic!("deamon failed to finish initial indexing in time");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let ctx = CommandContext::new(
+            AppConfig {
+                vault: Some(vault_dir.path().to_path_buf()),
+                ..AppConfig::default()
+            },
+            None,
+            0,
+        );
 
         let command = SearchCommand {
-            mode: SearchMode::Fts(query),
+            mode: SearchMode::Fts(QueryArgs {
+                query: "category:reference".to_string(),
+                limit: Some(5),
+                json: false,
+            }),
         };
 
         run(&ctx, &command).await.expect("fts search executes");
+
+        handle.shutdown().await.expect("shutdown succeeds");
     }
 }
