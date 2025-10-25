@@ -14,11 +14,18 @@ use arrowhead_core::{
 };
 use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy};
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use tempfile::TempDir;
-use tokio::time::{Instant, sleep};
+use tokio::{
+    sync::Mutex as AsyncMutex,
+    time::{Instant, sleep},
+};
+
+static TEST_LOG_MUTEX: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
+    let _log_guard = TEST_LOG_MUTEX.lock().await;
     let (temp_dir, vault_root) = prepare_vault()?;
 
     let handle = DeamonRuntimeBuilder::new(&vault_root)
@@ -36,6 +43,7 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
 
     let note_path = vault_root.join("Minimal Note.md");
     let mut content = fs::read_to_string(&note_path)?;
+    sleep(Duration::from_millis(1100)).await;
     content.push_str("\n\nUpdated content from watcher test.\n");
     fs::write(&note_path, content)?;
 
@@ -55,7 +63,26 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
         "status should report indexed notes"
     );
 
+    let log_path = vault_root
+        .join(".arrowhead")
+        .join("logs")
+        .join("daemon.log");
+
     handle.shutdown().await?;
+
+    let log_contents = fs::read_to_string(&log_path)
+        .with_context(|| format!("failed to read {}", log_path.display()))?;
+    assert!(
+        log_contents.contains("watcher resolved note ids for reindex"),
+        "daemon log should record watcher target resolution\n{}",
+        log_contents
+    );
+    assert!(
+        log_contents.contains("reindexed note from targeted paths"),
+        "daemon log should record note-level reindexing\n{}",
+        log_contents
+    );
+
     drop(temp_dir);
 
     Ok(())
@@ -63,6 +90,7 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn control_socket_status_and_shutdown() -> Result<()> {
+    let _log_guard = TEST_LOG_MUTEX.lock().await;
     let (temp_dir, vault_root) = prepare_vault()?;
 
     let handle = DeamonRuntimeBuilder::new(&vault_root)

@@ -101,8 +101,6 @@ arrowhead vault cleanup
 
 ## Known issues
 
-- **Sparse daemon logging**: Some environments only emit the start banner in `daemon.log`. A follow-up task is tracking the active tracing subscriber so indexing/download entries are preserved.
-- **Watcher visibility**: Incremental reindexing currently updates status snapshots but may not log per-note progress yet.
 - **Indexing failures**: A handful of notes can still fail to index without detailed diagnostics; richer error logging is on the roadmap.
 
 ## License

@@ -36,4 +36,5 @@ vector-lancedb = [
 
 [dev-dependencies]
 chrono.workspace = true
+once_cell = "1.19"
 tempfile = "3.8"

@@ -262,7 +262,6 @@ impl DeamonRuntime {
         let status_path = runtime.config.status_path.clone();
         let socket_path = runtime.config.socket_path.clone();
         let database = Arc::clone(&runtime.config.database);
-
         let task = tokio::spawn(async move { runtime.run().await });
 
         Ok(DeamonHandle {
@@ -471,10 +470,27 @@ impl DeamonRuntime {
         }
 
         let target_list: Vec<PathBuf> = targets.into_iter().collect();
-        let active_note = target_list
+        let mut target_ids: Vec<String> = target_list
             .iter()
             .filter_map(|path| self.config.vault.note_id_from_path(path))
-            .next();
+            .collect();
+        target_ids.sort();
+        let active_note = target_ids.first().cloned();
+
+        if !target_ids.is_empty() {
+            let sample = if target_ids.len() <= 5 {
+                target_ids.join(", ")
+            } else {
+                let head = target_ids[..5].join(", ");
+                format!("{head}… (+{} more)", target_ids.len() - 5)
+            };
+            info!(
+                resolved = target_ids.len(),
+                sample = %sample,
+                "watcher resolved note ids for reindex"
+            );
+            debug!(targets = ?target_ids, "watcher resolved note ids");
+        }
 
         self.persist_status(|status| {
             status.activity =

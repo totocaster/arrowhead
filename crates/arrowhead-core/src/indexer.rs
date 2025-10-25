@@ -299,23 +299,31 @@ impl Indexer {
         let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
         let mut tasks = FuturesUnordered::new();
 
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+
         for (note_id, absolute_path) in targets {
             let indexer = self.clone();
             let known_clone = Arc::clone(&known);
             let states_clone = Arc::clone(&state_table);
             let semaphore_clone = Arc::clone(&semaphore);
+            let task_dispatch = dispatch.clone();
             tasks.push(tokio::spawn(async move {
-                let _permit = semaphore_clone
-                    .acquire_owned()
-                    .await
-                    .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
-                let key = note_id.clone();
-                let outcome = match indexer.vault.inventory_entry_for_path(&absolute_path) {
-                    Ok(Some(entry)) => indexer.run_single(entry, known_clone, states_clone).await,
-                    Ok(None) => indexer.handle_missing_note(note_id).await,
-                    Err(err) => Err(err),
+                let fut = async move {
+                    let _permit = semaphore_clone
+                        .acquire_owned()
+                        .await
+                        .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
+                    let key = note_id.clone();
+                    let outcome = match indexer.vault.inventory_entry_for_path(&absolute_path) {
+                        Ok(Some(entry)) => {
+                            indexer.run_single(entry, known_clone, states_clone).await
+                        }
+                        Ok(None) => indexer.handle_missing_note(note_id).await,
+                        Err(err) => Err(err),
+                    };
+                    Ok::<_, anyhow::Error>((key, outcome))
                 };
-                Ok::<_, anyhow::Error>((key, outcome))
+                tracing::dispatcher::with_default(&task_dispatch, || fut).await
             }));
         }
 
@@ -455,9 +463,14 @@ impl Indexer {
         index_states: Arc<HashMap<String, NoteIndexState>>,
     ) -> Result<NoteProcessing> {
         let indexer = self.clone();
-        task::spawn_blocking(move || indexer.process_note(&entry, &known_notes, &index_states))
-            .await
-            .context("indexing task panicked")?
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                indexer.process_note(&entry, &known_notes, &index_states)
+            })
+        })
+        .await
+        .context("indexing task panicked")?
     }
 
     fn process_note(
