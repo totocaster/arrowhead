@@ -32,7 +32,7 @@ Arrowhead references the precision obsidian tools used by prehistoric humans for
 
 🚧 **Under active development** - This is a complete rewrite of Synapse from Swift to Rust.
 
-Current phase: **Phase 1 — Core foundation (vault/indexer)**
+Current phase: **Phase 4 — Verification & documentation (daemon runtime live)**
 
 See [docs/predev_synapse_rust_rewrite.md](docs/predev_synapse_rust_rewrite.md) for the complete specification.
 
@@ -42,6 +42,7 @@ See [docs/predev_synapse_rust_rewrite.md](docs/predev_synapse_rust_rewrite.md) f
 arrowhead/
 ├── crates/
 │   ├── arrowhead-core/     # Core library (vault, indexing, search, graph)
+│   ├── arrowhead-deamon/   # Background daemon (watcher + control socket)
 │   ├── arrowhead-mcp/      # MCP protocol implementation
 │   └── arrowhead-cli/      # CLI application
 ├── docs/                   # Documentation

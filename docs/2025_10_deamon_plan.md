@@ -7,9 +7,9 @@
 - Goal: evolve Arrowhead into a deamon-backed experience where vault
   initialisation provisions a background service that keeps the index hot
   without per-command reindexing.
-- Current state: CLI relies on on-demand indexing (kicking off full passes from
-  `search`/`index`). No background watcher exists; incremental deletion support
-  is missing in the SQLite layer and CLI always reindexes before searches.
+- Current state: `arrowhead-deamon` maintains the hot index (watcher + incremental
+  delete support), and CLI commands trust the daemon status instead of launching
+  ad-hoc indexing passes.
 - Constraints: Rust 1.86 toolchain, optional LanceDB feature, cross-platform
   support (macOS + Linux), maintainability & testability per rewrite spec.
 
@@ -27,9 +27,7 @@
 - ⚠️ IPC/control plane: no existing mechanism for CLI↔deamon coordination.
   Needs a lightweight channel (Unix domain socket + JSON command envelope) or
   status files. Chosen approach must survive restarts and support status checks.
-- ⚠️ CLI behaviour: commands currently self-refresh the index. We must refactor
-  them to skip indexing, trust the deamon’s hot index, and fall back gracefully
-  if the deamon is unhealthy.
+- ⚠️ Diagnostics: need richer surfacing of repeated indexing failures so users can troubleshoot without tailing logs.
 
 ## Implementation Plan
 

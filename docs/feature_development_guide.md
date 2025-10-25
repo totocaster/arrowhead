@@ -18,8 +18,9 @@ specification.
   subscriber. Keep stdout/stderr for intentional user-facing output only.
 - Emit at least `info!` on command start/finish and for notable decisions (e.g.
   skipping stale work, writing migrations).
-- When adding async tasks, ensure the logging guard spans their lifetime so the
-  non-blocking writer can flush.
+- When spawning background tasks, carry the active `tracing` dispatcher (e.g.
+  via `tracing::dispatcher::with_default`) so log output continues flowing to
+  the configured file logger.
 
 ## 3. Testing Expectations
 - Unit tests co-located with the code (`#[cfg(test)]`). Use the fixture vault in

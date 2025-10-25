@@ -9,15 +9,15 @@
 
 ## Executive Summary
 
-This document specifies a complete rewrite of Synapse from Swift to Rust as **Arrowhead**, transforming it from a macOS menu bar app with real-time indexing to a cross-platform CLI tool with on-demand indexing. The core functionality—Obsidian vault indexing, full-text search, semantic search, and MCP server—remains intact while the architecture is simplified for CLI-first operation.
+This document specifies a complete rewrite of Synapse from Swift to Rust as **Arrowhead**, transforming it from a macOS menu bar app with real-time indexing to a cross-platform CLI tool backed by a long-running deamon that keeps vault indexes hot. The core functionality—Obsidian vault indexing, full-text search, semantic search, and MCP server—remains intact while the architecture is simplified for CLI-first operation.
 
 **Name Origin:** Arrowhead references the precision obsidian tools used by prehistoric humans for hunting and crafting—sharp, targeted instruments that point the way, just as this tool precisely finds and connects knowledge within your Obsidian vault.
 
 ## Current Status (2025-10-21)
 
 - Workspace standardised on Rust 1.85 / edition 2024 (`rust-toolchain.toml` committed).
-- Core, CLI, and MCP crates compile with fully typed scaffolding; modules validate configuration and return descriptive `todo` errors instead of panicking.
-- CLI parses the complete command surface (`init`, `index`, `search`, `notes`, `graph`, `vault`) and persists config, ready for implementation work.
+- Core, CLI, and MCP crates now implement the background deamon workflow end-to-end, returning actionable errors instead of panicking.
+- CLI commands (`init`, `search`, `notes`, `graph`, `vault`) delegate indexing to `arrowheadd`, manage auto-start manifests, and persist config updates.
 - Documentation refreshed (`docs/api.md`, `docs/mcp_protocol.md`) and tests directory bootstrapped (`tests/integration/`).
 - Vector storage integration sits behind an optional `vector-lancedb` feature that stays disabled until semantic search work begins.
 
@@ -27,7 +27,7 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 |--------|------------------|-----------|
 | **Platform** | macOS only | macOS + Linux |
 | **Interface** | Menu bar GUI app | CLI tool |
-| **Indexing** | Real-time FSEvents monitoring | Smart on-demand (mtime-based) |
+| **Indexing** | Real-time FSEvents monitoring | Background deamon + incremental reindex (notify) |
 | **Deployment** | Sandboxed app bundle | Single binary |
 | **MCP Modes** | stdio only | stdio (local) + HTTP (remote) |
 | **Language** | Swift 5.9+ | Rust 1.85+ (2024 edition) |
@@ -134,7 +134,6 @@ arrowhead/
 │       │   ├── commands/
 │       │   │   ├── mod.rs
 │       │   │   ├── init.rs
-│       │   │   ├── index.rs
 │       │   │   ├── search.rs
 │       │   │   ├── notes.rs
 │       │   │   ├── graph.rs
@@ -692,8 +691,7 @@ OPTIONS:
 
 COMMANDS:
     init                    Initialize vault configuration
-    index                   Index vault notes
-    search                  Search notes
+    search                  Search notes (delegates to the deamon-maintained index)
     notes                   Note operations
     graph                   Graph navigation
     vault                   Vault management commands
@@ -706,23 +704,17 @@ COMMANDS:
 Creates configuration file and vault directories.
 
 **Options:**
-- `--vault <PATH>`: Path to vault root (required)
-- `--embeddings <MODEL>`: Embedding model name (default: all-MiniLM-L6-v2)
-- `--force`: Overwrite existing config
+- `--vault <PATH>`: Path to vault root (defaults to config or CWD)
+- `--embeddings <MODEL>`: Embedding preset (`fast`, `good`, `better`)
+- `--force`: Overwrite existing config or create the vault directory
+- `--no-start`: Prepare the vault but skip launching the deamon
+- `--fts-only`: Configure the deamon for FTS-only indexing (disables embeddings)
 
 **Actions:**
-- Create config file at `~/.config/arrowhead/config.toml`
-- Create `.arrowhead/` directory in vault
-- Validate vault structure
-- Delegate final setup to `arrowhead vault init` (which can launch the deamon)
-
-#### `index` - Index Vault
-
-Informational command that explains the deamon-managed indexing workflow.
-
-**Behavior:**
-- Prints guidance directing users to `arrowhead vault start` and `arrowhead vault status`
-- Remains available for backwards compatibility but performs no indexing work
+- Create/overwrite config file at `~/.config/arrowhead/config.toml`
+- Create `.arrowhead/` directories in the vault
+- Validate vault structure and honour Obsidian ignore settings
+- Delegate final setup to `arrowhead vault init` (launching the deamon unless `--no-start` was supplied)
 
 #### `search` - Search Notes
 
@@ -736,12 +728,6 @@ Search with multiple modes.
 **Common Options:**
 - `--limit <N>`: Maximum results (default: 10)
 - `--json`: Output as JSON
-- `--ids-only`: Output only note IDs
-
-**Mode-Specific Options:**
-- FTS: `--offset <N>` for pagination
-- Semantic: `--threshold <F>` for similarity threshold
-- Hybrid: `--confidence <F>` for confidence threshold
 
 #### `notes` - Note Operations
 
@@ -758,15 +744,21 @@ CRUD operations for notes.
 - `--id <ID>`: Note ID (auto-generated if not specified)
 - `--title <TITLE>`: Note title
 - `--category <CAT>`: Category
-- `--content <TEXT>`: Note content (or read from stdin)
-- `--file <PATH>`: Read content from file
-- `--metadata <JSON>`: Additional metadata as JSON
+- `--content <TEXT>`: Inline content to write
+- `--file <PATH>`: Read content from the supplied file
+- `--metadata <JSON>`: JSON metadata to merge into the note
 
 **Update Options:**
-- `--content <TEXT>`: New content
-- `--file <PATH>`: Read content from file
+- `--content <TEXT>`: Replacement content
+- `--file <PATH>`: Read replacement content from file
 - `--title <TITLE>`: New title
-- `--metadata <JSON>`: Update metadata
+- `--metadata <JSON>`: Merge metadata updates
+
+**List Options:**
+- `--ids-only`: Return only note identifiers (omit titles)
+
+**Delete Options:**
+- `--yes`: Skip the confirmation prompt
 
 #### `graph` - Graph Navigation
 
@@ -797,26 +789,13 @@ Manage the background deamon and Arrowhead working directories.
 **Structure:**
 
 ```toml
-[vault]
-path = "/path/to/vault"
-attachments_folder = "Attachments"
+vault = "/path/to/vault"
+embedding_model = "fast"
 
-[indexing]
-model = "all-MiniLM-L6-v2"
-parallel = 8
-batch_size = 32
-
-[search]
-default_limit = 10
-default_threshold = 0.7
-confidence_threshold = 0.3
-
-[mcp]
-bind = "127.0.0.1:8080"
-allowed_ips = ["127.0.0.1"]
-
-[logging]
-level = "info"
+[deamon]
+socket_path = "/custom/control.sock"
+status_path = "/custom/status.json"
+auto_start_enabled = true
 ```
 
 ---
@@ -885,7 +864,7 @@ level = "info"
 - Basic indexing without embeddings
 - CLI framework with `clap`
 - Configuration management
-- Commands: `init`, `index`, `notes read/list`
+- Commands: `init`, `notes read/list`
 
 ### Phase 2: Search & Embeddings (Weeks 3-4)
 
@@ -898,6 +877,7 @@ level = "info"
 - Semantic search with cosine similarity
 - Hybrid search implementation
 - Smart indexing with mtime checks
+- Background deamon scaffolding (initial spawn, status file, control socket)
 - Commands: `search fts/semantic/hybrid`
 
 ### Phase 3: Graph Navigation (Week 5)
@@ -1080,7 +1060,7 @@ level = "info"
 This specification provides a blueprint for rewriting Synapse from Swift to Rust as **Arrowhead**:
 
 ✅ **Cross-platform CLI** (macOS + Linux)
-✅ **Smart on-demand indexing** (mtime-based)
+✅ **Daemon-maintained incremental indexing** (notify + mtime-driven)
 ✅ **Dedicated vector storage** (LanceDB via optional feature)
 ✅ **Full search capabilities** (FTS, semantic, hybrid)
 ✅ **WikiLinks graph navigation**
