@@ -6,29 +6,50 @@ current design decisions and open items for the Rust rewrite.
 
 ## Transport Modes
 
-1. **stdio** — `arrowhead --mcp` spins up a JSON-RPC 2.0 loop over
-   stdin/stdout, mirroring the behaviour of the original Synapse app.
-2. **HTTP** — `arrowhead --mcp-server --bind <ADDR> --token <TOKEN>` exposes a
-   REST-like endpoint at `/rpc` that accepts JSON-RPC requests. Authentication
-   is performed via a bearer token header and optional IP allow lists.
+### stdio
 
-Both transports utilise the shared request handlers defined in
+`arrowhead --mcp` starts a long-lived process that speaks newline-delimited
+JSON-RPC 2.0 over stdin/stdout. Each frame must be a single-line JSON object or
+batch; responses are emitted one per line. The server enforces a bounded
+request queue (defaults to 64 pending messages), per-request worker limits, and
+returns a `RateLimited` JSON-RPC error when the queue is saturated. Runtime
+statistics are exposed via `StdioServer::metrics()` and logged when the server
+terminates.
+
+### HTTP (planned)
+
+`--mcp-server` will expose an HTTP endpoint backed by the same handler surface
+in a future phase. Authentication and multi-transport negotiation remain in the
+design stage.
+
+Both transports reuse the shared request handlers defined in
 `crates/arrowhead-mcp`.
 
 ## Tool Surface
 
-The initial tool suite is organised into the following categories:
+The stdio transport now exposes a complete Phase‑4 tool surface:
 
-- **Search** — `search_fts`, `search_similarity`, `search_hybrid`
-- **Notes** — `read_note`, `list_notes`, `create_note`, `update_note`, `delete_note`
-- **Graph** — `get_note_graph`, `get_backlinks`, `get_forward_links`,
-  `find_orphan_notes`, `find_unresolved_links`
-- **Discovery** — `get_related_notes`, `get_vault_stats`,
-  `get_vault_conventions`
-- **Protocol** — `initialize`, `tools/list`
+| Category | Methods | Notes |
+| --- | --- | --- |
+| Graph | `mcp.graph.get_context`, `mcp.graph.get_backlinks`, `mcp.graph.get_forward_links`, `mcp.graph.find_orphans`, `mcp.graph.find_unresolved` | Context methods require the target note to be indexed. Orphan/unresolved reports operate on the cached graph index without querying the daemon. |
+| Search | `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid` | Semantic and hybrid searches require the optional `vector-lancedb` feature. When the feature is disabled the handlers return `ToolDisabled`. |
+| Notes | `mcp.notes.list`, `mcp.notes.read`, `mcp.notes.metadata`, `mcp.notes.create`, `mcp.notes.update`, `mcp.notes.delete` | Create accepts either `noteId` or `title`. Delete requires `confirm: true`. Metadata updates treat `null` values as removals. |
+| Discovery | `mcp.discovery.get_related_notes`, `mcp.discovery.get_vault_stats`, `mcp.discovery.get_vault_conventions` | Related notes fall back to graph neighbourhood heuristics when semantic vectors are unavailable. Vault stats run on blocking workers to avoid stalling the async runtime. Conventions surface naming patterns, metadata usage, Obsidian settings, and the optional `.arrowhead/STYLE_GUIDE.md`. |
+| Vault | `mcp.vault.status` | Delegates to the Arrowhead daemon control socket and mirrors CLI error handling when the daemon is offline. |
+| Protocol | `mcp.protocol.initialize`, `mcp.protocol.tools/list` | `initialize` advertises server capabilities and (when available) a cached daemon status snapshot. `tools/list` enumerates the full tool catalogue for client introspection. |
 
-All tool schemas follow JSON Schema definitions to ensure consistent
-validation.
+Example request/response flow:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"mcp.notes.create","params":{"title":"Projects/Test Plan","content":"# Test Plan"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"noteId":"Projects/Test Plan","title":"Projects/Test Plan","metadata":{"title":"Projects/Test Plan"},"content":"# Test Plan","relativePath":"Projects/Test Plan.md","fileModifiedAt":"2024-01-18T08:53:00Z"}}
+```
+
+Error responses follow JSON-RPC conventions with Arrowhead-specific codes
+(`ToolDisabled`, `ServiceUnavailable`, etc.) captured in `crate::protocol::ErrorCode`.
 
 ## Authentication
 
@@ -38,7 +59,6 @@ config file. Logging must avoid printing tokens to stdout/stderr.
 
 ## Pending Work
 
-- Finalise request/response schemas for each tool.
-- Implement transport handlers inside `crates/arrowhead-mcp`.
-- Add integration tests under `tests/integration/mcp_tests.rs` to validate the
-  stdio and HTTP flows end-to-end.
+- HTTP transport (`--mcp-server`) with authentication and multiplexing.
+- Extended tooling metadata (JSON Schemas, richer examples) surfaced via `tools/list`.
+- Broader integration coverage once the HTTP transport lands.

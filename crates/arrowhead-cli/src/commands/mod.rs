@@ -8,6 +8,7 @@ use crate::config::AppConfig;
 
 pub mod graph;
 pub mod init;
+pub mod mcp;
 pub mod notes;
 pub mod search;
 pub mod vault;

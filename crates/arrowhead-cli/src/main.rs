@@ -5,14 +5,14 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
 mod autostart;
 mod commands;
 mod config;
 mod logging;
 
-use commands::{CommandContext, graph, init, notes, search, vault};
+use commands::{CommandContext, graph, init, mcp, notes, search, vault};
 use config::AppConfig;
 
 /// Arrowhead command-line interface options.
@@ -29,9 +29,12 @@ struct Cli {
     /// Increase output verbosity. Use multiple times for more detail.
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
+    /// Start the MCP stdio server instead of running a CLI subcommand.
+    #[arg(long, conflicts_with = "command")]
+    mcp: bool,
     /// Command to execute.
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 /// Available top-level CLI commands.
@@ -66,7 +69,21 @@ async fn main() -> Result<()> {
 
     let mut ctx = CommandContext::new(config, cli.config.clone(), cli.verbose);
 
-    match cli.command {
+    if cli.mcp {
+        mcp::run(&mut ctx).await?;
+        return Ok(());
+    }
+
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            Cli::command().print_help()?;
+            println!();
+            return Ok(());
+        }
+    };
+
+    match command {
         Commands::Init(command) => {
             init::run(&mut ctx, &command).await?;
             ctx.persist()?;

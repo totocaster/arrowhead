@@ -11,14 +11,18 @@ homepage.workspace = true
 [dependencies]
 # Core library
 arrowhead-core = { path = "../arrowhead-core" }
+arrowhead-deamon = { path = "../arrowhead-deamon" }
 
 # Error handling
 anyhow.workspace = true
 thiserror.workspace = true
 
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
+regex.workspace = true
 
 # Async runtime
 tokio.workspace = true
@@ -32,5 +36,10 @@ tower-http.workspace = true
 # Logging
 tracing.workspace = true
 
+[features]
+default = []
+vector-lancedb = ["arrowhead-core/vector-lancedb"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3.8"
