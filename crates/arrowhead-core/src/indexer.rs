@@ -27,12 +27,6 @@ use crate::{
 };
 
 #[cfg(feature = "vector-lancedb")]
-use crate::NoteRecord;
-
-#[cfg(feature = "vector-lancedb")]
-use crate::embeddings::EmbeddingRecord;
-
-#[cfg(feature = "vector-lancedb")]
 const EMBEDDING_FLUSH_BATCH: usize = 64;
 
 type WriteSender = mpsc::Sender<WriteJob>;

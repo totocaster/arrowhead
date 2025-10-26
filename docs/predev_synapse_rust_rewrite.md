@@ -223,9 +223,9 @@ arrowhead/
    - Store resolved/unresolved links in graph table
 
 **Optimization Features:**
-- Parallel indexing with configurable worker count
+- Worker pool parallelises I/O, extraction, and embedding while a dedicated writer task serialises SQLite and LanceDB updates through a bounded queue (prevents connection exhaustion).
 - Batch embedding generation for efficiency
-- Transaction batching (commit every N notes)
+- Bounded channel back-pressure keeps memory predictable and surfaces stalled writers.
 - Progress callback support
 
 ### 4. Search
@@ -454,8 +454,8 @@ arrowhead/
 - Track statistics: total, indexed, skipped, errors
 
 **Optimization:**
-- Parallel processing with configurable worker pool
-- Batch commits to reduce transaction overhead
+- Parallel processing with configurable worker pool feeding a bounded write queue
+- Dedicated writer task serialises SQLite upserts and LanceDB flushes to avoid pool starvation
 - Async embedding generation with semaphore limiting
 
 **Progress Reporting:**

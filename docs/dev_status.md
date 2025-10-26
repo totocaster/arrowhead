@@ -5,7 +5,7 @@
 - **Toolchain:** Rust 1.86 (2024 edition) pinned via `rust-toolchain.toml`.
 - **Workspace health:** `cargo fmt`, `cargo check`, and `cargo test` all pass.
 - **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
-- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, skipping unchanged notes automatically and respecting Obsidian ignore filters.
+- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, and a new bounded write queue funnels all SQLite/LanceDB persistence through a single writer so unchanged notes skip cheaply while updated notes commit without exhausting the connection pool.
 - **Vault settings:** `.obsidian/app.json` is parsed for attachments and user ignore filters so templates stay out of the index.
 - **CLI:** `init` now performs the full interactive vault setup (prompting for auto-start, launching the deamon unless `--no-start` is passed) and returns immediately once `arrowheadd` is alive—the initial crawl continues in the background and progress is surfaced via `arrowhead vault status`. A new `--fts-only` switch lets users opt out of semantic indexing up front. `index` remains informational, and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/cli.log` with multi-day retention. Vault subcommands (`vault init/start/status/stop/cleanup`) manage the background deamon, cache socket/status metadata in config, render runtime health (JSON or human-readable), and provide teardown. Search commands rely on the deamon status instead of running local indexing passes.
 - **Auto-start:** `vault init` now offers to register per-user auto-start units (launchd on macOS, `systemd --user` on Linux), persists manifest metadata under `.arrowhead/deamon/autostart/`, surfaces enablement in `vault status`, and ensures `vault cleanup` removes the units.
@@ -32,18 +32,19 @@
 
 ## Next Focus Areas
 
-1. **Search Hardening (Phase 2 follow-up)**
+1. **Graph Enhancements (Phase 3 focus)**
+   - Surface directional link summaries (forward/back/backlink counts) via CLI + MCP with clear reasons.
+   - Add sync guarantees between note edits and graph edges, including queue depth/back-pressure metrics for troubleshooting.
+   - Profile large vaults to tune channel sizing and surface alerts when the writer falls behind.
+
+2. **Search Hardening (Phase 2 follow-up)**
    - Tune hybrid weighting/thresholds against real vault corpora and add regression fixtures covering semantic-only and mixed queries.
    - Improve semantic previews (smarter snippet generation) and document evaluation tooling.
    - Extend integration tests to exercise LanceDB-backed searches (requires `protoc` in CI agents).
 
-2. **Model Management & UX**
+3. **Model Management & UX**
    - Finalise licensing guidance for the shipped presets and surface model selection in docs/CLI help.
    - Allow opt-in cache directory overrides and consider richer CLI presentation for deamon-reported download progress.
-
-3. **Graph Enhancements**
-   - Layer graph metrics (degree counts, orphan summaries) into CLI/MCP responses.
-   - Document link reason taxonomy for MCP consumers and explore caching strategies for large vaults.
 
 4. **MCP Surface (Phase 4-5)**
    - Finalise JSON-RPC types and tool schemas.
@@ -56,7 +57,7 @@
 - **Schema migrations:** Continue relying on drop-and-reindex for incompatible schemas; document any future scenarios that require persistent migrations.
 - **Concurrent access:** Clarify whether multi-process vault access needs to be supported in v1.
 - **Protobuf tooling:** `vector-lancedb` builds need `protoc` on developer and CI machines; decide whether to vendor binaries or document the prerequisite.
-- **Indexing diagnostics:** Some vaults still report failed notes without actionable errors—improve logging around extraction failures and include note identifiers in the status output.
+- **Indexing diagnostics:** Instrument writer queue depth / latency so operators can spot back-pressure and correlate with per-note failures.
 
 ## Tracking
 
