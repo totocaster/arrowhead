@@ -7,15 +7,18 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
-use tokio::{sync::Semaphore, task};
+use tokio::{
+    sync::{Semaphore, mpsc, oneshot},
+    task,
+};
 use tracing::{debug, error, info};
 
 use crate::{
-    IndexingStats, Vault,
-    embeddings::EmbeddingPipeline,
+    IndexingStats, NoteRecord, Vault,
+    embeddings::{EmbeddingPipeline, EmbeddingRecord},
     graph::{LinkReason, LinkResolutionRecord, normalise_link_lookup},
     metadata::{MetadataExtraction, MetadataExtractor, WikiLink},
     sqlite::{IndexDatabase, LinkResolutionMaps, NoteIndexState},
@@ -31,6 +34,41 @@ use crate::embeddings::EmbeddingRecord;
 
 #[cfg(feature = "vector-lancedb")]
 const EMBEDDING_FLUSH_BATCH: usize = 64;
+
+type WriteSender = mpsc::Sender<WriteJob>;
+
+#[derive(Debug)]
+struct PreparedNote {
+    note: NoteRecord,
+    extraction: MetadataExtraction,
+    resolved_links: Vec<LinkResolutionRecord>,
+    indexed_at: DateTime<Utc>,
+    embedding: Option<EmbeddingRecord>,
+}
+
+#[derive(Debug)]
+enum WriteOperation {
+    Upsert(PreparedNote),
+    Remove { note_id: String },
+}
+
+#[derive(Debug)]
+struct WriteJob {
+    op: WriteOperation,
+    ack: oneshot::Sender<Result<WriteAck>>,
+}
+
+#[derive(Debug)]
+enum WriteAck {
+    Upsert,
+    Remove { existed: bool },
+}
+
+#[derive(Debug)]
+enum WriterResult {
+    Upsert { embedding: Option<EmbeddingRecord> },
+    Remove { existed: bool },
+}
 
 /// Configuration options shared by the indexing pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +142,12 @@ impl Indexer {
         ));
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
+        let (write_tx, write_rx) = mpsc::channel(self.config.parallelism.max(1) * 2);
+        let writer_handle = tokio::spawn(run_writer(
+            Arc::clone(&self.database),
+            self.embeddings.clone(),
+            write_rx,
+        ));
 
         let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
         let mut tasks = FuturesUnordered::new();
@@ -114,6 +158,7 @@ impl Indexer {
             let semaphore = Arc::clone(&semaphore);
             let states = Arc::clone(&state_table);
             let entry_id = entry.id.clone();
+            let write_sender = write_tx.clone();
 
             debug!(note_id = %entry.id, "queueing note for indexing");
             tasks.push(tokio::spawn(async move {
@@ -121,7 +166,9 @@ impl Indexer {
                     .acquire_owned()
                     .await
                     .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
-                let result = indexer.run_single(entry, resolution, states).await;
+                let result = indexer
+                    .run_single(entry, resolution, states, write_sender)
+                    .await;
                 Ok::<_, anyhow::Error>((entry_id, result))
             }));
         }
@@ -131,36 +178,11 @@ impl Indexer {
             ..IndexingStats::default()
         };
 
-        #[cfg(feature = "vector-lancedb")]
-        let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
-        #[cfg(feature = "vector-lancedb")]
-        let embeddings_pipeline = self.embeddings.clone();
-
         let mut processed = 0u64;
         while let Some(result) = tasks.next().await {
             let (note_id, outcome) = result??;
             match outcome {
-                Ok(NoteProcessing::Indexed(embedding)) => {
-                    #[cfg(feature = "vector-lancedb")]
-                    {
-                        if let Some(record) = embedding {
-                            if let Some(pipeline) = embeddings_pipeline.as_ref() {
-                                embedding_buffer.push(record);
-                                if embedding_buffer.len() >= EMBEDDING_FLUSH_BATCH {
-                                    pipeline
-                                        .store()
-                                        .upsert_embeddings(&embedding_buffer)
-                                        .await
-                                        .with_context(|| "failed to persist note embeddings")?;
-                                    embedding_buffer.clear();
-                                }
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "vector-lancedb"))]
-                    {
-                        let _ = embedding;
-                    }
+                Ok(NoteProcessing::Indexed) => {
                     stats.indexed += 1;
                     processed += 1;
                     observer(IndexProgressEvent {
@@ -206,16 +228,10 @@ impl Indexer {
             }
         }
 
-        #[cfg(feature = "vector-lancedb")]
-        if let Some(pipeline) = embeddings_pipeline.as_ref() {
-            if !embedding_buffer.is_empty() {
-                pipeline
-                    .store()
-                    .upsert_embeddings(&embedding_buffer)
-                    .await
-                    .with_context(|| "failed to persist note embeddings")?;
-            }
-        }
+        drop(write_tx);
+        writer_handle
+            .await
+            .map_err(|err| anyhow!("writer task aborted: {err}"))??;
 
         let pruned = self.prune_missing_notes(note_set.as_ref()).await?;
         if !pruned.is_empty() {
@@ -262,25 +278,22 @@ impl Indexer {
             Arc::clone(&note_set),
             resolution_maps,
         ));
-        let outcome = self.run_single(entry, resolution, state_table).await?;
+        let (write_tx, write_rx) = mpsc::channel(2);
+        let writer_handle = tokio::spawn(run_writer(
+            Arc::clone(&self.database),
+            self.embeddings.clone(),
+            write_rx,
+        ));
+        let outcome = self
+            .run_single(entry, resolution, state_table, write_tx.clone())
+            .await?;
+        drop(write_tx);
+        writer_handle
+            .await
+            .map_err(|err| anyhow!("writer task aborted: {err}"))??;
 
         match outcome {
-            NoteProcessing::Indexed(embedding) => {
-                #[cfg(feature = "vector-lancedb")]
-                if let Some(record) = embedding {
-                    if let Some(pipeline) = self.embeddings.clone() {
-                        pipeline
-                            .store()
-                            .upsert_embeddings(&[record])
-                            .await
-                            .with_context(|| "failed to persist note embeddings")?;
-                    }
-                }
-                #[cfg(not(feature = "vector-lancedb"))]
-                {
-                    let _ = embedding;
-                }
-            }
+            NoteProcessing::Indexed => {}
             NoteProcessing::Skipped => {}
             NoteProcessing::Removed => {
                 debug!(
@@ -330,6 +343,12 @@ impl Indexer {
         let resolution = Arc::new(ResolutionContext::new(Arc::clone(&known), resolution_maps));
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
+        let (write_tx, write_rx) = mpsc::channel(self.config.parallelism.max(1) * 2);
+        let writer_handle = tokio::spawn(run_writer(
+            Arc::clone(&self.database),
+            self.embeddings.clone(),
+            write_rx,
+        ));
         let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
         let mut tasks = FuturesUnordered::new();
 
@@ -341,6 +360,7 @@ impl Indexer {
             let states_clone = Arc::clone(&state_table);
             let semaphore_clone = Arc::clone(&semaphore);
             let task_dispatch = dispatch.clone();
+            let write_sender = write_tx.clone();
             tasks.push(tokio::spawn(async move {
                 let fut = async move {
                     let _permit = semaphore_clone
@@ -351,10 +371,28 @@ impl Indexer {
                     let outcome = match indexer.vault.inventory_entry_for_path(&absolute_path) {
                         Ok(Some(entry)) => {
                             indexer
-                                .run_single(entry, resolution_clone, states_clone)
+                                .run_single(
+                                    entry,
+                                    resolution_clone,
+                                    states_clone,
+                                    write_sender.clone(),
+                                )
                                 .await
                         }
-                        Ok(None) => indexer.handle_missing_note(note_id).await,
+                        Ok(None) => {
+                            let dispatcher =
+                                tracing::dispatcher::get_default(|current| current.clone());
+                            let indexer_clone = indexer.clone();
+                            let write_clone = write_sender.clone();
+                            tokio::task::spawn_blocking(move || {
+                                tracing::dispatcher::with_default(&dispatcher, || {
+                                    indexer_clone
+                                        .handle_missing_note(note_id.clone(), write_clone)
+                                })
+                            })
+                            .await
+                            .map_err(|err| anyhow!("indexing task panicked: {err}"))?
+                        }
                         Err(err) => Err(err),
                     };
                     Ok::<_, anyhow::Error>((key, outcome))
@@ -368,35 +406,10 @@ impl Indexer {
             ..IndexingStats::default()
         };
 
-        #[cfg(feature = "vector-lancedb")]
-        let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
-        #[cfg(feature = "vector-lancedb")]
-        let embeddings_pipeline = self.embeddings.clone();
-
         while let Some(result) = tasks.next().await {
             let (note_id, outcome) = result??;
             match outcome {
-                Ok(NoteProcessing::Indexed(embedding)) => {
-                    #[cfg(feature = "vector-lancedb")]
-                    {
-                        if let Some(record) = embedding {
-                            if let Some(pipeline) = embeddings_pipeline.as_ref() {
-                                embedding_buffer.push(record);
-                                if embedding_buffer.len() >= EMBEDDING_FLUSH_BATCH {
-                                    pipeline
-                                        .store()
-                                        .upsert_embeddings(&embedding_buffer)
-                                        .await
-                                        .with_context(|| "failed to persist note embeddings")?;
-                                    embedding_buffer.clear();
-                                }
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "vector-lancedb"))]
-                    {
-                        let _ = embedding;
-                    }
+                Ok(NoteProcessing::Indexed) => {
                     stats.indexed += 1;
                     info!(
                         note_id = note_id.as_str(),
@@ -428,16 +441,10 @@ impl Indexer {
             }
         }
 
-        #[cfg(feature = "vector-lancedb")]
-        if let Some(pipeline) = embeddings_pipeline.as_ref() {
-            if !embedding_buffer.is_empty() {
-                pipeline
-                    .store()
-                    .upsert_embeddings(&embedding_buffer)
-                    .await
-                    .with_context(|| "failed to persist note embeddings")?;
-            }
-        }
+        drop(write_tx);
+        writer_handle
+            .await
+            .map_err(|err| anyhow!("writer task aborted: {err}"))??;
 
         Ok(stats)
     }
@@ -469,11 +476,22 @@ impl Indexer {
         Ok(existed)
     }
 
-    async fn handle_missing_note(&self, note_id: String) -> Result<NoteProcessing> {
-        if self.remove_note(&note_id).await? {
-            Ok(NoteProcessing::Removed)
-        } else {
-            Ok(NoteProcessing::Skipped)
+    fn handle_missing_note(
+        &self,
+        note_id: String,
+        write_tx: WriteSender,
+    ) -> Result<NoteProcessing> {
+        match submit_write(&write_tx, WriteOperation::Remove { note_id })? {
+            WriteAck::Remove { existed } => {
+                if existed {
+                    Ok(NoteProcessing::Removed)
+                } else {
+                    Ok(NoteProcessing::Skipped)
+                }
+            }
+            WriteAck::Upsert => {
+                unreachable!("received upsert acknowledgement for remove job")
+            }
         }
     }
 
@@ -514,12 +532,13 @@ impl Indexer {
         entry: NoteInventoryEntry,
         resolution: Arc<ResolutionContext>,
         index_states: Arc<HashMap<String, NoteIndexState>>,
+        write_tx: WriteSender,
     ) -> Result<NoteProcessing> {
         let indexer = self.clone();
         let dispatch = tracing::dispatcher::get_default(|current| current.clone());
         task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                indexer.process_note(&entry, &resolution, &index_states)
+                indexer.process_note(&entry, &resolution, &index_states, &write_tx)
             })
         })
         .await
@@ -531,6 +550,7 @@ impl Indexer {
         entry: &NoteInventoryEntry,
         resolution: &ResolutionContext,
         index_states: &HashMap<String, NoteIndexState>,
+        write_tx: &WriteSender,
     ) -> Result<NoteProcessing> {
         let note = self
             .vault
@@ -570,10 +590,9 @@ impl Indexer {
             "resolved wikilinks for note"
         );
         let indexed_at = Utc::now();
-        self.database
-            .upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
-
-        let embedding_update: Option<EmbeddingUpdate> = if let Some(pipeline) = &self.embeddings {
+        let metadata_count = extraction.metadata.len();
+        let link_count = resolved_links.len();
+        let embedding = if let Some(pipeline) = &self.embeddings {
             #[cfg(feature = "vector-lancedb")]
             {
                 if EmbeddingPipeline::is_supported() {
@@ -602,13 +621,29 @@ impl Indexer {
         } else {
             None
         };
-        info!(
-            note_id = %entry.id,
-            metadata_fields = extraction.metadata.len(),
-            link_count = resolved_links.len(),
-            "indexed note"
-        );
-        Ok(NoteProcessing::Indexed(embedding_update))
+
+        let prepared = PreparedNote {
+            note,
+            extraction,
+            resolved_links,
+            indexed_at,
+            embedding,
+        };
+
+        match submit_write(write_tx, WriteOperation::Upsert(prepared))? {
+            WriteAck::Upsert => {
+                info!(
+                    note_id = %entry.id,
+                    metadata_fields = metadata_count,
+                    link_count,
+                    "indexed note"
+                );
+                Ok(NoteProcessing::Indexed)
+            }
+            WriteAck::Remove { .. } => {
+                unreachable!("received remove acknowledgement for upsert job")
+            }
+        }
     }
 }
 
@@ -625,15 +660,9 @@ pub struct IndexProgressEvent {
     pub indexed: bool,
 }
 
-#[cfg(feature = "vector-lancedb")]
-type EmbeddingUpdate = EmbeddingRecord;
-
-#[cfg(not(feature = "vector-lancedb"))]
-type EmbeddingUpdate = ();
-
 #[derive(Debug)]
 enum NoteProcessing {
-    Indexed(Option<EmbeddingUpdate>),
+    Indexed,
     Skipped,
     Removed,
 }
@@ -691,6 +720,128 @@ impl ResolutionContext {
             _ => None,
         }
     }
+}
+
+fn submit_write(write_tx: &WriteSender, op: WriteOperation) -> Result<WriteAck> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    write_tx
+        .blocking_send(WriteJob { op, ack: ack_tx })
+        .map_err(|err| anyhow!("failed to dispatch write job: {err}"))?;
+    let ack = ack_rx
+        .blocking_recv()
+        .map_err(|err| anyhow!("writer task dropped response: {err}"))??;
+    Ok(ack)
+}
+
+async fn run_writer(
+    database: Arc<IndexDatabase>,
+    embeddings: Option<Arc<EmbeddingPipeline>>,
+    mut rx: mpsc::Receiver<WriteJob>,
+) -> Result<()> {
+    let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
+
+    while let Some(WriteJob { op, ack }) = rx.recv().await {
+        let db = Arc::clone(&database);
+        let blocking_result = tokio::task::spawn_blocking(move || -> Result<WriterResult> {
+            match op {
+                WriteOperation::Upsert(prepared) => {
+                    let PreparedNote {
+                        note,
+                        extraction,
+                        resolved_links,
+                        indexed_at,
+                        embedding,
+                    } = prepared;
+                    db.upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
+                    Ok(WriterResult::Upsert { embedding })
+                }
+                WriteOperation::Remove { note_id } => {
+                    let existed = db.remove_note(&note_id)?;
+                    Ok(WriterResult::Remove { existed })
+                }
+            }
+        })
+        .await
+        .map_err(|err| anyhow!("writer worker panicked: {err}"))?;
+
+        match blocking_result {
+            Ok(WriterResult::Upsert { embedding }) => {
+                if let Err(err) =
+                    handle_embedding(&embeddings, &mut embedding_buffer, embedding).await
+                {
+                    let _ = ack.send(Err(err));
+                } else {
+                    let _ = ack.send(Ok(WriteAck::Upsert));
+                }
+            }
+            Ok(WriterResult::Remove { existed }) => {
+                let _ = ack.send(Ok(WriteAck::Remove { existed }));
+            }
+            Err(err) => {
+                let _ = ack.send(Err(err));
+            }
+        }
+    }
+
+    flush_embedding_buffer(&embeddings, &mut embedding_buffer).await?;
+    Ok(())
+}
+
+#[cfg(feature = "vector-lancedb")]
+async fn handle_embedding(
+    pipeline: &Option<Arc<EmbeddingPipeline>>,
+    buffer: &mut Vec<EmbeddingRecord>,
+    embedding: Option<EmbeddingRecord>,
+) -> Result<()> {
+    if let (Some(pipeline), Some(record)) = (pipeline.as_ref(), embedding) {
+        buffer.push(record);
+        if buffer.len() >= EMBEDDING_FLUSH_BATCH {
+            pipeline
+                .store()
+                .upsert_embeddings(buffer)
+                .await
+                .with_context(|| "failed to persist note embeddings")?;
+            buffer.clear();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vector-lancedb"))]
+#[allow(clippy::ptr_arg)]
+async fn handle_embedding(
+    _pipeline: &Option<Arc<EmbeddingPipeline>>,
+    _buffer: &mut Vec<EmbeddingRecord>,
+    _embedding: Option<EmbeddingRecord>,
+) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "vector-lancedb")]
+async fn flush_embedding_buffer(
+    pipeline: &Option<Arc<EmbeddingPipeline>>,
+    buffer: &mut Vec<EmbeddingRecord>,
+) -> Result<()> {
+    if let Some(pipeline) = pipeline.as_ref() {
+        if !buffer.is_empty() {
+            pipeline
+                .store()
+                .upsert_embeddings(buffer)
+                .await
+                .with_context(|| "failed to persist note embeddings")?;
+            buffer.clear();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vector-lancedb"))]
+#[allow(clippy::ptr_arg)]
+async fn flush_embedding_buffer(
+    _pipeline: &Option<Arc<EmbeddingPipeline>>,
+    _buffer: &mut Vec<EmbeddingRecord>,
+) -> Result<()> {
+    Ok(())
 }
 
 fn extract_aliases(extraction: &MetadataExtraction) -> Vec<String> {

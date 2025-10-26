@@ -85,7 +85,8 @@ impl IndexDatabase {
 
         let manager = SqliteConnectionManager::file(&path);
         let pool = Pool::builder()
-            .max_size(8)
+            .max_size(32)
+            .connection_timeout(Duration::from_secs(120))
             .build(manager)
             .context("failed to build SQLite connection pool")?;
 
