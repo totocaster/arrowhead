@@ -386,8 +386,7 @@ impl Indexer {
                             let write_clone = write_sender.clone();
                             tokio::task::spawn_blocking(move || {
                                 tracing::dispatcher::with_default(&dispatcher, || {
-                                    indexer_clone
-                                        .handle_missing_note(note_id.clone(), write_clone)
+                                    indexer_clone.handle_missing_note(note_id.clone(), write_clone)
                                 })
                             })
                             .await
