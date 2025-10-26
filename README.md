@@ -1,3 +1,5 @@
+![Arrowhead banner](docs/assets/Arrowhead_GitHub_Logo.png)
+
 # Arrowhead
 
 **Obsidian vault indexing and search with MCP integration**
