@@ -10,6 +10,8 @@ developed; this file serves as the agreed plan of record.
 - `arrowhead search` — execute FTS/semantic/hybrid searches.
 - `arrowhead notes` — CRUD operations for working with notes.
 - `arrowhead graph` — inspect WikiLink graph relationships.
+  - Default invocation (`arrowhead graph <NOTE_ID>`) returns a combined context view listing outbound links, backlinks, and unresolved edges in one response.
+  - All graph subcommands accept `--json` to emit machine-readable payloads mirroring the CLI output.
 - `arrowhead vault` — utility commands such as stats and integrity checks.
 
 Each command is documented in greater detail within the command-specific Rust

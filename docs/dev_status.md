@@ -14,7 +14,7 @@
 - **CI:** GitHub Actions workflow (`CI`) runs on push/PR/workflow_dispatch, enforcing fmt, clippy, check, and test across the workspace.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`) and updated to include the deamon crate/runtime responsibilities; feature development guide established; integration fixtures ready.
 - **Vectors:** Semantic pipeline (fastembed + LanceDB) integrates with indexing, the deamon runtime, and CLI search when the optional `vector-lancedb` feature is enabled; defaults to FTS-only when the feature is off or `--fts-only` is chosen. Vector builds skip per-command file logging by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1` to opt in) while we stabilise LanceDB tracing behaviour.
-- **Graph:** WikiLink extraction now persists raw/display/heading metadata plus a resolution reason; `arrowhead graph` surfaces backlinks, forward links, orphans, unresolved edges, and combined context views with human-readable explanations.
+- **Graph:** WikiLink extraction now persists raw/display/heading metadata plus a resolution reason; `arrowhead graph` defaults to a combined context view showing inbound/outbound edges and supports `--json` for structured responses alongside backlinks, forward links, orphan, and unresolved reports.
 
 ## Completed Work (Phase 0-1)
 
@@ -28,7 +28,7 @@
 - Indexer progress instrumentation landed (batching hooks, observer events, CLI progress bar) so long-running reindexes surface user feedback out of the box.
 - FTS search pipeline (Synapse-style query rewriting, porter tokenization, metadata/value dual-token indexing, revamped ranking/snippets) with comprehensive unit and integration coverage, including automatic index refresh when running searches.
 - Semantic + hybrid search: embedding presets (`fast`/`good`/`better`), automatic Hugging Face downloads scoped to the vault, LanceDB persistence/refresh from the indexer, and CLI entry points for `search semantic` / `search hybrid` with cosine + weighted scoring.
-- Graph foundation: link extraction now records target/display/heading data with resolution reasons; indexer updates `note_links` during daemon runs and the CLI `graph` subcommands render backlinks, forward links, context, orphans, and unresolved edges.
+- Graph foundation: link extraction now records target/display/heading data with resolution reasons; indexer updates `note_links` during daemon runs and the CLI `graph` command now defaults to the full context view (with optional `--json` output) while still exposing dedicated backlinks, forward links, orphan, and unresolved subcommands.
 
 ## Next Focus Areas
 

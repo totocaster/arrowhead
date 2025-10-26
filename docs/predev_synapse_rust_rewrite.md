@@ -765,12 +765,18 @@ CRUD operations for notes.
 
 Navigate WikiLinks relationships.
 
+**Default Invocation:**
+- `graph <ID>`: Show complete graph context (forward links, backlinks, unresolved)
+
 **Subcommands:**
 - `backlinks <ID>`: Show notes linking to this note
 - `forward-links <ID>`: Show notes this note links to
 - `orphans`: Find orphaned notes
 - `unresolved`: Find broken WikiLinks
 - `context <ID>`: Show complete graph context
+
+**Common Options:**
+- `--json`: Output as JSON
 
 #### `vault` - Vault Management
 
@@ -892,7 +898,7 @@ auto_start_enabled = true
 - Backlinks/forward links queries
 - Orphan detection
 - Unresolved link tracking
-- Commands: `graph backlinks/forward-links/orphans/unresolved/context`
+- Commands: `graph <ID>` (context), `graph backlinks/forward-links/orphans/unresolved/context`
   emit human-readable reasons (direct/title/alias/unresolved) for each relationship
 
 ### Phase 4: MCP stdio (Week 6)
