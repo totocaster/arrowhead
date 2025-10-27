@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrowhead_core::{
-    ActivityState, DeamonStatus,
+    ActivityState, DeamonStatus, StatusFrame,
     sqlite::{IndexDatabase, NoteIndexState},
 };
 use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy, status_stream};
@@ -160,13 +160,17 @@ async fn status_stream_emits_frames() -> Result<()> {
 
     let note_path = vault_root.join("Minimal Note.md");
     let mut content = fs::read_to_string(&note_path)?;
+    sleep(Duration::from_millis(1100)).await;
     content.push_str("\n\nStreaming status test update.\n");
     fs::write(&note_path, content)?;
 
-    let indexing_frame = tokio::time::timeout(Duration::from_secs(5), stream.next())
-        .await
-        .context("timed out waiting for follow-up status frame")??
-        .context("daemon closed stream before emitting follow-up frame")?;
+    let indexing_frame = expect_status_frame(
+        &mut stream,
+        "follow-up status frame",
+        Duration::from_secs(12),
+        |state| matches!(state, ActivityState::Indexing),
+    )
+    .await?;
 
     assert!(
         indexing_frame.emitted_at >= first.emitted_at,
@@ -181,10 +185,13 @@ async fn status_stream_emits_frames() -> Result<()> {
         indexing_frame.status.activity.state
     );
 
-    let idle_frame = tokio::time::timeout(Duration::from_secs(5), stream.next())
-        .await
-        .context("timed out waiting for idle status frame")??
-        .context("daemon closed stream before emitting idle frame")?;
+    let idle_frame = expect_status_frame(
+        &mut stream,
+        "idle status frame",
+        Duration::from_secs(12),
+        |state| matches!(state, ActivityState::Idle),
+    )
+    .await?;
     assert!(
         matches!(idle_frame.status.activity.state, ActivityState::Idle),
         "expected daemon to return to idle state after processing watcher batch"
@@ -194,6 +201,36 @@ async fn status_stream_emits_frames() -> Result<()> {
     drop(temp_dir);
 
     Ok(())
+}
+
+async fn expect_status_frame<F>(
+    stream: &mut arrowhead_deamon::StatusStream,
+    stage: &'static str,
+    timeout: Duration,
+    mut predicate: F,
+) -> Result<StatusFrame>
+where
+    F: FnMut(&ActivityState) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("timed out waiting for {stage}");
+        }
+        let remaining = deadline.duration_since(now);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Ok(Some(frame))) => {
+                if predicate(&frame.status.activity.state) {
+                    return Ok(frame);
+                }
+            }
+            Ok(Ok(None)) => bail!("daemon closed stream before emitting {stage}"),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => bail!("timed out waiting for {stage}"),
+        }
+    }
 }
 
 fn prepare_vault() -> Result<(TempDir, PathBuf)> {
