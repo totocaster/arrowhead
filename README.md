@@ -84,6 +84,21 @@ To cofigure local mcp use this snippet:
 }
 ```
 
+### Memory footprint
+
+The daemon keeps semantic search ready by loading the `fastembed` model into an embedding pool sized to your CPU count (up to eight concurrent model handles). Each handle pulls the ~90 MB ONNX weights plus ONNX Runtime state, so full semantic mode typically consumes around 1 GB of RAM even when idle.  
+If you only need full-text indexing or want a lighter runtime, disable embeddings:
+
+```bash
+# Initialise the vault without semantic embeddings
+arrowhead init --fts-only
+
+# Or launch manually with embeddings disabled
+ARROWHEAD_EMBEDDING_MODEL=none arrowhead vault start
+```
+
+This keeps FTS indexing and search working while skipping the model downloads and heap allocations that normally dominate the daemon’s memory footprint.
+
 ## Architecture
 
 ```
