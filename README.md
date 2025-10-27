@@ -1,64 +1,110 @@
 ![Arrowhead banner](docs/assets/Arrowhead_GitHub_Logo.png)
 
-# Arrowhead
+**Fast Obsidian search and discovery that makes AI agents your true knowledge assistant.**
 
-**Obsidian vault indexing and search with MCP integration**
+Arrowhead is a cross-platform CLI and daemon that keeps your Obsidian vault indexed around the clock. It combines fast full-text search, semantic vectors, graph analytics, and a Claude-ready MCP interface so both humans and agents can explore your notes without friction.
 
-Arrowhead is a cross-platform CLI tool that provides Obsidian-aware indexing, note management, and (soon) search capabilities for Obsidian vaults, with AI integration via the Model Context Protocol (MCP).
+## How It Works
 
-## Name Origin
+```mermaid
+flowchart TB
+    Vault["Obsidian Vault<br>(markdown + assets)"]
 
-Arrowhead references the precision obsidian tools used by prehistoric humans for hunting and crafting—sharp, targeted instruments that point the way, just as this tool precisely finds and connects knowledge within your Obsidian vault.
+    subgraph Core["Arrowhead Core"]
+        Daemon[arrowheadd daemon]
+        Index["Arrowhead Index<br>FTS + Vector"]
+
+        Daemon --manage--> Index
+    end
+
+    subgraph Clients["Arrowhead clients"]
+        CLI[Arrowhead CLI]
+        MCP[MCP stdio server]
+        MCPHTTP[MCP HTTP service]
+    end
+    
+    Daemon <--watcher--> Vault 
+
+    TUI["Codex / Claude Code<br>TUI"]
+    Client[Claude.app / MCP client]
+    RemoteClient[Remote MCP client]
+
+    CLI --> Index
+    TUI --> CLI
+
+    MCP ---> Index 
+    Client --> MCP
+
+    MCPHTTP ---> Index 
+    RemoteClient --> MCPHTTP
+```
+
+Arrowhead Core runtime watches your vault, streams changes into a bounded writer queue, and persists both text and vector indexes without taking ownership of your files. Arrowhead clients—the CLI and the MCP transports—sit on top of that runtime, reading directly from the shared index to serve both local workflows and remote agent requests.
 
 ## Features
 
-### Available today
+- Background daemon with live filesystem watching and bounded persistence queue.
+- Vault-aware indexing that respects `.obsidian` settings, templates, and ignore lists.
+- Full-text, semantic, and hybrid search with snippet generation and metadata filters.
+- Notes CRUD, graph analytics, and discovery helpers via CLI or MCP tool surface.
+- Opt-in semantic embeddings using fastembed + LanceDB behind the `vector-lancedb` feature.
+- Auto-start manifests for macOS (launchd) and Linux (`systemd --user`) with CLI management.
 
-- **Background daemon**: `arrowhead init` provisions `.arrowhead/` scaffolding, launches `arrowheadd`, and keeps the SQLite + LanceDB indexes hot via filesystem watching.
-- **Auto-start integration**: `arrowhead vault autostart enable|disable|status` manages launchd (macOS) or systemd --user (Linux) units so the daemon comes up automatically on login.
-- **Status telemetry**: `arrowhead vault status` surfaces the daemon’s live activity, download progress, note/error counts, and log locations (`.arrowhead/logs/cli.log`, `.arrowhead/logs/daemon.log`).
-- **Smart indexing**: Incremental reindexing with staleness detection so only changed notes are processed.
-- **Obsidian-aware**: Automatically honours `.obsidian/app.json` settings (ignored folders, attachments) when scanning the vault.
-- **Notes CLI**: `arrowhead notes read/list/create/update/delete` manages Markdown notes directly from the terminal.
-- **Full-text search**: SQLite FTS5-based keyword search with `field:value` syntax and porter stemming.
-- **Semantic + hybrid search**: fastembed models (build with `--features vector-lancedb`) deliver semantic and combined scoring with per-result reasoning snippets.
-- **Model management**: Daemon coordinates Hugging Face downloads with progress surfaced in `vault status`.
+## Quick Start
 
-### Coming soon
+#### 1. Download arrowhead.
 
-- **WikiLinks Graph**: Navigate backlinks, forward links, and find orphaned notes
-- **MCP Server**: Dual-mode MCP integration (stdio for local, HTTP for remote)
-- **Cross-Platform**: Works on macOS and Linux
+```bash
+brew install arrowhead
+```
 
-## Project Status
+#### 2. Navigate to your Obsidian vault and initialize Arrowhead. 
 
-🚧 **Under active development** - This is a complete rewrite of Synapse from Swift to Rust.
+```
+arrowhead init
+```
 
-Current phase: **Phase 4 — Verification & documentation (daemon runtime live)**
+This will launch and register the daemon that will keep watching your files and keep the index ready for use. Initial indexing might take some time depending on the size of your vault. You can use the `arrowhead vault status` to check it.  
 
-See [docs/predev_synapse_rust_rewrite.md](docs/predev_synapse_rust_rewrite.md) for the complete specification.
+#### 3. Start using Arrowhead
+
+* CLI: It is recommended to use a CLI tool when working with coding agents that have access to the terminal (Claide Code, Codex CLI) for performance reasons.
+* MCP: For local remote AI agent instances such as Claude.app, use MCP client. 
+
+To cofigure local mcp use this snippet:
+
+```json
+{
+  "mcpServers": {
+    "arrowhead": {
+      "command": "arrowhead",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
 
 ## Architecture
 
 ```
 arrowhead/
 ├── crates/
-│   ├── arrowhead-core/     # Core library (vault, indexing, search, graph)
-│   ├── arrowhead-deamon/   # Background daemon (watcher + control socket)
-│   ├── arrowhead-mcp/      # MCP protocol implementation
-│   └── arrowhead-cli/      # CLI application
-├── docs/                   # Documentation
-└── tests/                  # Integration tests and fixtures
+│   ├── arrowhead-core/     # Vault I/O, indexer engine, search & graph primitives
+│   ├── arrowhead-deamon/   # Background runtime (watcher, queue, control socket, binary)
+│   ├── arrowhead-mcp/      # MCP protocol (stdio runtime, handlers, tooling)
+│   └── arrowhead-cli/      # CLI (clap commands, config, runtime bootstrap)
+├── docs/                   # Specs, protocol references, development guides
+└── tests/                  # Integration harness and fixture vaults
 ```
 
 ## Technology Stack
 
-- **Language**: Rust 1.85+ (2024 edition)
-- **CLI**: clap 4.5+
-- **Database**: SQLite (rusqlite) with FTS5
-- **Vectors**: fastembed (ONNX embeddings)
-- **HTTP**: axum 0.7+
-- **Async**: tokio 1.40+
+- **Language**: Rust 1.86 (2024 edition) with `anyhow`/`thiserror` for rich errors.
+- **CLI**: `clap` 4.5+, `tracing` for structured diagnostics.
+- **Daemon runtime**: `tokio` 1.40+ with `notify`-backed filesystem watching.
+- **Database**: SQLite (`rusqlite`) with FTS5 and JSON metadata columns.
+- **Vectors**: `fastembed` + LanceDB behind the `vector-lancedb` feature gate.
+- **MCP**: Standards-compliant stdio transport; HTTP transport under active development.
 
 ## Building
 
@@ -69,11 +115,14 @@ cargo build
 # Build release version
 cargo build --release
 
-# Install CLI + daemon (installs both `arrowhead` and `arrowheadd` with LanceDB support)
+# Install CLI + daemon (installs `arrowhead` + `arrowheadd`)
 make install PREFIX=$HOME/.local LOCKED=0 FORCE=1
 
 # Run CLI
 arrowhead --help
+
+# Enable semantic features (requires `protoc` + LanceDB toolchain)
+cargo build --release --features vector-lancedb
 
 # Run tests
 cargo test
@@ -82,29 +131,45 @@ cargo test
 ## Usage overview
 
 ```bash
-# Initialise a vault (creates .arrowhead/, starts the daemon, optional semantic preset)
-arrowhead init --vault /path/to/vault [--embeddings fast|good|better]
+# Initialise a vault (creates .arrowhead/, prepares index DB, offers auto-start)
+arrowhead init --vault /path/to/vault [--embeddings fast|good|better|none] [--fts-only]
 
-# Check daemon status (activity, note counts, download progress, log paths)
+# Launch or check the background daemon
+arrowhead vault start
 arrowhead vault status
 
-# Manage auto-start registration
+# Manage auto-start registration (per-user launchd/systemd)
 arrowhead vault autostart enable
 arrowhead vault autostart status
 arrowhead vault autostart disable
 
-# Read live logs (CLI + daemon)
+# Search (FTS, semantic, or hybrid)
+arrowhead search fts "project roadmap" --vault /path/to/vault
+arrowhead search semantic "notes about embeddings" --vault /path/to/vault
+
+# CRUD helpers + graph analytics
+arrowhead notes list --vault /path/to/vault --json
+arrowhead graph context "Project Hub" --vault /path/to/vault
+
+# Tail structured logs
 tail -f /path/to/vault/.arrowhead/logs/cli.log
 tail -f /path/to/vault/.arrowhead/logs/daemon.log
 
-# Stop the daemon or clean up all Arrowhead artefacts
+# Stop the daemon or clean up Arrowhead artefacts
 arrowhead vault stop
 arrowhead vault cleanup
+
+# Run the MCP stdio server for Claude or other clients
+arrowhead --mcp --stdio
 ```
 
-## Known issues
+## Roadmap
 
-- **Indexing failures**: A handful of notes can still fail to index without detailed diagnostics; richer error logging is on the roadmap.
+- HTTP transport for MCP with bearer auth and multiplexed requests.
+- Graph diagnostics: directional summaries, back-pressure metrics, large vault profiling.
+- Search hardening: semantic snippet tuning, LanceDB regression fixtures, hybrid scoring tweaks.
+- Model management UX: preset documentation, cache overrides, richer download progress.
+- Vector dependency review and MSRV tracking for LanceDB releases.
 
 ## License
 
@@ -117,8 +182,8 @@ at your option.
 
 ## Contributing
 
-This project is in early development. 
+We welcome issues and pull requests once the Phase 1 foundation is fully stabilised. Start by reading the [rewrite specification](docs/predev_synapse_rust_rewrite.md) and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
 
 ## Acknowledgments
 
-Arrowhead is a Rust rewrite of [Synapse-Obsidian](https://github.com/yourusername/Synapse-Obsidian), originally written in Swift for macOS.
+Arrowhead is the Rust rewrite of [Synapse-Obsidian](https://github.com/totocaster/Synapse-Obsidian), originally a macOS Swift app. Huge thanks to the early users and contributors whose feedback shaped the new CLI-first architecture.
