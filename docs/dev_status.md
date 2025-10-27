@@ -28,12 +28,11 @@
 - Indexer progress instrumentation landed (batching hooks, observer events, CLI progress bar) so long-running reindexes surface user feedback out of the box.
 - FTS search pipeline (Synapse-style query rewriting, porter tokenization, metadata/value dual-token indexing, revamped ranking/snippets) with comprehensive unit and integration coverage, including automatic index refresh when running searches.
 - Semantic + hybrid search: embedding presets (`fast`/`good`/`better`), automatic Hugging Face downloads scoped to the vault, LanceDB persistence/refresh from the indexer, and CLI entry points for `search semantic` / `search hybrid` with cosine + weighted scoring.
-- Graph foundation: link extraction now records target/display/heading data with resolution reasons; indexer updates `note_links` during daemon runs and the CLI `graph` command now defaults to the full context view (with optional `--json` output) while still exposing dedicated backlinks, forward links, orphan, and unresolved subcommands.
+- Graph foundation: link extraction now records target/display/heading data with resolution reasons; indexer updates `note_links` during daemon runs and the CLI `graph` command now defaults to the full context view (with optional `--json` output that summarises forward/backlink counts) while still exposing dedicated backlinks, forward links, orphan, and unresolved subcommands.
 
 ## Next Focus Areas
 
 1. **Graph Enhancements (Phase 3 focus)**
-   - Surface directional link summaries (forward/back/backlink counts) via CLI + MCP with clear reasons.
    - Add sync guarantees between note edits and graph edges, including queue depth/back-pressure metrics for troubleshooting.
    - Profile large vaults to tune channel sizing and surface alerts when the writer falls behind.
 
