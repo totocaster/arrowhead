@@ -52,6 +52,7 @@
 ## Open Decisions / Risks
 
 - **Vector MSRV:** sqlite-vec currently aligns with the workspace toolchain; continue monitoring upstream requirements.
+- **Toolchain alignment:** `rust-toolchain.toml` pins 1.86.0 but `rust-version` metadata and CI still target 1.85; update the remaining references to avoid drift.
 - **Model distribution:** Implement Hugging Face-backed downloads with clear licensing documentation and opt-in presets.
 - **Schema migrations:** Continue relying on drop-and-reindex for incompatible schemas; document any future scenarios that require persistent migrations.
 - **Concurrent access:** Clarify whether multi-process vault access needs to be supported in v1.

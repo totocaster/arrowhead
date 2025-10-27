@@ -1,8 +1,9 @@
 # Arrowhead Public API
 
-This document captures the high-level API surface that Arrowhead exposes to
-other applications and tooling. The implementation is currently being
-developed; this file serves as the agreed plan of record.
+This document captures the high-level API surface that Arrowhead currently
+exposes to other applications and tooling. The CLI and stdio MCP transport
+described below ship in the repository today; the HTTP transport remains on
+the roadmap.
 
 ## CLI Commands
 
@@ -13,7 +14,8 @@ developed; this file serves as the agreed plan of record.
 - `arrowhead graph` — inspect WikiLink graph relationships.
   - Default invocation (`arrowhead graph <NOTE_ID>`) returns a combined context view listing outbound links, backlinks, and unresolved edges in one response.
   - All graph subcommands accept `--json` to emit machine-readable payloads mirroring the CLI output.
-- `arrowhead vault` — utility commands such as stats and integrity checks.
+- `arrowhead status` — stream live daemon status frames or fall back to the latest snapshot.
+- `arrowhead vault` — manage daemon lifecycle (init/start/stop/cleanup/autostart).
 
 Each command is documented in greater detail within the command-specific Rust
 modules under `crates/arrowhead-cli/src/commands/`.
@@ -53,8 +55,6 @@ Implemented tool surface:
 - Vault: `mcp.vault.status`
 - Protocol: `mcp.protocol.initialize`, `mcp.protocol.tools/list`
 
-Semantic and hybrid search remain feature-gated by the optional
-Embeddings load by default via sqlite-vec; discovery handlers fall back to graph heuristics if embeddings are disabled at runtime.
-when vectors are unavailable.
+Semantic and hybrid search remain feature-gated by the optional embeddings pipeline; discovery handlers fall back to graph heuristics if embeddings are disabled at runtime.
 
 Further transport and schema details live in `docs/mcp_protocol.md`.

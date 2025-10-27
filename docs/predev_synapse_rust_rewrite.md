@@ -15,7 +15,7 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 
 ## Current Status (2025-10-21)
 
-- Workspace standardised on Rust 1.85 / edition 2024 (`rust-toolchain.toml` committed).
+- Workspace standardised on Rust 1.86 / edition 2024 (pinned via `rust-toolchain.toml`).
 - Core, CLI, and MCP crates now implement the background deamon workflow end-to-end, returning actionable errors instead of panicking.
 - CLI commands (`init`, `search`, `notes`, `graph`, `vault`) delegate indexing to `arrowheadd`, manage auto-start manifests, and persist config updates.
 - Documentation refreshed (`docs/api.md`, `docs/mcp_protocol.md`) and tests directory bootstrapped (`tests/integration/`).
@@ -29,9 +29,9 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 | **Interface** | Menu bar GUI app | CLI tool |
 | **Indexing** | Real-time FSEvents monitoring | Background deamon + incremental reindex (notify) |
 | **Deployment** | Sandboxed app bundle | Single binary |
-| **MCP Modes** | stdio only | stdio (local) + HTTP (remote) |
-| **Language** | Swift 5.9+ | Rust 1.85+ (2024 edition) |
-| **Vector Storage** | SQLite BLOBs | Dedicated vector database |
+| **MCP Modes** | stdio only | stdio (local) + HTTP (remote, planned) |
+| **Language** | Swift 5.9+ | Rust 1.86+ (2024 edition) |
+| **Vector Storage** | SQLite BLOBs | SQLite + sqlite-vec virtual table |
 
 ---
 
@@ -59,9 +59,9 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 │                      Arrowhead Binary                        │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ CLI Commands │  │  MCP Server  │  │  MCP Remote  │      │
-│  │   (clap)     │  │   (stdio)    │  │   (HTTP)     │      │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐│
+│  │ CLI Commands │  │  MCP Server  │  │  MCP Remote        ││
+│  │   (clap)     │  │   (stdio)    │  │  (HTTP, planned)   ││
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
 │         │                 │                 │               │
 │         └─────────────────┴─────────────────┘               │
@@ -91,7 +91,7 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 
 ```
 arrowhead/
-├── rust-toolchain.toml        # Toolchain pin (Rust 1.85.0)
+├── rust-toolchain.toml        # Toolchain pin (Rust 1.86.0)
 ├── Cargo.toml                 # Workspace definition
 ├── crates/
 │   ├── arrowhead-core/        # Core library
@@ -583,24 +583,26 @@ arrowhead/
 - Write JSON-RPC response to stdout
 - Continue until stdin closes
 
-#### 2. Remote MCP (HTTP)
+#### 2. Remote MCP (HTTP, planned)
 
-**Server Usage:** `arrowhead --mcp-server --bind 127.0.0.1:8080 --token <secret>`
+_Not yet implemented; targeted for Phase 5 once the HTTP transport lands._
 
-**Protocol:**
+**Planned usage:** `arrowhead --mcp-server --bind 127.0.0.1:8080 --token <secret>`
+
+**Planned protocol:**
 - HTTP POST to `/rpc` endpoint
 - JSON-RPC 2.0 in request body
 - Bearer token authentication (Authorization header)
 - CORS disabled by default (single-user)
 
-**Authentication:**
+**Planned authentication:**
 - Require `Authorization: Bearer <token>` header
 - Validate token against configuration
 - IP allowlist enforcement (default: localhost only)
 - Return 401 Unauthorized if invalid
 - Return 403 Forbidden if IP not allowed
 
-**Server Features:**
+**Planned server features:**
 - Health check endpoint: GET `/health`
 - Metrics endpoint (optional): GET `/metrics`
 - Graceful shutdown on SIGTERM
@@ -611,25 +613,25 @@ arrowhead/
 
 | Category | Method | Description |
 |----------|--------|-------------|
-| **Search** | `search_fts` | Full-text search with field:value syntax |
-| | `search_similarity` | Semantic search with embeddings |
-| | `search_hybrid` | Combined FTS + semantic search |
-| **Notes** | `read_note` | Get complete note content |
-| | `list_notes` | List notes with optional metadata filtering |
-| | `get_note_metadata` | Get metadata without content |
-| | `create_note` | Create new note (CRUD) |
-| | `update_note` | Update existing note (CRUD) |
-| | `delete_note` | Delete note (CRUD) |
-| **Graph** | `get_note_graph` | Complete graph context for a note |
-| | `get_backlinks` | Notes linking TO this note |
-| | `get_forward_links` | Notes linked FROM this note |
-| | `find_orphan_notes` | Notes with no WikiLinks |
-| | `find_unresolved_links` | Broken WikiLinks |
-| **Discovery** | `get_related_notes` | Semantically similar notes |
-| | `get_vault_stats` | Vault overview and statistics |
-| | `get_vault_conventions` | Naming patterns, metadata conventions |
-| **Protocol** | `initialize` | Initialize connection, return server info |
-| | `tools/list` | List all available tools |
+| **Search** | `mcp.search.fts` | Full-text search with field:value syntax |
+| | `mcp.search.semantic` | Semantic search with embeddings |
+| | `mcp.search.hybrid` | Combined FTS + semantic search |
+| **Notes** | `mcp.notes.read` | Get complete note content |
+| | `mcp.notes.list` | List notes with optional metadata filtering |
+| | `mcp.notes.metadata` | Get metadata without content |
+| | `mcp.notes.create` | Create new note (CRUD) |
+| | `mcp.notes.update` | Update existing note (CRUD) |
+| | `mcp.notes.delete` | Delete note (CRUD) |
+| **Graph** | `mcp.graph.get_context` | Complete graph context for a note |
+| | `mcp.graph.get_backlinks` | Notes linking TO this note |
+| | `mcp.graph.get_forward_links` | Notes linked FROM this note |
+| | `mcp.graph.find_orphans` | Notes with no WikiLinks |
+| | `mcp.graph.find_unresolved` | Broken WikiLinks |
+| **Discovery** | `mcp.discovery.get_related_notes` | Semantically similar notes |
+| | `mcp.discovery.get_vault_stats` | Vault overview and statistics |
+| | `mcp.discovery.get_vault_conventions` | Naming patterns, metadata conventions |
+| **Protocol** | `mcp.protocol.initialize` | Initialize connection, return server info |
+| | `mcp.protocol.tools/list` | List all available tools |
 
 **Excluded Tools** (from original Synapse):
 - ❌ AI provider integrations (OpenAI, Anthropic, Ollama)
@@ -675,11 +677,7 @@ OPTIONS:
     --vault <PATH>          Path to vault (default: from config)
     --config <PATH>         Config file path
     --mcp                   Run in MCP stdio mode
-    --mcp-server            Run MCP HTTP server
-    --bind <ADDR>           HTTP server bind address
-    --token <TOKEN>         Authentication token for MCP
-    -v, --verbose           Verbose logging
-    -q, --quiet             Suppress output
+    -v, --verbose           Increase logging verbosity (repeatable)
     -h, --help              Show help
 
 COMMANDS:
@@ -791,6 +789,7 @@ Manage the background deamon and Arrowhead working directories.
 - `start`: Launch or relaunch the deamon, waiting for the control socket
 - `stop`: Request a graceful shutdown via the control socket
 - `cleanup`: Stop the deamon if running, then remove `.arrowhead/` caches (index, vectors, logs, status, socket, PID)
+- `autostart`: Enable, disable, or inspect user-level auto-start integration
 
 ### Configuration File
 
@@ -817,17 +816,17 @@ auto_start_enabled = true
 | Category | Crate | Purpose |
 |----------|-------|---------|
 | **CLI** | `clap` (4.5+) | Command-line argument parsing with derive |
-| | `directories` (5.0+) | XDG config directory paths |
-| **Config** | `toml` (0.8+) | TOML configuration parsing |
+| | `directories` (6.0+) | XDG config directory paths |
+| **Config** | `toml` (0.9+) | TOML configuration parsing |
 | | `serde` (1.0+) | Serialization framework |
-| **Database** | `rusqlite` (0.32+) | SQLite bindings with FTS5 |
+| **Database** | `rusqlite` (0.37+) | SQLite bindings with FTS5 |
 | | `r2d2` + `r2d2_sqlite` | Connection pooling |
-| **Vectors** | `lancedb` (latest) | Vector database for embeddings |
-| | `fastembed` (3.0+) | ONNX embedding models |
-| | `ndarray` (0.15+) | N-dimensional arrays |
-| **Async** | `tokio` (1.40+) | Async runtime (full features) |
+| **Vectors** | `sqlite-vec` (0.1+) | SQLite extension providing vector search |
+| | `fastembed` (5.2+) | ONNX embedding models |
+| | `ndarray` (0.16+) | N-dimensional arrays |
+| **Async** | `tokio` (1.48+) | Async runtime (full features) |
 | | `async-trait` (0.1+) | Async trait support |
-| **HTTP** | `axum` (0.7+) | Web framework |
+| **HTTP** | `axum` (0.8+) | Web framework (planned HTTP transport) |
 | | `tower` + `tower-http` | Middleware |
 | **Parsing** | `serde_yaml` (0.9+) | YAML frontmatter |
 | | `serde_json` (1.0+) | JSON support |
@@ -836,8 +835,8 @@ auto_start_enabled = true
 | | `thiserror` (1.0+) | Custom error types |
 | | `chrono` (0.4+) | Date/time handling |
 | | `tracing` + `tracing-subscriber` | Structured logging |
-| **UI** | `indicatif` (0.17+) | Progress bars (optional) |
-| | `colored` (2.1+) | Terminal colors (optional) |
+| **UI** | `indicatif` (0.18+) | Progress bars (optional) |
+| | `colored` (3.0+) | Terminal colors (optional) |
 
 ### Optional Dependencies
 
@@ -856,7 +855,7 @@ auto_start_enabled = true
 **Goal:** Establish workspace, documentation, and foundational APIs.
 
 **Deliverables:**
-- Rust 1.85 / edition 2024 toolchain pinned via `rust-toolchain.toml`.
+- Rust 1.86 / edition 2024 toolchain pinned via `rust-toolchain.toml`.
 - Core/CLI/MCP crates laid out with typed modules returning descriptive `todo` errors.
 - CLI command surface and shared config loader implemented.
 - Initial documentation and test harness directories added.
@@ -1010,7 +1009,7 @@ auto_start_enabled = true
    - Monitor access logs
    - Never expose directly to internet
 
-**Example Secure Setup:**
+**Planned secure setup (HTTP transport):**
 - Generate token: `openssl rand -hex 32`
 - Run server: `arrowhead --mcp-server --bind 127.0.0.1:8080 --token $TOKEN`
 - Use reverse proxy for TLS termination
@@ -1075,7 +1074,7 @@ This specification provides a blueprint for rewriting Synapse from Swift to Rust
 ✅ **Dedicated vector storage** (sqlite-vec virtual table inside the main index)
 ✅ **Full search capabilities** (FTS, semantic, hybrid)
 ✅ **WikiLinks graph navigation**
-✅ **Dual MCP modes** (stdio + HTTP)
+⏳ **HTTP MCP transport** (planned Phase 5 deliverable)
 ✅ **Production-ready auth** (bearer tokens)
 ✅ **Clean architecture** (core library + CLI + MCP)
 ✅ **Obsidian compatible** (100% vault compatibility)
