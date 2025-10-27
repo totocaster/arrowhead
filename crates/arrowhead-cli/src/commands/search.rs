@@ -1,9 +1,9 @@
 //! `arrowhead search` subcommands.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::json;
 use tracing::info;
 
@@ -47,6 +47,9 @@ pub struct QueryArgs {
     /// Output JSON for machine consumption.
     #[arg(long)]
     pub json: bool,
+    /// Select an output format optimised for different pipelines.
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OutputFormat,
 }
 
 /// Dispatch search execution.
@@ -64,11 +67,7 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
 
     let logs_dir = vault.paths().logs_dir();
 
-    #[cfg(feature = "vector-lancedb")]
     let logging_enabled = std::env::var_os("ARROWHEAD_ENABLE_FILE_LOGS").is_some();
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    let logging_enabled = std::env::var_os("ARROWHEAD_DISABLE_FILE_LOGS").is_none();
 
     let _logging_guard = if logging_enabled {
         Some(logging::scoped_file_logging(&logs_dir, ctx.verbosity())?)
@@ -76,18 +75,23 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         None
     };
 
-    let model_id = ctx
+    let selected_model = ctx
         .config
         .embedding_model
         .clone()
         .unwrap_or_else(|| "fast".to_string());
-    let embeddings = if EmbeddingPipeline::is_supported() {
-        let pipeline = EmbeddingPipeline::initialise(vault.as_ref(), &model_id)
+    let embeddings = match &command.mode {
+        SearchMode::Fts(_) => None,
+        _ => {
+            let pipeline = EmbeddingPipeline::initialise(
+                vault.as_ref(),
+                Arc::clone(&database),
+                &selected_model,
+            )
             .await
-            .context("failed to prepare embedding pipeline")?;
-        Some(Arc::new(pipeline))
-    } else {
-        None
+            .with_context(|| format!("failed to prepare embedding pipeline `{selected_model}`"))?;
+            Some(Arc::new(pipeline))
+        }
     };
 
     let status = ensure_deamon_ready(ctx, vault.as_ref()).await?;
@@ -101,31 +105,37 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         );
     }
 
-    let service = SearchService::new(database, SearchConfig::default(), embeddings);
+    let service = SearchService::new(database, SearchConfig::default(), embeddings.clone());
 
     match &command.mode {
         SearchMode::Fts(args) => {
             info!(query = args.query.as_str(), limit = ?args.limit, "executing FTS search");
             let results = execute_fts_search(&service, args).await?;
-            render_results(&results, args.json)?;
+            render_results(&results, args.json, args.format, vault.as_ref())?;
             Ok(())
         }
         SearchMode::Semantic(args) => {
+            let _ = embeddings
+                .as_ref()
+                .expect("embedding pipeline required for semantic search");
             info!(query = args.query.as_str(), limit = ?args.limit, "executing semantic search");
             let results = service
                 .search_semantic(&args.query, args.limit)
                 .await
                 .context("failed to execute semantic search")?;
-            render_results(&results, args.json)?;
+            render_results(&results, args.json, args.format, vault.as_ref())?;
             Ok(())
         }
         SearchMode::Hybrid(args) => {
+            let _ = embeddings
+                .as_ref()
+                .expect("embedding pipeline required for hybrid search");
             info!(query = args.query.as_str(), limit = ?args.limit, "executing hybrid search");
             let results = service
                 .search_hybrid(&args.query, args.limit)
                 .await
                 .context("failed to execute hybrid search")?;
-            render_results(&results, args.json)?;
+            render_results(&results, args.json, args.format, vault.as_ref())?;
             Ok(())
         }
     }
@@ -182,7 +192,28 @@ async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<Deam
     }
 }
 
-fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Human-friendly multi-column output.
+    Human,
+    /// Emit matching note identifiers, one per line.
+    Ids,
+    /// Emit absolute note paths, one per line.
+    Paths,
+}
+
+impl Default for OutputFormat {
+    fn default() -> Self {
+        Self::Human
+    }
+}
+
+fn render_results(
+    results: &[SearchResult],
+    json_output: bool,
+    format: OutputFormat,
+    vault: &Vault,
+) -> Result<()> {
     if json_output {
         let payload: Vec<_> = results
             .iter()
@@ -191,7 +222,8 @@ fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
                     "note_id": result.note_id,
                     "title": result.title,
                     "score": result.score,
-                    "bm25": result.bm25,
+                    "bm25": result.bm25_score(),
+                    "relative_path": result.relative_path,
                     "preview": result.preview,
                     "reason": result.reason,
                     "metadata": result.metadata,
@@ -207,30 +239,60 @@ fn render_results(results: &[SearchResult], json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    for result in results {
-        let title = result
-            .title
-            .as_deref()
-            .or_else(|| {
-                result
-                    .metadata
-                    .get("title")
-                    .and_then(|value| value.as_str())
-            })
-            .unwrap_or("-");
-        println!(
-            "{}\t{:.3}\t{:.2}\t{}",
-            result.note_id, result.score, result.bm25, title
-        );
-        if let Some(reason) = &result.reason {
-            println!("  Reason: {}", reason);
+    match format {
+        OutputFormat::Human => {
+            for result in results {
+                let title = result
+                    .title
+                    .as_deref()
+                    .or_else(|| {
+                        result
+                            .metadata
+                            .get("title")
+                            .and_then(|value| value.as_str())
+                    })
+                    .unwrap_or("-");
+                let bm25_display = result
+                    .bm25_score()
+                    .map(|score| format!("{score:.2}"))
+                    .unwrap_or_else(|| "N/A".to_string());
+                println!(
+                    "{}\t{:.3}\t{}\t{}",
+                    result.note_id, result.score, bm25_display, title
+                );
+                if let Some(reason) = &result.reason {
+                    println!("  Reason: {}", reason);
+                }
+                if let Some(preview) = &result.preview {
+                    println!("  {}", preview.trim());
+                }
+            }
         }
-        if let Some(preview) = &result.preview {
-            println!("  {}", preview.trim());
+        OutputFormat::Ids => {
+            for result in results {
+                println!("{}", result.note_id);
+            }
+        }
+        OutputFormat::Paths => {
+            for result in results {
+                if let Some(path) = note_absolute_path(vault, result) {
+                    println!("{}", path.display());
+                } else {
+                    println!("{}", result.note_id);
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn note_absolute_path(vault: &Vault, result: &SearchResult) -> Option<PathBuf> {
+    if let Some(relative) = result.relative_path.as_deref() {
+        Some(vault.note_path(relative))
+    } else {
+        vault.note_file_path(&result.note_id).ok()
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +335,7 @@ mod tests {
                 query: "category:reference".to_string(),
                 limit: Some(5),
                 json: false,
+                format: OutputFormat::default(),
             }),
         };
 
@@ -336,6 +399,7 @@ mod tests {
                 query: "category:reference".to_string(),
                 limit: Some(5),
                 json: false,
+                format: OutputFormat::default(),
             }),
         };
 

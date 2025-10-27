@@ -1,11 +1,11 @@
 //! Search coordination across FTS, semantic, and hybrid strategies.
 
-use std::sync::{Arc, LazyLock};
-#[cfg(feature = "vector-lancedb")]
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
-#[cfg(feature = "vector-lancedb")]
-use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use tokio::task;
@@ -22,6 +22,8 @@ pub struct SearchResult {
     pub score: f32,
     /// Raw BM25 rank reported by SQLite (lower is better).
     pub bm25: f32,
+    /// Relative path of the note within the vault, when known.
+    pub relative_path: Option<String>,
     /// Optional snippet or preview text.
     pub preview: Option<String>,
     /// High-level explanation of why this result ranked where it did.
@@ -39,10 +41,20 @@ impl SearchResult {
             note_id,
             score: 0.0,
             bm25: f32::MAX,
+            relative_path: None,
             preview: None,
             reason: None,
             metadata: MetadataMap::default(),
             title: None,
+        }
+    }
+
+    /// Normalised BM25 score that omits sentinel values.
+    pub fn bm25_score(&self) -> Option<f32> {
+        if !self.bm25.is_finite() || self.bm25 == f32::MAX {
+            None
+        } else {
+            Some(self.bm25)
         }
     }
 }
@@ -70,7 +82,6 @@ impl Default for SearchConfig {
 pub struct SearchService {
     database: Arc<IndexDatabase>,
     config: SearchConfig,
-    #[cfg(feature = "vector-lancedb")]
     embeddings: Option<Arc<EmbeddingPipeline>>,
 }
 
@@ -81,13 +92,9 @@ impl SearchService {
         config: SearchConfig,
         embeddings: Option<Arc<EmbeddingPipeline>>,
     ) -> Self {
-        #[cfg(not(feature = "vector-lancedb"))]
-        let _ = embeddings;
-
         Self {
             database,
             config,
-            #[cfg(feature = "vector-lancedb")]
             embeddings,
         }
     }
@@ -131,6 +138,7 @@ impl SearchService {
                     note_id: item.note_id,
                     score: rank_to_score(item.rank),
                     bm25,
+                    relative_path: Some(item.relative_path),
                     preview: item.snippet,
                     reason,
                     metadata,
@@ -149,7 +157,6 @@ impl SearchService {
     }
 
     /// Execute a semantic similarity search.
-    #[cfg(feature = "vector-lancedb")]
     pub async fn search_semantic(
         &self,
         query: &str,
@@ -160,12 +167,10 @@ impl SearchService {
             bail!("empty search query");
         }
 
-        let pipeline = self
-            .embeddings
-            .as_ref()
-            .ok_or_else(|| anyhow!(
-                "semantic search requires Arrowhead to be built with LanceDB support. Rebuild with the `vector-lancedb` feature and reindex the vault."
-            ))?;
+        let pipeline = match self.embeddings.as_ref() {
+            Some(pipeline) => pipeline,
+            None => bail!("semantic search requires embeddings to be enabled"),
+        };
 
         let limit = limit.unwrap_or(self.config.default_limit).max(1);
         info!(query = query, limit, "executing semantic search");
@@ -198,6 +203,10 @@ impl SearchService {
             .database
             .titles_for_notes(&note_ids)
             .context("failed to load note titles for semantic results")?;
+        let relative_path_map = self
+            .database
+            .relative_paths_for_notes(&note_ids)
+            .context("failed to load note paths for semantic results")?;
 
         let mut results = Vec::new();
         for item in matches.into_iter().take(limit) {
@@ -211,6 +220,7 @@ impl SearchService {
                 .cloned()
                 .unwrap_or_default();
             let title = title_map.get(&item.note_id).cloned().unwrap_or(None);
+            let relative_path = relative_path_map.get(&item.note_id).cloned();
             let preview = self
                 .database
                 .note_excerpt(&item.note_id, 240)
@@ -220,6 +230,7 @@ impl SearchService {
                 note_id: item.note_id,
                 score: similarity,
                 bm25: f32::MAX,
+                relative_path,
                 preview,
                 reason: Some(format!("Semantic similarity {:.2}", similarity)),
                 metadata,
@@ -237,7 +248,6 @@ impl SearchService {
     }
 
     /// Execute a hybrid search, combining semantic and keyword results.
-    #[cfg(feature = "vector-lancedb")]
     pub async fn search_hybrid(
         &self,
         query: &str,
@@ -251,12 +261,10 @@ impl SearchService {
             bail!("empty search query");
         }
 
-        let pipeline = self
-            .embeddings
-            .as_ref()
-            .ok_or_else(|| anyhow!(
-                "hybrid search requires Arrowhead to be built with LanceDB support. Rebuild with the `vector-lancedb` feature and reindex the vault."
-            ))?;
+        let pipeline = match self.embeddings.as_ref() {
+            Some(pipeline) => pipeline,
+            None => bail!("hybrid search requires embeddings to be enabled"),
+        };
 
         let limit = limit.unwrap_or(self.config.default_limit).max(1);
         info!(query = query, limit, "executing hybrid search");
@@ -305,9 +313,8 @@ impl SearchService {
 
         let missing_ids: Vec<String> = combined
             .iter()
-            .filter_map(|(note_id, entry)| {
-                (entry.fts.is_none() && entry.semantic.is_some()).then(|| note_id.clone())
-            })
+            .filter(|(_, entry)| entry.fts.is_none() && entry.semantic.is_some())
+            .map(|(note_id, _)| note_id.clone())
             .collect();
 
         let metadata_map = self
@@ -318,6 +325,10 @@ impl SearchService {
             .database
             .titles_for_notes(&missing_ids)
             .context("failed to load note titles for hybrid search results")?;
+        let relative_path_map = self
+            .database
+            .relative_paths_for_notes(&missing_ids)
+            .context("failed to load note paths for hybrid search results")?;
 
         let mut excerpt_map = HashMap::new();
         for note_id in &missing_ids {
@@ -354,11 +365,13 @@ impl SearchService {
                     if combined_score >= self.config.semantic_threshold {
                         let metadata = metadata_map.get(&note_id).cloned().unwrap_or_default();
                         let title = title_map.get(&note_id).cloned().unwrap_or(None);
+                        let relative_path = relative_path_map.get(&note_id).cloned();
                         let preview = excerpt_map.remove(&note_id).unwrap_or(None);
                         results.push(SearchResult {
                             note_id,
                             score: combined_score,
                             bm25: f32::MAX,
+                            relative_path,
                             preview,
                             reason: Some(format!("Semantic similarity {:.2}", semantic)),
                             metadata,
@@ -380,26 +393,6 @@ impl SearchService {
             "hybrid search completed"
         );
         Ok(results)
-    }
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    #[allow(missing_docs)]
-    pub async fn search_semantic(
-        &self,
-        _query: &str,
-        _limit: Option<usize>,
-    ) -> Result<Vec<SearchResult>> {
-        bail!("semantic search requires Arrowhead to be built with the `vector-lancedb` feature.")
-    }
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    #[allow(missing_docs)]
-    pub async fn search_hybrid(
-        &self,
-        _query: &str,
-        _limit: Option<usize>,
-    ) -> Result<Vec<SearchResult>> {
-        bail!("hybrid search requires Arrowhead to be built with the `vector-lancedb` feature.")
     }
 
     /// Access the current search configuration.

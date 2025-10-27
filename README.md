@@ -47,7 +47,7 @@ Arrowhead Core runtime watches your vault, streams changes into a bounded writer
 - Vault-aware indexing that respects `.obsidian` settings, templates, and ignore lists.
 - Full-text, semantic, and hybrid search with snippet generation and metadata filters.
 - Notes CRUD, graph analytics, and discovery helpers via CLI or MCP tool surface.
-- Opt-in semantic embeddings using fastembed + LanceDB behind the `vector-lancedb` feature.
+- Semantic embeddings using fastembed with vectors stored in sqlite-vec alongside the primary index.
 - Auto-start manifests for macOS (launchd) and Linux (`systemd --user`) with CLI management.
 
 ## Quick Start
@@ -103,7 +103,7 @@ arrowhead/
 - **CLI**: `clap` 4.5+, `tracing` for structured diagnostics.
 - **Daemon runtime**: `tokio` 1.40+ with `notify`-backed filesystem watching.
 - **Database**: SQLite (`rusqlite`) with FTS5 and JSON metadata columns.
-- **Vectors**: `fastembed` + LanceDB behind the `vector-lancedb` feature gate.
+- **Vectors**: `fastembed` embeddings persisted via sqlite-vec inside the SQLite index.
 - **MCP**: Standards-compliant stdio transport; HTTP transport under active development.
 
 ## Building
@@ -120,9 +120,6 @@ make install PREFIX=$HOME/.local LOCKED=0 FORCE=1
 
 # Run CLI
 arrowhead --help
-
-# Enable semantic features (requires `protoc` + LanceDB toolchain)
-cargo build --release --features vector-lancedb
 
 # Run tests
 cargo test
@@ -146,6 +143,15 @@ arrowhead vault autostart disable
 # Search (FTS, semantic, or hybrid)
 arrowhead search fts "project roadmap" --vault /path/to/vault
 arrowhead search semantic "notes about embeddings" --vault /path/to/vault
+arrowhead search hybrid "mixed query" --vault /path/to/vault
+
+# Pipe-friendly search output
+arrowhead search fts "project roadmap" --vault /path/to/vault --format paths
+arrowhead search semantic "notes about embeddings" --vault /path/to/vault --format ids
+
+# Graph pipelines
+arrowhead graph orphans --vault /path/to/vault --format ids | head -20
+arrowhead graph backlinks "Project Hub" --vault /path/to/vault --format ids
 
 # CRUD helpers + graph analytics
 arrowhead notes list --vault /path/to/vault --json
@@ -163,13 +169,15 @@ arrowhead vault cleanup
 arrowhead --mcp --stdio
 ```
 
+Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available. Graph listings pick up the same pipe-friendly `--format ids` option for backlinks, forward-links, orphans, and unresolved link reports.
+
 ## Roadmap
 
 - HTTP transport for MCP with bearer auth and multiplexed requests.
 - Graph diagnostics: directional summaries, back-pressure metrics, large vault profiling.
-- Search hardening: semantic snippet tuning, LanceDB regression fixtures, hybrid scoring tweaks.
+- Search hardening: semantic snippet tuning, sqlite-vec regression fixtures, hybrid scoring tweaks.
 - Model management UX: preset documentation, cache overrides, richer download progress.
-- Vector dependency review and MSRV tracking for LanceDB releases.
+- Vector dependency review and MSRV tracking for sqlite-vec releases.
 
 ## License
 

@@ -75,22 +75,13 @@ pub struct GraphLinksPayload {
 }
 
 /// Request parameters shared by all search methods.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SearchParams {
     /// Query string to evaluate.
     pub query: String,
     /// Optional maximum number of results to return.
     pub limit: Option<usize>,
-}
-
-impl Default for SearchParams {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            limit: None,
-        }
-    }
 }
 
 /// Response payload wrapping search results.
@@ -114,8 +105,12 @@ pub struct SearchResultPayload {
     pub title: Option<String>,
     /// Combined relevance score reported by the search engine.
     pub score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     /// Raw BM25 rank returned by the FTS index (lower is better).
-    pub bm25: f32,
+    pub bm25: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Relative path of the note within the vault.
+    pub relative_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional preview snippet generated from the note content.
     pub preview: Option<String>,
@@ -133,7 +128,8 @@ impl SearchResultPayload {
             note_id: result.note_id.clone(),
             title: result.title.clone(),
             score: result.score,
-            bm25: result.bm25,
+            bm25: result.bm25_score(),
+            relative_path: result.relative_path.clone(),
             preview: result.preview.clone(),
             reason: result.reason.clone(),
             metadata: result.metadata.clone(),
@@ -150,22 +146,13 @@ pub struct NoteReadParams {
 }
 
 /// Parameters for listing notes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct NotesListParams {
     /// When true, omit additional note metadata and return identifiers only.
     pub ids_only: bool,
     /// Maximum number of entries to return.
     pub limit: Option<usize>,
-}
-
-impl Default for NotesListParams {
-    fn default() -> Self {
-        Self {
-            ids_only: false,
-            limit: None,
-        }
-    }
 }
 
 /// Parameters for metadata lookups.
@@ -424,17 +411,11 @@ pub struct RelatedNotesPayload {
 }
 
 /// Optional parameters controlling vault statistics aggregation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct VaultStatsParams {
     /// Maximum number of recent notes to include in the response.
     pub recent_limit: Option<usize>,
-}
-
-impl Default for VaultStatsParams {
-    fn default() -> Self {
-        Self { recent_limit: None }
-    }
 }
 
 /// Aggregated vault statistics for `mcp.discovery.get_vault_stats`.

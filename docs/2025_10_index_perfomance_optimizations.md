@@ -12,7 +12,7 @@
 - Replaced the single global fastembed mutex with a bounded pool of model
   instances so parallel workers can generate embeddings concurrently without
   blocking each other. Semantic writes are buffered and flushed in batches to
-  reduce LanceDB delete/add churn.
+  reduce sqlite-vec delete/add churn.
 - Added thread-scoped SQLite connection caching to keep prepared statements and
   WAL buffers warm during heavy ingestion.
 - Normalised minor search test formatting that surfaced during `cargo fmt`.
@@ -41,7 +41,7 @@
 3. **Prepared Statement Pooling:** Revisit SQLite `upsert_note` to reuse prepared
    statements within the thread connection for further micro-optimisation.
 4. **Embedding Pipeline Metrics:** Emit structured timing metrics around embed
-   generation and LanceDB flushes to validate pooling effectiveness across
+   generation and sqlite-vec flushes to validate pooling effectiveness across
    diverse CPU configurations.
 5. **Parallel File I/O:** Investigate switching the inventory walker to the
    `ignore` crate’s parallel traversal for even faster directory scanning on

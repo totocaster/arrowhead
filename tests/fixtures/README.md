@@ -28,6 +28,8 @@ The `test-vault` is a comprehensive Obsidian vault designed to test all features
 - **Tags**: 40+ unique tags
 - **Metadata Patterns**: Simple and complex YAML frontmatter
 
+When validating the fixtures with the CLI, `arrowhead search --format paths` emits absolute note locations for quick inspection, `arrowhead graph --format ids` streams backlink/orphan lists for batching, and semantic-only hits surface `"N/A"` in the BM25 column to indicate that no lexical score was used.
+
 ## Test Note Categories
 
 ### 1. Happy Path Notes (Normal Usage)

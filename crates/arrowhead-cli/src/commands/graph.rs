@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde_json::json;
 
 use arrowhead_core::{
@@ -18,6 +18,9 @@ pub struct GraphCommand {
     /// Emit JSON instead of human-readable output.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Select an output format optimised for different pipelines.
+    #[arg(long, global = true, value_enum, default_value_t)]
+    pub format: GraphOutputFormat,
     /// Graph operation to perform.
     #[command(subcommand)]
     pub action: Option<GraphAction>,
@@ -39,6 +42,21 @@ pub enum GraphAction {
     /// Treat bare `note-id` invocations as context requests.
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+/// Graph output rendering formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GraphOutputFormat {
+    /// Human-friendly narrative output.
+    Human,
+    /// Emit bare identifiers (or unresolved raw tokens) per line.
+    Ids,
+}
+
+impl Default for GraphOutputFormat {
+    fn default() -> Self {
+        Self::Human
+    }
 }
 
 /// Common argument containing a note identifier.
@@ -66,25 +84,30 @@ pub async fn run(ctx: &CommandContext, command: &GraphCommand) -> Result<()> {
         ResolvedGraphAction::Backlinks(note_id) => {
             ensure_note_indexed(&database, &note_id)?;
             let edges = service.backlinks(&note_id).await?;
-            render_backlinks(&note_id, &edges, command.json)?;
+            render_backlinks(&note_id, &edges, command.json, command.format)?;
         }
         ResolvedGraphAction::ForwardLinks(note_id) => {
             ensure_note_indexed(&database, &note_id)?;
             let edges = service.forward_links(&note_id).await?;
-            render_forward_links(&note_id, &edges, command.json)?;
+            render_forward_links(&note_id, &edges, command.json, command.format)?;
         }
         ResolvedGraphAction::Context(note_id) => {
             ensure_note_indexed(&database, &note_id)?;
             let context = service.context(&note_id).await?;
-            render_context(&note_id, &context, command.json)?;
+            if !command.json && command.format == GraphOutputFormat::Ids {
+                bail!(
+                    "--format ids is not supported for `graph context`; use `graph forward-links` or `graph backlinks` instead."
+                );
+            }
+            render_context(&note_id, &context, command.json, command.format)?;
         }
         ResolvedGraphAction::Orphans => {
             let orphans = service.orphans().await?;
-            render_orphans(&orphans, command.json)?;
+            render_orphans(&orphans, command.json, command.format)?;
         }
         ResolvedGraphAction::Unresolved => {
             let unresolved = service.unresolved_links().await?;
-            render_unresolved(&unresolved, command.json)?;
+            render_unresolved(&unresolved, command.json, command.format)?;
         }
     }
 
@@ -139,7 +162,12 @@ enum ResolvedGraphAction {
     Unresolved,
 }
 
-fn render_forward_links(note_id: &str, edges: &[LinkEdge], json_output: bool) -> Result<()> {
+fn render_forward_links(
+    note_id: &str,
+    edges: &[LinkEdge],
+    json_output: bool,
+    format: GraphOutputFormat,
+) -> Result<()> {
     if json_output {
         let payload = json!({
             "note_id": note_id,
@@ -150,21 +178,35 @@ fn render_forward_links(note_id: &str, edges: &[LinkEdge], json_output: bool) ->
         return Ok(());
     }
 
-    if edges.is_empty() {
-        println!("No outbound links from {}.", note_id);
-        return Ok(());
-    }
+    match format {
+        GraphOutputFormat::Human => {
+            if edges.is_empty() {
+                println!("No outbound links from {}.", note_id);
+                return Ok(());
+            }
 
-    println!("Forward links from {}:", note_id);
-    for edge in edges {
-        let label = format_edge_label(edge, LinkDirection::Forward);
-        println!("- {} ({})", label, describe_edge(edge));
+            println!("Forward links from {}:", note_id);
+            for edge in edges {
+                let label = format_edge_label(edge, LinkDirection::Forward);
+                println!("- {} ({})", label, describe_edge(edge));
+            }
+            Ok(())
+        }
+        GraphOutputFormat::Ids => {
+            for identifier in forward_link_identifiers(edges) {
+                println!("{}", identifier);
+            }
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
-fn render_backlinks(note_id: &str, edges: &[LinkEdge], json_output: bool) -> Result<()> {
+fn render_backlinks(
+    note_id: &str,
+    edges: &[LinkEdge],
+    json_output: bool,
+    format: GraphOutputFormat,
+) -> Result<()> {
     if json_output {
         let payload = json!({
             "note_id": note_id,
@@ -175,24 +217,33 @@ fn render_backlinks(note_id: &str, edges: &[LinkEdge], json_output: bool) -> Res
         return Ok(());
     }
 
-    if edges.is_empty() {
-        println!("No backlinks found for {}.", note_id);
-        return Ok(());
-    }
+    match format {
+        GraphOutputFormat::Human => {
+            if edges.is_empty() {
+                println!("No backlinks found for {}.", note_id);
+                return Ok(());
+            }
 
-    println!("Backlinks to {}:", note_id);
-    for edge in edges {
-        println!(
-            "- {} ({})",
-            format_edge_label(edge, LinkDirection::Backward),
-            describe_edge(edge)
-        );
+            println!("Backlinks to {}:", note_id);
+            for edge in edges {
+                println!(
+                    "- {} ({})",
+                    format_edge_label(edge, LinkDirection::Backward),
+                    describe_edge(edge)
+                );
+            }
+            Ok(())
+        }
+        GraphOutputFormat::Ids => {
+            for identifier in backlink_identifiers(edges) {
+                println!("{}", identifier);
+            }
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
-fn render_orphans(note_ids: &[String], json_output: bool) -> Result<()> {
+fn render_orphans(note_ids: &[String], json_output: bool, format: GraphOutputFormat) -> Result<()> {
     if json_output {
         let payload = json!({
             "orphan_notes": note_ids,
@@ -202,20 +253,33 @@ fn render_orphans(note_ids: &[String], json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    if note_ids.is_empty() {
-        println!("No orphan notes detected.");
-        return Ok(());
-    }
+    match format {
+        GraphOutputFormat::Human => {
+            if note_ids.is_empty() {
+                println!("No orphan notes detected.");
+                return Ok(());
+            }
 
-    println!("Orphan notes:");
-    for note_id in note_ids {
-        println!("- {}", note_id);
+            println!("Orphan notes:");
+            for note_id in note_ids {
+                println!("- {}", note_id);
+            }
+            Ok(())
+        }
+        GraphOutputFormat::Ids => {
+            for identifier in note_ids {
+                println!("{}", identifier);
+            }
+            Ok(())
+        }
     }
-
-    Ok(())
 }
 
-fn render_unresolved(edges: &[LinkEdge], json_output: bool) -> Result<()> {
+fn render_unresolved(
+    edges: &[LinkEdge],
+    json_output: bool,
+    format: GraphOutputFormat,
+) -> Result<()> {
     if json_output {
         let payload = json!({
             "unresolved_links": edges.iter().map(|edge| edge_to_json(edge, LinkDirection::Forward)).collect::<Vec<_>>(),
@@ -225,28 +289,42 @@ fn render_unresolved(edges: &[LinkEdge], json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    if edges.is_empty() {
-        println!("No unresolved links detected.");
-        return Ok(());
-    }
+    match format {
+        GraphOutputFormat::Human => {
+            if edges.is_empty() {
+                println!("No unresolved links detected.");
+                return Ok(());
+            }
 
-    println!("Unresolved links:");
-    let mut grouped: BTreeMap<&str, Vec<&LinkEdge>> = BTreeMap::new();
-    for edge in edges {
-        grouped.entry(edge.source.as_str()).or_default().push(edge);
-    }
+            println!("Unresolved links:");
+            let mut grouped: BTreeMap<&str, Vec<&LinkEdge>> = BTreeMap::new();
+            for edge in edges {
+                grouped.entry(edge.source.as_str()).or_default().push(edge);
+            }
 
-    for (source, items) in grouped {
-        println!("- {}:", source);
-        for item in items {
-            println!("  - [[{}]]", item.raw);
+            for (source, items) in grouped {
+                println!("- {}:", source);
+                for item in items {
+                    println!("  - [[{}]]", item.raw);
+                }
+            }
+            Ok(())
+        }
+        GraphOutputFormat::Ids => {
+            for identifier in unresolved_identifiers(edges) {
+                println!("{}", identifier);
+            }
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
-fn render_context(note_id: &str, context: &GraphContext, json_output: bool) -> Result<()> {
+fn render_context(
+    note_id: &str,
+    context: &GraphContext,
+    json_output: bool,
+    format: GraphOutputFormat,
+) -> Result<()> {
     if json_output {
         let forward: Vec<_> = context
             .forward_links
@@ -281,24 +359,47 @@ fn render_context(note_id: &str, context: &GraphContext, json_output: bool) -> R
         return Ok(());
     }
 
-    render_forward_links(note_id, &context.forward_links, false)?;
-    println!();
-    render_backlinks(note_id, &context.backlinks, false)?;
+    match format {
+        GraphOutputFormat::Human => {
+            render_forward_links(note_id, &context.forward_links, false, format)?;
+            println!();
+            render_backlinks(note_id, &context.backlinks, false, format)?;
 
-    let unresolved: Vec<&LinkEdge> = context
-        .forward_links
-        .iter()
-        .filter(|edge| edge.reason == LinkReason::Unresolved)
-        .collect();
-    if !unresolved.is_empty() {
-        println!();
-        println!("Unresolved links from {}:", note_id);
-        for edge in unresolved {
-            println!("- [[{}]]", edge.raw);
+            let unresolved: Vec<&LinkEdge> = context
+                .forward_links
+                .iter()
+                .filter(|edge| edge.reason == LinkReason::Unresolved)
+                .collect();
+            if !unresolved.is_empty() {
+                println!();
+                println!("Unresolved links from {}:", note_id);
+                for edge in unresolved {
+                    println!("- [[{}]]", edge.raw);
+                }
+            }
+
+            Ok(())
+        }
+        GraphOutputFormat::Ids => {
+            // This branch is currently gated by the caller; keep logic for completeness.
+            for identifier in forward_link_identifiers(&context.forward_links) {
+                println!("{}", identifier);
+            }
+            for identifier in backlink_identifiers(&context.backlinks) {
+                println!("{}", identifier);
+            }
+            let unresolved_edges: Vec<LinkEdge> = context
+                .forward_links
+                .iter()
+                .filter(|edge| edge.reason == LinkReason::Unresolved)
+                .cloned()
+                .collect();
+            for identifier in unresolved_identifiers(&unresolved_edges) {
+                println!("{}", identifier);
+            }
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 fn describe_edge(edge: &LinkEdge) -> String {
@@ -355,4 +456,81 @@ fn edge_to_json(edge: &LinkEdge, direction: LinkDirection) -> serde_json::Value 
             LinkDirection::Backward => "inbound",
         },
     })
+}
+
+fn forward_link_identifiers(edges: &[LinkEdge]) -> Vec<String> {
+    edges
+        .iter()
+        .map(|edge| edge.target.clone().unwrap_or_else(|| edge.raw.clone()))
+        .collect()
+}
+
+fn backlink_identifiers(edges: &[LinkEdge]) -> Vec<String> {
+    edges.iter().map(|edge| edge.source.clone()).collect()
+}
+
+fn unresolved_identifiers(edges: &[LinkEdge]) -> Vec<String> {
+    edges
+        .iter()
+        .map(|edge| format!("{}\t{}", edge.source, edge.raw))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn edge_with_target(
+        source: &str,
+        target: Option<&str>,
+        raw: &str,
+        reason: LinkReason,
+    ) -> LinkEdge {
+        LinkEdge {
+            source: source.to_string(),
+            target: target.map(|value| value.to_string()),
+            raw: raw.to_string(),
+            display_text: None,
+            heading: None,
+            reason,
+        }
+    }
+
+    #[test]
+    fn forward_link_identifiers_prefers_target_id() {
+        let edges = vec![
+            edge_with_target("source-a", Some("target-a"), "Target A", LinkReason::Direct),
+            edge_with_target("source-b", None, "Unresolved Note", LinkReason::Unresolved),
+        ];
+        let identifiers = forward_link_identifiers(&edges);
+        assert_eq!(
+            identifiers,
+            vec!["target-a".to_string(), "Unresolved Note".to_string()]
+        );
+    }
+
+    #[test]
+    fn backlink_identifiers_emit_sources() {
+        let edges = vec![
+            edge_with_target("note-a", Some("target"), "raw", LinkReason::Direct),
+            edge_with_target("note-b", Some("target"), "raw", LinkReason::Alias),
+        ];
+        let identifiers = backlink_identifiers(&edges);
+        assert_eq!(
+            identifiers,
+            vec!["note-a".to_string(), "note-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn unresolved_identifiers_include_source_and_raw() {
+        let edges = vec![edge_with_target(
+            "note-a",
+            None,
+            "Missing Page",
+            LinkReason::Unresolved,
+        )];
+        let identifiers = unresolved_identifiers(&edges);
+        assert_eq!(identifiers, vec!["note-a\tMissing Page".to_string()]);
+    }
 }

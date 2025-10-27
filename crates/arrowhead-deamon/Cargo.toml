@@ -15,9 +15,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 arrowhead-core = { path = "../arrowhead-core" }
-fastembed = { workspace = true, optional = true }
+fastembed.workspace = true
 futures.workspace = true
-hf-hub = { workspace = true, optional = true }
+hf-hub.workspace = true
 notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,14 +25,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
-
-[features]
-default = []
-vector-lancedb = [
-    "arrowhead-core/vector-lancedb",
-    "dep:fastembed",
-    "dep:hf-hub",
-]
 
 [dev-dependencies]
 chrono.workspace = true

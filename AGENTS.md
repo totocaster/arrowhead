@@ -7,7 +7,7 @@
 
 ## Ground Rules
 1. **Toolchain:** Build against Rust 1.85 (2024 edition). Update `rust-toolchain.toml` if a later MSRV is required; call it out in reviews.
-2. **Features:** The `vector-lancedb` cargo feature is off by default. Enable it only when implementing semantic search/persistence and confirm LanceDB’s MSRV requirements.
+2. **Features:** Semantic search ships by default using sqlite-vec; keep embeddings healthy and avoid regressing the always-on pipeline.
 3. **Style:** Follow idiomatic Rust (clippy clean, `cargo fmt`). Prefer explicit structs/enums over loose maps; document non-obvious flows with concise comments.
 4. **Error Handling:** Use `anyhow`/`thiserror` as scoped in the spec. Return actionable errors instead of panicking.
 5. **Testing:** Add unit tests alongside code (`#[cfg(test)]`) and integration tests under `tests/integration/`. Use `tests/fixtures/test-vault` as read-only input; write indexes to temp dirs.
@@ -26,7 +26,7 @@
 
 ## Code Priorities
 - **Phase 1:** Implement vault I/O, metadata extraction, and SQLite schema.
-- **Phase 2:** Build indexer, search pipeline, and embed LanceDB (behind feature) when ready.
+- **Phase 2:** Build indexer, search pipeline, and harden the sqlite-vec vector store.
 - **Phase 3+:** Complete graph services, MCP transports, and polish.
 
 ## Communication

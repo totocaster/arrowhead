@@ -186,6 +186,8 @@ fn test_semantic_search() {
 }
 ```
 
+For shell-driven smoke tests, the CLI exposes `--format ids`/`--format paths` on `arrowhead search`, and `arrowhead graph` mirrors `--format ids` on backlinks, forward-links, orphans, and unresolved listings. Semantic-only matches display `"N/A"` in the BM25 column when no lexical rank exists.
+
 ## Test Organization
 
 ### Unit Tests

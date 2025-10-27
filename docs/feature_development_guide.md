@@ -12,10 +12,9 @@ specification.
 
 ## 2. Logging & Observability
 - Use `tracing` for diagnostic output. During CLI execution, logs normally flow
-  to `.arrowhead/logs/cli.log` via `logging::scoped_file_logging`. When
-  building with the `vector-lancedb` feature we keep file logging opt-in (set
-  `ARROWHEAD_ENABLE_FILE_LOGS=1`) to avoid known issues in LanceDB's tracing
-  subscriber. Keep stdout/stderr for intentional user-facing output only.
+  to `.arrowhead/logs/cli.log` via `logging::scoped_file_logging`. Keep file
+  logging opt-in by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1`) so local runs
+  stay quiet unless you explicitly need artefacts.
 - Emit at least `info!` on command start/finish and for notable decisions (e.g.
   skipping stale work, writing migrations).
 - When spawning background tasks, carry the active `tracing` dispatcher (e.g.
@@ -25,6 +24,7 @@ specification.
 ## 3. Testing Expectations
 - Unit tests co-located with the code (`#[cfg(test)]`). Use the fixture vault in
   `tests/fixtures/test-vault` for vault/indexer scenarios; never mutate it.
+- Stub embeddings in tests (e.g. set `with_embedding_model(None)` or `disable_embeddings()`) to avoid downloading models; semantic behaviour should be validated via fixtures and sqlite-vec tables.
 - Integration tests belong under `tests/integration/` and should use ephemeral
   temp directories for side effects.
 - Cover behavioural regressions before introducing new logic; add regression
@@ -39,9 +39,6 @@ specification.
 - Vault-aware features must respect detected Obsidian settings (e.g.
   `.obsidian/app.json` ignore filters, attachment directories) and surface them
   through the `VaultSettings` APIs.
-- Feature flags (e.g. `vector-lancedb`) stay off by default until the phase
-  specifies activation.
-
 ## 5. Documentation & Communication
 - Update `docs/dev_status.md` after significant milestones or architecture
   shifts.

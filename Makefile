@@ -17,9 +17,9 @@ CARGO_FORCE := $(if $(filter 1,$(FORCE)),--force,)
 install:
 	@echo "Installing Arrowhead CLI to $(BIN_DIR)"
 	@mkdir -p "$(BIN_DIR)"
-	@"$(CARGO)" install --path "$(CLI_PATH)" --root "$(PREFIX)" --features vector-lancedb $(CARGO_LOCKED) $(CARGO_FORCE)
+	@"$(CARGO)" install --path "$(CLI_PATH)" --root "$(PREFIX)" $(CARGO_LOCKED) $(CARGO_FORCE)
 	@echo "Installing Arrowhead deamon (arrowheadd) to $(BIN_DIR)"
-	@"$(CARGO)" install --path "$(DEAMON_PATH)" --root "$(PREFIX)" --features vector-lancedb $(CARGO_LOCKED) $(CARGO_FORCE)
+	@"$(CARGO)" install --path "$(DEAMON_PATH)" --root "$(PREFIX)" $(CARGO_LOCKED) $(CARGO_FORCE)
 	@printf '\nArrowhead CLI and deamon installed to: %s\nEnsure \"%s\" is on your PATH so both `arrowhead` and `arrowheadd` are runnable.\n' "$(BIN_DIR)" "$(BIN_DIR)"
 
 clean:

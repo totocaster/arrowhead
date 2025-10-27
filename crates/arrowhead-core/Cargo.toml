@@ -37,20 +37,13 @@ r2d2_sqlite.workspace = true
 # Vector embeddings
 fastembed.workspace = true
 ndarray.workspace = true
-lancedb = { workspace = true, optional = true }
+sqlite-vec.workspace = true
+zerocopy.workspace = true
 num_cpus.workspace = true
-
-# Arrow integration for LanceDB vector persistence
-arrow-array = { version = "55.1", optional = true }
-arrow-schema = { version = "55.1", optional = true }
 
 # Text processing
 regex.workspace = true
 
-[features]
-default = []
-vector-lancedb = ["lancedb", "arrow-array", "arrow-schema"]
-
 [dev-dependencies]
 tempfile = "3.8"
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros"] }

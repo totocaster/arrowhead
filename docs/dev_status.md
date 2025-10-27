@@ -5,15 +5,15 @@
 - **Toolchain:** Rust 1.86 (2024 edition) pinned via `rust-toolchain.toml`.
 - **Workspace health:** `cargo fmt`, `cargo check`, and `cargo test` all pass.
 - **Crates:** Core/CLI/MCP crates ship concrete implementations for Phase 1 (vault, metadata, SQLite, indexer) with tests.
-- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, and a new bounded write queue funnels all SQLite/LanceDB persistence through a single writer so unchanged notes skip cheaply while updated notes commit without exhausting the connection pool.
+- **Indexer:** Staleness detection compares filesystem mtimes with stored `indexed_at`, and a new bounded write queue funnels all SQLite (including sqlite-vec) persistence through a single writer so unchanged notes skip cheaply while updated notes commit without exhausting the connection pool.
 - **Vault settings:** `.obsidian/app.json` is parsed for attachments and user ignore filters so templates stay out of the index.
 - **CLI:** `init` now performs the full interactive vault setup (prompting for auto-start, launching the deamon unless `--no-start` is passed) and returns immediately once `arrowheadd` is alive—the initial crawl continues in the background and live progress streams through `arrowhead status` (TTY view or NDJSON frames). A new `--fts-only` switch lets users opt out of semantic indexing up front. `index` remains informational, and full `notes` CRUD (read/list/create/update/delete) execute end-to-end; logging writes to `.arrowhead/logs/cli.log` with multi-day retention. Vault subcommands (`vault init/start/stop/cleanup`) manage the background deamon, cache socket/status metadata in config, render runtime health, and provide teardown. Search commands rely on the deamon-maintained index instead of running local refresh passes. `arrowhead --mcp` now bootstraps the MCP stdio server, exposing the full Phase‑4 tool surface (graph analytics, search, notes CRUD, discovery helpers, protocol initialise/tools) with bounded backpressure, structured tracing, and shared runtime wiring.
 - **Auto-start:** `vault init` now offers to register per-user auto-start units (launchd on macOS, `systemd --user` on Linux), persists manifest metadata under `.arrowhead/deamon/autostart/`, surfaces enablement in the status stream, and ensures `vault cleanup` removes the units.
 - **Search:** `arrowhead search fts` executes against SQLite FTS5 with `field:value` and boolean syntax, stemming (`porter`) enabled, richer relevance scores, and cleaner snippets while relying on the deamon-maintained index (no inline refresh).
-- **Deamon runtime:** New `arrowhead-deamon` crate (Tokio binary `arrowheadd` + library) exposes `status`/`shutdown` JSON socket commands, persists PID/status/log files under `.arrowhead/deamon`, and streams filesystem events via `notify` to `Indexer::reindex_paths`. Poll-based watcher integration tests verify path reindex + status updates. When semantic indexing is enabled the runtime now initialises the fastembed + LanceDB pipeline itself, streaming Hugging Face download progress into `DeamonStatus.downloads`, raising issues on failure, and falling back to FTS-only indexing if the model cannot be prepared. Logging now captures lifecycle, watcher batch, and per-note outcomes in `.arrowhead/logs/daemon.log` so debugging no longer depends on the CLI process.
+- **Deamon runtime:** New `arrowhead-deamon` crate (Tokio binary `arrowheadd` + library) exposes `status`/`shutdown` JSON socket commands, persists PID/status/log files under `.arrowhead/deamon`, and streams filesystem events via `notify` to `Indexer::reindex_paths`. Poll-based watcher integration tests verify path reindex + status updates. When semantic indexing is enabled the runtime now initialises the fastembed + sqlite-vec pipeline itself, streaming Hugging Face download progress into `DeamonStatus.downloads`, raising issues on failure, and falling back to FTS-only indexing if the model cannot be prepared. Logging now captures lifecycle, watcher batch, and per-note outcomes in `.arrowhead/logs/daemon.log` so debugging no longer depends on the CLI process.
 - **CI:** GitHub Actions workflow (`CI`) runs on push/PR/workflow_dispatch, enforcing fmt, clippy, check, and test across the workspace.
 - **Documentation:** Specification aligned (`docs/predev_synapse_rust_rewrite.md`) and updated to include the deamon crate/runtime responsibilities; feature development guide established; integration fixtures ready.
-- **Vectors:** Semantic pipeline (fastembed + LanceDB) integrates with indexing, the deamon runtime, and CLI search when the optional `vector-lancedb` feature is enabled; defaults to FTS-only when the feature is off or `--fts-only` is chosen. Vector builds skip per-command file logging by default (set `ARROWHEAD_ENABLE_FILE_LOGS=1` to opt in) while we stabilise LanceDB tracing behaviour.
+- **Vectors:** Semantic pipeline (fastembed + sqlite-vec) integrates with indexing, the daemon runtime, and CLI search by default; use `--fts-only` to disable embeddings when required. File logging stays opt-in (`ARROWHEAD_ENABLE_FILE_LOGS=1`) while we monitor sqlite-vec logging overhead.
 - **Graph:** WikiLink extraction now persists raw/display/heading metadata plus a resolution reason; `arrowhead graph` defaults to a combined context view showing inbound/outbound edges and supports `--json` for structured responses alongside backlinks, forward links, orphan, and unresolved reports.
 
 ## Completed Work (Phase 0-1)
@@ -28,7 +28,7 @@
 - Indexer progress instrumentation landed (batching hooks, observer events, CLI progress bar) so long-running reindexes surface user feedback out of the box.
 - FTS search pipeline (Synapse-style query rewriting, porter tokenization, metadata/value dual-token indexing, revamped ranking/snippets) with comprehensive unit and integration coverage, including automatic index refresh when running searches.
 - Real-time status streaming: the deamon emits `StatusFrame` updates over the control socket, `arrowhead status` tails frames (TTY or NDJSON), and the CLI falls back to cached snapshots when the runtime is offline.
-- Semantic + hybrid search: embedding presets (`fast`/`good`/`better`), automatic Hugging Face downloads scoped to the vault, LanceDB persistence/refresh from the indexer, and CLI entry points for `search semantic` / `search hybrid` with cosine + weighted scoring.
+- Semantic + hybrid search: embedding presets (`fast`/`good`/`better`), automatic Hugging Face downloads scoped to the vault, sqlite-vec persistence/refresh from the indexer, and CLI entry points for `search semantic` / `search hybrid` with cosine + weighted scoring.
 - Graph foundation: link extraction now records target/display/heading data with resolution reasons; indexer updates `note_links` during daemon runs and the CLI `graph` command now defaults to the full context view (with optional `--json` output that summarises forward/backlink counts) while still exposing dedicated backlinks, forward links, orphan, and unresolved subcommands.
 
 ## Next Focus Areas
@@ -40,7 +40,7 @@
 2. **Search Hardening (Phase 2 follow-up)**
    - Tune hybrid weighting/thresholds against real vault corpora and add regression fixtures covering semantic-only and mixed queries.
    - Improve semantic previews (smarter snippet generation) and document evaluation tooling.
-   - Extend integration tests to exercise LanceDB-backed searches (requires `protoc` in CI agents).
+   - Extend integration tests to exercise sqlite-vec-backed searches.
 
 3. **Model Management & UX**
    - Finalise licensing guidance for the shipped presets and surface model selection in docs/CLI help.
@@ -51,11 +51,11 @@
 
 ## Open Decisions / Risks
 
-- **Vector MSRV:** LanceDB currently requires Rust ≥1.86; workspace bumped accordingly.
+- **Vector MSRV:** sqlite-vec currently aligns with the workspace toolchain; continue monitoring upstream requirements.
 - **Model distribution:** Implement Hugging Face-backed downloads with clear licensing documentation and opt-in presets.
 - **Schema migrations:** Continue relying on drop-and-reindex for incompatible schemas; document any future scenarios that require persistent migrations.
 - **Concurrent access:** Clarify whether multi-process vault access needs to be supported in v1.
-- **Protobuf tooling:** `vector-lancedb` builds need `protoc` on developer and CI machines; decide whether to vendor binaries or document the prerequisite.
+- **Vector tooling:** sqlite-vec auto-extends SQLite at runtime; ensure CI agents ship with compatible libc/SQLite builds.
 - **Indexing diagnostics:** Instrument writer queue depth / latency so operators can spot back-pressure and correlate with per-note failures.
 
 ## Tracking

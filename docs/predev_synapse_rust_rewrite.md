@@ -19,7 +19,7 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 - Core, CLI, and MCP crates now implement the background deamon workflow end-to-end, returning actionable errors instead of panicking.
 - CLI commands (`init`, `search`, `notes`, `graph`, `vault`) delegate indexing to `arrowheadd`, manage auto-start manifests, and persist config updates.
 - Documentation refreshed (`docs/api.md`, `docs/mcp_protocol.md`) and tests directory bootstrapped (`tests/integration/`).
-- Vector storage integration sits behind an optional `vector-lancedb` feature that stays disabled until semantic search work begins.
+- Vector storage integration relies on sqlite-vec embedded in the SQLite index so semantic search is always available once embeddings are generated.
 
 ### Key Changes from Original
 
@@ -223,7 +223,7 @@ arrowhead/
    - Store resolved/unresolved links in graph table
 
 **Optimization Features:**
-- Worker pool parallelises I/O, extraction, and embedding while a dedicated writer task serialises SQLite and LanceDB updates through a bounded queue (prevents connection exhaustion).
+- Worker pool parallelises I/O, extraction, and embedding while a dedicated writer task serialises SQLite (including sqlite-vec vector writes) through a bounded queue to prevent connection starvation.
 - Batch embedding generation for efficiency
 - Bounded channel back-pressure keeps memory predictable and surfaces stalled writers.
 - Progress callback support
@@ -366,34 +366,26 @@ arrowhead/
 
 **Requirement:** Efficient storage and retrieval of embedding vectors with similarity search support.
 
-**Option A: LanceDB (Recommended)**
+**Option A: sqlite-vec (Implemented)**
 
-**Why LanceDB:**
-- Native Rust support with official `lancedb` crate
-- Persistent local file storage (no server required)
-- Columnar format optimized for vector operations
-- Built-in HNSW index for fast ANN search
-- Supports metadata filtering alongside vector search
-- Can scale to millions of vectors
-- Zero-copy memory mapping for efficiency
+**Why sqlite-vec:**
+- Ships as a lightweight SQLite extension; no external daemon or build-time protoc dependency.
+- Integrates directly with the existing SQLite connection pool and transaction model.
+- Provides cosine similarity search with metadata columns, matching current vault scale requirements.
+- Keeps vectors in the primary `.arrowhead/index.db`, simplifying backup and cache management.
 
 **Structure:**
-- Location: `.arrowhead/vectors/` directory
-- Stores vectors + metadata in columnar Lance format
-- Automatic HNSW index creation
-- Native support for f32 vectors (384 or 768 dimensions)
+- Location: `.arrowhead/index.db` (shared SQLite database).
+- Virtual table: `note_embeddings` implemented with the sqlite-vec `vec0` module.
+- Columns: `note_id`, normalised embedding vector, `model`, `indexed_at`.
 
 **Implementation Approach:**
-- Open LanceDB connection at `.arrowhead/vectors`
-- Create table with schema: note_id, vector, model_name, created_at
-- Use native ANN search with cosine similarity
-- Batch upsert during indexing
-- Query interface: vector search with optional metadata filters
+- Register sqlite-vec via the SQLite auto-extension API during database initialisation.
+- Create the `note_embeddings` virtual table with `distance_metric=cosine` and metadata columns.
+- Batch upsert vectors inside the writer task to avoid concurrent write contention.
+- Query using `MATCH` + distance ordering to retrieve cosine-ranked results and filter by threshold.
 
-> **Implementation note:** The Rust workspace exposes a `vector-lancedb`
-> Cargo feature. It is disabled by default so the scaffolding builds on Rust
-> 1.85. Enabling the feature pulls in LanceDB and its dependencies once the
-> toolchain is bumped.
+**Recommendation:** sqlite-vec meets the current scale targets; re-evaluate alternatives like Qdrant only if we outgrow the embedded approach or need advanced filtering.
 
 **Option B: Qdrant (Alternative - More Features)**
 
@@ -408,7 +400,7 @@ arrowhead/
 - Heavier dependencies
 - Overkill for typical vault sizes (<100k notes)
 
-**Recommendation:** Start with LanceDB for simplicity, consider Qdrant for future if advanced features needed.
+**Recommendation:** Ship sqlite-vec for simplicity today and revisit Qdrant or similar if scale or filtering needs exceed what the embedded table can deliver.
 
 **Option C: Custom HNSW + SQLite (Fallback)**
 
@@ -424,7 +416,7 @@ arrowhead/
 
 **Decision Matrix:**
 
-| Feature | LanceDB | Qdrant | Custom |
+| Feature | sqlite-vec | Qdrant | Custom |
 |---------|---------|--------|--------|
 | **Rust Support** | Excellent | Excellent | N/A |
 | **Local Storage** | Native | Embedded mode | Native |
@@ -434,7 +426,7 @@ arrowhead/
 | **Dependencies** | Light | Heavy | Minimal |
 | **Maintenance** | Low | Low | High |
 
-**Final Recommendation:** Use LanceDB for initial implementation.
+**Final Recommendation:** Ship sqlite-vec for the baseline implementation.
 
 ---
 
@@ -455,7 +447,7 @@ arrowhead/
 
 **Optimization:**
 - Parallel processing with configurable worker pool feeding a bounded write queue
-- Dedicated writer task serialises SQLite upserts and LanceDB flushes to avoid pool starvation
+- Dedicated writer task serialises SQLite upserts (including sqlite-vec vector batches) to avoid pool starvation
 - Async embedding generation with semaphore limiting
 
 **Progress Reporting:**
@@ -868,7 +860,7 @@ auto_start_enabled = true
 - Core/CLI/MCP crates laid out with typed modules returning descriptive `todo` errors.
 - CLI command surface and shared config loader implemented.
 - Initial documentation and test harness directories added.
-- Optional `vector-lancedb` feature wired for future LanceDB enablement.
+- Embedding support is built into the default build; no feature flag is required.
 
 ### Phase 1: Core Foundation (Weeks 1-2)
 
@@ -890,7 +882,7 @@ auto_start_enabled = true
 
 **Deliverables:**
 - FTS search with field:value syntax
-- LanceDB integration for vectors
+- sqlite-vec integration for vectors
 - Embedding generation with `fastembed`
 - Semantic search with cosine similarity
 - Hybrid search implementation
@@ -1080,7 +1072,7 @@ This specification provides a blueprint for rewriting Synapse from Swift to Rust
 
 ✅ **Cross-platform CLI** (macOS + Linux)
 ✅ **Daemon-maintained incremental indexing** (notify + mtime-driven)
-✅ **Dedicated vector storage** (LanceDB via optional feature)
+✅ **Dedicated vector storage** (sqlite-vec virtual table inside the main index)
 ✅ **Full search capabilities** (FTS, semantic, hybrid)
 ✅ **WikiLinks graph navigation**
 ✅ **Dual MCP modes** (stdio + HTTP)

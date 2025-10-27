@@ -32,7 +32,7 @@ The stdio transport now exposes a complete Phase‑4 tool surface:
 | Category | Methods | Notes |
 | --- | --- | --- |
 | Graph | `mcp.graph.get_context`, `mcp.graph.get_backlinks`, `mcp.graph.get_forward_links`, `mcp.graph.find_orphans`, `mcp.graph.find_unresolved` | Context methods require the target note to be indexed. Orphan/unresolved reports operate on the cached graph index without querying the daemon. |
-| Search | `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid` | Semantic and hybrid searches require the optional `vector-lancedb` feature. When the feature is disabled the handlers return `ToolDisabled`. |
+| Search | `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid` | Semantic and hybrid searches rely on the embeddings pipeline; handlers return `ToolDisabled` if embeddings failed to initialise. |
 | Notes | `mcp.notes.list`, `mcp.notes.read`, `mcp.notes.metadata`, `mcp.notes.create`, `mcp.notes.update`, `mcp.notes.delete` | Create accepts either `noteId` or `title`. Delete requires `confirm: true`. Metadata updates treat `null` values as removals. |
 | Discovery | `mcp.discovery.get_related_notes`, `mcp.discovery.get_vault_stats`, `mcp.discovery.get_vault_conventions` | Related notes fall back to graph neighbourhood heuristics when semantic vectors are unavailable. Vault stats run on blocking workers to avoid stalling the async runtime. Conventions surface naming patterns, metadata usage, Obsidian settings, and the optional `.arrowhead/STYLE_GUIDE.md`. |
 | Vault | `mcp.vault.status` | Delegates to the Arrowhead daemon control socket and mirrors CLI error handling when the daemon is offline. |

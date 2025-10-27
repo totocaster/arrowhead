@@ -26,7 +26,6 @@ use crate::{
     vault::{normalise_relative_path, normalise_relative_str},
 };
 
-#[cfg(feature = "vector-lancedb")]
 const EMBEDDING_FLUSH_BATCH: usize = 64;
 
 type WriteSender = mpsc::Sender<WriteJob>;
@@ -446,7 +445,6 @@ impl Indexer {
     pub async fn remove_note(&self, note_id: &str) -> Result<bool> {
         let existed = self.database.remove_note(note_id)?;
 
-        #[cfg(feature = "vector-lancedb")]
         if existed {
             if let Some(pipeline) = &self.embeddings {
                 pipeline
@@ -586,31 +584,16 @@ impl Indexer {
         let metadata_count = extraction.metadata.len();
         let link_count = resolved_links.len();
         let embedding = if let Some(pipeline) = &self.embeddings {
-            #[cfg(feature = "vector-lancedb")]
-            {
-                if EmbeddingPipeline::is_supported() {
-                    let context = compose_embedding_text(&note, &extraction);
-                    let vector =
-                        pipeline
-                            .generator()
-                            .embed_document(&context)
-                            .with_context(|| {
-                                format!("failed to generate embedding for note {}", entry.id)
-                            })?;
-                    Some(EmbeddingRecord {
-                        note_id: note.id.clone(),
-                        vector,
-                        indexed_at,
-                    })
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(feature = "vector-lancedb"))]
-            {
-                let _ = pipeline;
-                None
-            }
+            let context = compose_embedding_text(&note, &extraction);
+            let vector = pipeline
+                .generator()
+                .embed_document(&context)
+                .with_context(|| format!("failed to generate embedding for note {}", entry.id))?;
+            Some(EmbeddingRecord {
+                note_id: note.id.clone(),
+                vector,
+                indexed_at,
+            })
         } else {
             None
         };
@@ -780,7 +763,6 @@ async fn run_writer(
     Ok(())
 }
 
-#[cfg(feature = "vector-lancedb")]
 async fn handle_embedding(
     pipeline: &Option<Arc<EmbeddingPipeline>>,
     buffer: &mut Vec<EmbeddingRecord>,
@@ -800,17 +782,6 @@ async fn handle_embedding(
     Ok(())
 }
 
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(clippy::ptr_arg)]
-async fn handle_embedding(
-    _pipeline: &Option<Arc<EmbeddingPipeline>>,
-    _buffer: &mut Vec<EmbeddingRecord>,
-    _embedding: Option<EmbeddingRecord>,
-) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(feature = "vector-lancedb")]
 async fn flush_embedding_buffer(
     pipeline: &Option<Arc<EmbeddingPipeline>>,
     buffer: &mut Vec<EmbeddingRecord>,
@@ -825,15 +796,6 @@ async fn flush_embedding_buffer(
             buffer.clear();
         }
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(clippy::ptr_arg)]
-async fn flush_embedding_buffer(
-    _pipeline: &Option<Arc<EmbeddingPipeline>>,
-    _buffer: &mut Vec<EmbeddingRecord>,
-) -> Result<()> {
     Ok(())
 }
 
@@ -855,7 +817,6 @@ fn extract_aliases(extraction: &MetadataExtraction) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "vector-lancedb")]
 fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) -> String {
     let mut sections = Vec::new();
 

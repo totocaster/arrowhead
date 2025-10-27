@@ -5,11 +5,14 @@ use std::{
     collections::HashMap,
     fs,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Once,
+        atomic::{AtomicI32, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -29,9 +32,11 @@ thread_local! {
 }
 
 static NEXT_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
+static SQLITE_VEC_REGISTER: Once = Once::new();
+static SQLITE_VEC_STATUS: AtomicI32 = AtomicI32::new(rusqlite::ffi::SQLITE_OK);
 
 /// Current schema version for the Arrowhead index database.
-const INDEX_SCHEMA_VERSION: i32 = 3;
+const INDEX_SCHEMA_VERSION: i32 = 4;
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +60,7 @@ impl IndexDatabase {
         let path = path.as_ref().to_path_buf();
         debug!(path = %path.display(), "initialising SQLite index database");
 
+        ensure_sqlite_vec_registered()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create database directory {}", parent.display())
@@ -446,6 +452,38 @@ impl IndexDatabase {
         Ok(result)
     }
 
+    /// Resolve relative paths for the supplied note identifiers.
+    pub fn relative_paths_for_notes(&self, note_ids: &[String]) -> Result<HashMap<String, String>> {
+        let mut result: HashMap<String, String> = HashMap::new();
+        if note_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let conn = self.connection()?;
+        let placeholders = vec!["?"; note_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT id, relative_path FROM notes WHERE id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(note_ids.iter().map(|id| id.as_str())),
+            |row| {
+                let id: String = row.get(0)?;
+                let relative_path: String = row.get(1)?;
+                Ok((id, relative_path))
+            },
+        )?;
+
+        for row in rows {
+            let (id, relative_path) = row?;
+            result.insert(id, relative_path);
+        }
+
+        Ok(result)
+    }
+
     /// Fetch a brief excerpt of the note content for preview purposes.
     pub fn note_excerpt(&self, note_id: &str, limit: usize) -> Result<Option<String>> {
         let conn = self.connection()?;
@@ -469,6 +507,7 @@ impl IndexDatabase {
 }
 
 fn init_connection(conn: &Connection) -> Result<()> {
+    ensure_sqlite_vec_registered()?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to set journal_mode")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -523,12 +562,46 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             tokenize = 'porter unicode61',
             columnsize = 0
         );
+
+        CREATE TABLE IF NOT EXISTS embedding_metadata (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            model_id TEXT NOT NULL,
+            repository TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )
     .context("failed to apply schema migrations")?;
 
     conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
         .context("failed to set schema version")
+}
+
+fn ensure_sqlite_vec_registered() -> Result<()> {
+    SQLITE_VEC_REGISTER.call_once(|| unsafe {
+        type ExtensionEntry = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> i32;
+
+        let entry: ExtensionEntry = std::mem::transmute::<*const (), ExtensionEntry>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        );
+
+        let rc = rusqlite::ffi::sqlite3_auto_extension(Some(entry));
+        SQLITE_VEC_STATUS.store(rc, Ordering::SeqCst);
+    });
+
+    let rc = SQLITE_VEC_STATUS.load(Ordering::SeqCst);
+    if rc != rusqlite::ffi::SQLITE_OK {
+        Err(anyhow!(
+            "failed to register sqlite-vec extension (sqlite rc {rc})"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Connection handle tied to a worker thread for SQLite reuse.
