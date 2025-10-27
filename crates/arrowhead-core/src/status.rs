@@ -13,6 +13,26 @@ use serde::{Deserialize, Serialize};
 /// Version number stored in status files for forward compatibility.
 pub const DEAMON_STATUS_VERSION: u32 = 1;
 
+/// Live status frame emitted whenever the deamon state changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StatusFrame {
+    /// Timestamp capturing when the frame was emitted.
+    pub emitted_at: DateTime<Utc>,
+    /// Complete status snapshot associated with the frame.
+    pub status: DeamonStatus,
+}
+
+impl StatusFrame {
+    /// Construct a new frame from the supplied status snapshot.
+    #[must_use]
+    pub fn new(status: DeamonStatus) -> Self {
+        Self {
+            emitted_at: Utc::now(),
+            status,
+        }
+    }
+}
+
 /// Persisted snapshot of the deamon's health and recent activity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeamonStatus {

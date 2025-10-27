@@ -7,11 +7,10 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use arrowhead_core::{ActivityState, DeamonStatus, IssueSeverity, StatusIssue, Vault, VaultConfig};
+use anyhow::{Context, Result, bail};
+use arrowhead_core::{DeamonStatus, Vault, VaultConfig};
 use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
 use clap::{Args, Subcommand};
-use serde_json::json;
 use tokio::time::{Instant, sleep};
 use tracing::info;
 
@@ -38,8 +37,6 @@ pub struct VaultCommand {
 pub enum VaultAction {
     /// Prepare a vault for the background deamon and optionally launch it.
     Init(VaultInitArgs),
-    /// Query the active deamon and render its status.
-    Status(VaultStatusArgs),
     /// Launch the background deamon, spawning it if necessary.
     Start(VaultStartArgs),
     /// Send a shutdown signal to the deamon and clean up metadata.
@@ -62,14 +59,6 @@ pub struct VaultInitArgs {
     /// Disable semantic indexing when initialising the vault.
     #[arg(long)]
     pub fts_only: bool,
-}
-
-/// Options for `vault status`.
-#[derive(Debug, Args, Clone, PartialEq, Eq)]
-pub struct VaultStatusArgs {
-    /// Emit status as JSON instead of human-readable output.
-    #[arg(long)]
-    pub json: bool,
 }
 
 /// Options for `vault start`.
@@ -103,45 +92,11 @@ pub enum VaultAutostartAction {
 pub async fn run(ctx: &mut CommandContext, command: &VaultCommand) -> Result<()> {
     match &command.action {
         VaultAction::Init(args) => handle_init(ctx, args).await?,
-        VaultAction::Status(args) => handle_status(ctx, args).await?,
         VaultAction::Start(args) => handle_start(ctx, args).await?,
         VaultAction::Stop => handle_stop(ctx).await?,
         VaultAction::Cleanup => handle_cleanup(ctx).await?,
         VaultAction::Autostart(command) => handle_autostart(ctx, command).await?,
     }
-
-    Ok(())
-}
-
-async fn handle_status(ctx: &mut CommandContext, args: &VaultStatusArgs) -> Result<()> {
-    let vault_path = resolve_vault_path(ctx)?;
-    let (_vault, paths) = load_vault_environment(&vault_path)?;
-
-    let status = fetch_status(&paths).await?.ok_or_else(|| {
-        anyhow!("arrowhead deamon is not running. Start it with `arrowhead vault start`")
-    })?;
-
-    let auto_status = auto_start_status(&paths)?;
-
-    if args.json {
-        let payload = json!({
-            "status": &status,
-            "auto_start": auto_start_status_json(&auto_status),
-        });
-        let payload =
-            serde_json::to_string_pretty(&payload).context("failed to render JSON payload")?;
-        println!("{}", payload);
-    } else {
-        render_status(&status, &auto_status);
-    }
-
-    ctx.config.deamon.auto_start_enabled = match auto_status {
-        AutoStartStatus::Enabled { .. } => Some(true),
-        AutoStartStatus::Disabled { .. } => Some(false),
-        AutoStartStatus::Unsupported => ctx.config.deamon.auto_start_enabled,
-    };
-
-    update_config_with_status(ctx, &paths, Some(&status))?;
 
     Ok(())
 }
@@ -574,8 +529,9 @@ fn load_vault_environment(vault_path: &Path) -> Result<(Vault, DeamonPaths)> {
     Ok((vault, paths))
 }
 
+#[cfg(test)]
 async fn fetch_status(paths: &DeamonPaths) -> Result<Option<DeamonStatus>> {
-    match send_control_request(&paths.socket_path, ControlRequest::Status).await {
+    match send_control_request(&paths.socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { status }) => Ok(Some(status)),
         Ok(ControlResponse::Error { message }) => bail!(message),
         Ok(ControlResponse::ShutdownAck) => Ok(None),
@@ -592,7 +548,7 @@ async fn fetch_status(paths: &DeamonPaths) -> Result<Option<DeamonStatus>> {
 }
 
 async fn is_socket_alive(paths: &DeamonPaths) -> Result<bool> {
-    match send_control_request(&paths.socket_path, ControlRequest::Status).await {
+    match send_control_request(&paths.socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { .. }) => Ok(true),
         Ok(ControlResponse::Error { .. }) => Ok(true),
         Ok(ControlResponse::ShutdownAck) => Ok(false),
@@ -611,121 +567,6 @@ fn auto_start_status(paths: &DeamonPaths) -> Result<AutoStartStatus> {
         }
     } else {
         Ok(AutoStartStatus::Unsupported)
-    }
-}
-
-fn auto_start_status_json(status: &AutoStartStatus) -> serde_json::Value {
-    match status {
-        AutoStartStatus::Enabled { provider, active } => json!({
-            "enabled": true,
-            "provider": provider_label(*provider),
-            "active": active,
-        }),
-        AutoStartStatus::Disabled { provider } => json!({
-            "enabled": false,
-            "provider": provider_label(*provider),
-        }),
-        AutoStartStatus::Unsupported => json!({
-            "enabled": false,
-            "supported": false,
-        }),
-    }
-}
-
-fn render_status(status: &DeamonStatus, auto: &AutoStartStatus) {
-    println!(
-        "arrowhead deamon status (updated {})",
-        status.updated_at.to_rfc3339()
-    );
-    let activity_label = status
-        .activity
-        .description
-        .as_deref()
-        .unwrap_or_else(|| describe_activity(status.activity.state));
-    println!("  Activity: {}", activity_label);
-    if let Some(note) = &status.activity.note_id {
-        println!("  Current note: {}", note);
-    }
-    if status.activity.queued_jobs > 0 {
-        println!("  Queued jobs: {}", status.activity.queued_jobs);
-    }
-    println!("  Indexed notes: {}", status.indexed_notes);
-    println!("  Error notes: {}", status.error_notes);
-    println!("  Log file: {}", status.log_path.display());
-    match auto {
-        AutoStartStatus::Enabled { provider, active } => {
-            let label = provider_label(*provider);
-            let activity = if *active { "active" } else { "inactive" };
-            println!("  Auto-start: enabled via {label} ({activity})");
-        }
-        AutoStartStatus::Disabled { provider } => {
-            let label = provider_label(*provider);
-            println!("  Auto-start: disabled ({label})");
-        }
-        AutoStartStatus::Unsupported => {
-            println!("  Auto-start: unsupported on this platform");
-        }
-    }
-
-    if status.downloads.is_empty() {
-        println!("  Downloads: none");
-    } else {
-        println!("  Downloads:");
-        for download in &status.downloads {
-            println!(
-                "    - {} ({:?}) {}/{}",
-                download.item,
-                download.state,
-                download.bytes_downloaded,
-                download
-                    .bytes_total
-                    .map(|total| total.to_string())
-                    .unwrap_or_else(|| "?".to_string())
-            );
-            if let Some(message) = &download.message {
-                println!("      {}", message);
-            }
-        }
-    }
-
-    if status.issues.is_empty() {
-        println!("  Issues: none");
-    } else {
-        println!("  Issues:");
-        for issue in &status.issues {
-            print_issue(issue);
-        }
-    }
-}
-
-fn print_issue(issue: &StatusIssue) {
-    println!(
-        "    - [{}] {}: {} (at {})",
-        severity_label(issue.severity),
-        issue.code,
-        issue.message,
-        issue.occurred_at.to_rfc3339()
-    );
-    if let Some(detail) = &issue.detail {
-        println!("      {}", detail);
-    }
-}
-
-fn describe_activity(state: ActivityState) -> &'static str {
-    match state {
-        ActivityState::Idle => "idle",
-        ActivityState::Indexing => "indexing",
-        ActivityState::Removing => "removing stale notes",
-        ActivityState::Downloading => "downloading assets",
-        ActivityState::Faulted => "faulted",
-    }
-}
-
-fn severity_label(severity: IssueSeverity) -> &'static str {
-    match severity {
-        IssueSeverity::Info => "info",
-        IssueSeverity::Warning => "warning",
-        IssueSeverity::Error => "error",
     }
 }
 
@@ -1042,23 +883,5 @@ mod tests {
         assert!(ctx.config.deamon.socket_path.is_some());
         assert!(ctx.config.deamon.status_path.is_some());
         assert_eq!(ctx.config.deamon.auto_start_enabled, Some(false));
-    }
-
-    #[test]
-    fn auto_start_status_json_handles_enabled_state() {
-        let value = auto_start_status_json(&AutoStartStatus::Enabled {
-            provider: AutoStartProvider::SystemdUser,
-            active: true,
-        });
-        assert_eq!(value["enabled"], true);
-        assert_eq!(value["provider"], "systemd --user");
-        assert_eq!(value["active"], true);
-    }
-
-    #[test]
-    fn auto_start_status_json_handles_unsupported_state() {
-        let value = auto_start_status_json(&AutoStartStatus::Unsupported);
-        assert_eq!(value["enabled"], false);
-        assert_eq!(value["supported"], false);
     }
 }

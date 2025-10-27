@@ -695,6 +695,7 @@ COMMANDS:
     search                  Search notes (delegates to the deamon-maintained index)
     notes                   Note operations
     graph                   Graph navigation
+    status                  Stream live daemon activity and health
     vault                   Vault management commands
 ```
 
@@ -778,6 +779,17 @@ Navigate WikiLinks relationships.
 **Common Options:**
 - `--json`: Output as JSON
 
+#### `status` - Live Daemon Status
+
+Stream real-time activity frames from the background deamon.
+
+**Behaviour:**
+- Connects to the control socket and renders updates until interrupted (`Ctrl+C`).
+- Falls back to the persisted `status.json` snapshot when the socket is unavailable.
+
+**Options:**
+- `--json`: Emit newline-delimited `StatusFrame` JSON objects for downstream tooling.
+
 #### `vault` - Vault Management
 
 Manage the background deamon and Arrowhead working directories.
@@ -785,7 +797,6 @@ Manage the background deamon and Arrowhead working directories.
 **Subcommands:**
 - `init`: Prepare `.arrowhead/` directories and (by default) launch the deamon
 - `start`: Launch or relaunch the deamon, waiting for the control socket
-- `status`: Query the control socket or fallback status file for health and progress
 - `stop`: Request a graceful shutdown via the control socket
 - `cleanup`: Stop the deamon if running, then remove `.arrowhead/` caches (index, vectors, logs, status, socket, PID)
 

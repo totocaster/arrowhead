@@ -28,7 +28,7 @@ pub use indexer::IndexProgressEvent;
 pub use search::{SearchConfig, SearchResult, SearchService};
 pub use status::{
     ActivityState, ActivityStatus, DEAMON_STATUS_VERSION, DeamonStatus, DownloadState,
-    DownloadStatus, IssueSeverity, StatusIssue,
+    DownloadStatus, IssueSeverity, StatusFrame, StatusIssue,
 };
 pub use types::{IndexingStats, MetadataMap, NoteId, NoteRecord, VaultPaths};
 pub use vault::{InventorySnapshot, Vault, VaultConfig, VaultSettings};

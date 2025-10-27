@@ -12,7 +12,7 @@ use arrowhead_core::{
     ActivityState, DeamonStatus,
     sqlite::{IndexDatabase, NoteIndexState},
 };
-use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy};
+use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy, status_stream};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
@@ -117,6 +117,78 @@ async fn control_socket_status_and_shutdown() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    handle.shutdown().await?;
+    drop(temp_dir);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_stream_emits_frames() -> Result<()> {
+    let _log_guard = TEST_LOG_MUTEX.lock().await;
+    let (temp_dir, vault_root) = prepare_vault()?;
+
+    let handle = DeamonRuntimeBuilder::new(&vault_root)
+        .disable_embeddings()
+        .watcher_strategy(WatcherStrategy::Poll {
+            interval: Duration::from_millis(50),
+        })
+        .spawn()
+        .await?;
+
+    wait_for_socket(handle.socket_path()).await?;
+
+    let mut stream = status_stream(handle.socket_path()).await?;
+
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .context("timed out waiting for first status frame")??
+        .context("daemon closed stream before emitting a frame")?;
+
+    assert!(
+        matches!(
+            first.status.activity.state,
+            ActivityState::Idle
+                | ActivityState::Indexing
+                | ActivityState::Downloading
+                | ActivityState::Removing
+        ),
+        "unexpected activity state {:?}",
+        first.status.activity.state
+    );
+
+    let note_path = vault_root.join("Minimal Note.md");
+    let mut content = fs::read_to_string(&note_path)?;
+    content.push_str("\n\nStreaming status test update.\n");
+    fs::write(&note_path, content)?;
+
+    let indexing_frame = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .context("timed out waiting for follow-up status frame")??
+        .context("daemon closed stream before emitting follow-up frame")?;
+
+    assert!(
+        indexing_frame.emitted_at >= first.emitted_at,
+        "status frames should be monotonic"
+    );
+    assert!(
+        matches!(
+            indexing_frame.status.activity.state,
+            ActivityState::Indexing
+        ),
+        "expected indexing state after modifying a note, got {:?}",
+        indexing_frame.status.activity.state
+    );
+
+    let idle_frame = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .context("timed out waiting for idle status frame")??
+        .context("daemon closed stream before emitting idle frame")?;
+    assert!(
+        matches!(idle_frame.status.activity.state, ActivityState::Idle),
+        "expected daemon to return to idle state after processing watcher batch"
+    );
 
     handle.shutdown().await?;
     drop(temp_dir);

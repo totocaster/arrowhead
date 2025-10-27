@@ -887,7 +887,7 @@ impl DaemonClient {
 
     /// Fetch the latest deamon status, falling back to the cached status file.
     pub async fn status(&self) -> Result<DeamonStatus> {
-        match send_control_request(&self.socket_path, ControlRequest::Status).await {
+        match send_control_request(&self.socket_path, ControlRequest::StatusSnapshot).await {
             Ok(ControlResponse::Status { status }) => Ok(status),
             Ok(ControlResponse::Error { message }) => {
                 bail!("arrowhead deamon reported an error: {message}");

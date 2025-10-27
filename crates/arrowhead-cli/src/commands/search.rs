@@ -150,7 +150,7 @@ async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<Deam
         .clone()
         .unwrap_or(default_socket);
 
-    match send_control_request(&socket_path, ControlRequest::Status).await {
+    match send_control_request(&socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { status }) => Ok(status),
         Ok(ControlResponse::Error { message }) => {
             bail!("arrowhead deamon reported an error: {message}")

@@ -531,7 +531,7 @@ impl Vault {
             entries.push(entry);
         }
 
-        info!(count = entries.len(), "completed vault inventory build");
+        debug!(count = entries.len(), "completed vault inventory build");
         Ok(entries)
     }
 

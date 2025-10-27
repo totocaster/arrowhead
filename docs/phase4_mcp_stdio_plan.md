@@ -22,7 +22,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
 - `arrowhead --mcp` starts a long-running process that speaks MCP over stdio.
 - The transport validates JSON-RPC envelopes, correlates requests/responses,
   and surfaces well-typed errors.
-- Core tools are exposed: vault status, note content fetch, FTS search,
+- Core tools are exposed: live status streaming, note content fetch, FTS search,
   semantic search (when enabled), graph context/backlinks/forward links,
   and metadata lookup.
 - The server shares index + graph state with the existing daemon-driven
@@ -47,7 +47,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
    - `mcp.graph.get_context` (combined forward/back/unresolved).
    - `mcp.graph.get_backlinks` / `mcp.graph.get_forward_links`.
    - `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid`.
-   - `mcp.vault.status` (align with `arrowhead vault status --json`).
+   - `mcp.vault.status` (align with `arrowhead status --json`).
    - `mcp.notes.read`, `mcp.notes.list`, `mcp.notes.metadata`.
    - Feature-gated `mcp.search.semantic` when `vector-lancedb` is disabled.
    - Request validation (note IDs, pagination, vault path) with actionable

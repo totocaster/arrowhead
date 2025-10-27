@@ -76,15 +76,15 @@
      - Maintain install status in `.arrowhead/deamon/autostart/` for troubleshooting,
        and ensure `vault cleanup` removes these units and marks them disabled.
      - After launching, inform the user that the first indexing pass may take time and
-       direct them to `arrowhead vault status` for live progress.
+      direct them to `arrowhead status` for live progress.
 
 3. **CLI Integration**
    - Expand `arrowhead vault` subcommands:
      - `vault init` – ensures vault directories, performs initial index, launches the
        deamon detached, registers auto-start, and persists socket/pid metadata. Prompts
        the user for auto-start consent and reminds them to allow the deamon time to
-       finish the first indexing pass (monitor via `vault status`).
-     - `vault status` – queries the Unix socket; if unavailable, reads `status.json`
+      finish the first indexing pass (monitor via `arrowhead status`).
+    - `status` – subscribes to the Unix socket stream; if unavailable, reads `status.json`
        to report vault + deamon health, indexed-vs-error counts, current activity,
        download progress/issues, log file location, indexing lag, and auto-start status.
      - `vault start` – starts (or restarts) the deamon and verifies the socket.
@@ -93,15 +93,15 @@
      - `vault cleanup` – stops the deamon, removes `.arrowhead` caches (index.db,
        vectors, logs, status, socket, PID, autostart metadata), and uninstalls launch
        agents while leaving raw vault notes untouched.
-  - `arrowhead init` delegates to `vault init` and runs the full interactive setup
-    (auto-start prompt + deamon launch). Once the control socket is ready the
-    command returns immediately while `arrowheadd` completes the initial crawl in the
-    background; users can monitor progress via `arrowhead vault status`. Pass
+ - `arrowhead init` delegates to `vault init` and runs the full interactive setup
+   (auto-start prompt + deamon launch). Once the control socket is ready the
+   command returns immediately while `arrowheadd` completes the initial crawl in the
+    background; users can monitor progress via `arrowhead status`. Pass
     `--no-start` to skip launching in bespoke deployments.
    - Update `search`/`notes`/future commands to:
      - Skip `ensure_index_fresh`; instead, query deamon status before operations. If
        the socket is unavailable or returns an error—or `status.json` lists outstanding
-       issues—commands fail fast with guidance to run `arrowhead vault status`.
+       issues—commands fail fast with guidance to run `arrowhead status`.
      - Continue handling vault I/O (e.g., note CRUD); rely on the watcher for
        subsequent indexing. No direct reindex calls from CLI in steady state.
    - Extend `AppConfig` with `deamon` preferences (socket path override, auto-start
@@ -112,7 +112,7 @@
      rename handling.
    - Integration tests using temp vaults + `notify::PollWatcher` to simulate file
      changes and assert deamon responses, status updates, and logging separation.
-   - CLI smoke tests for `vault status/start/stop/cleanup`, spawning the deamon as a
+  - CLI smoke tests for `status` plus `vault start/stop/cleanup`, spawning the deamon as a
      child process under tests and ensuring cleanup on panic.
    - Platform tests (behind feature flags) that validate `launchd` plist generation
      and `systemd` units compile and round-trip.

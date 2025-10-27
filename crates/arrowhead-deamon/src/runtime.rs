@@ -14,8 +14,8 @@ use arrowhead_core::embeddings::EmbeddingPipeline;
 use arrowhead_core::indexer::{Indexer, IndexerConfig};
 use arrowhead_core::sqlite::IndexDatabase;
 use arrowhead_core::{
-    ActivityState, ActivityStatus, DeamonStatus, DownloadState, DownloadStatus, InventorySnapshot,
-    IssueSeverity, StatusIssue, Vault, VaultConfig,
+    ActivityState, ActivityStatus, DeamonStatus, DownloadState, DownloadStatus, IssueSeverity,
+    StatusFrame, StatusIssue, Vault, VaultConfig,
 };
 #[cfg(feature = "vector-lancedb")]
 use fastembed::{EmbeddingModel, ModelTrait};
@@ -175,7 +175,7 @@ impl DeamonHandle {
 
     /// Query the runtime over the control socket.
     pub async fn request_status(&self) -> Result<DeamonStatus> {
-        match send_control_request(&self.socket_path, ControlRequest::Status).await? {
+        match send_control_request(&self.socket_path, ControlRequest::StatusSnapshot).await? {
             ControlResponse::Status { status } => Ok(status),
             ControlResponse::Error { message } => Err(anyhow!(message)),
             ControlResponse::ShutdownAck => Err(anyhow!("unexpected shutdown acknowledgement")),
@@ -222,6 +222,7 @@ struct DeamonRuntime {
     config: DeamonConfig,
     indexer: Option<Arc<Indexer>>,
     status: Arc<Mutex<DeamonStatus>>,
+    frame_tx: broadcast::Sender<StatusFrame>,
     _watcher: WatcherHandle,
     event_rx: mpsc::Receiver<Vec<PathBuf>>,
     shutdown_tx: broadcast::Sender<()>,
@@ -242,13 +243,16 @@ impl DeamonRuntime {
 
         let status_snapshot = DeamonStatus::new(config.log_path.clone());
         status_snapshot.save_to_path(&config.status_path)?;
-        let status = Arc::new(Mutex::new(status_snapshot));
+        let status = Arc::new(Mutex::new(status_snapshot.clone()));
+        let (frame_tx, _) = broadcast::channel(256);
+        let _ = frame_tx.send(StatusFrame::new(status_snapshot));
         let (shutdown_tx, _) = broadcast::channel(8);
 
         Ok(Self {
             config,
             indexer: None,
             status,
+            frame_tx,
             _watcher: watcher,
             event_rx,
             shutdown_tx,
@@ -279,10 +283,12 @@ impl DeamonRuntime {
             let status = Arc::clone(&self.status);
             let shutdown_tx = self.shutdown_tx.clone();
             let socket_path = self.config.socket_path.clone();
+            let frames = self.frame_tx.clone();
             tokio::spawn(async move {
                 run_control_server(
                     socket_path,
                     status,
+                    frames,
                     shutdown_tx.clone(),
                     shutdown_tx.subscribe(),
                 )
@@ -360,6 +366,7 @@ impl DeamonRuntime {
 
         let status = Arc::clone(&self.status);
         let status_path = self.config.status_path.clone();
+        let frame_tx = self.frame_tx.clone();
         let handle = tokio::runtime::Handle::current();
         let throttle = Arc::new(StdMutex::new(Instant::now()));
 
@@ -386,30 +393,29 @@ impl DeamonRuntime {
 
                 let status = Arc::clone(&status);
                 let status_path = status_path.clone();
+                let frame_tx = frame_tx.clone();
                 let event = event.clone();
                 handle.spawn(async move {
                     let remaining = event.total.saturating_sub(event.processed);
                     let note_id = event.note_id.clone();
                     let description =
                         format!("indexing note {} of {}", event.processed, event.total);
-                    if let Err(err) = persist_status_to_path(&status, &status_path, |snapshot| {
-                        snapshot.activity.note_id = Some(note_id.clone());
-                        snapshot.activity.queued_jobs = remaining as usize;
-                        snapshot.activity.description = Some(description.clone());
-                        snapshot.indexed_notes = event.processed;
-                    })
-                    .await
+                    if let Err(err) =
+                        persist_status_to_path(&status, &status_path, Some(&frame_tx), |snapshot| {
+                            snapshot.activity.note_id = Some(note_id.clone());
+                            snapshot.activity.queued_jobs = remaining as usize;
+                            snapshot.activity.description = Some(description.clone());
+                            snapshot.indexed_notes = event.processed;
+                        })
+                        .await
                     {
                         debug!(error = ?err, "failed to persist indexing progress status");
                     }
                 });
             })
             .await?;
-        let snapshot: InventorySnapshot = self.config.vault.inventory_snapshot()?;
-        let indexed_notes = snapshot.entries().len() as u64;
-
         self.persist_status(|status| {
-            status.indexed_notes = indexed_notes;
+            status.indexed_notes = stats.total_notes;
             update_index_error_issue(status, stats.errors);
             status.activity = ActivityStatus::idle();
         })
@@ -431,7 +437,12 @@ impl DeamonRuntime {
             return Ok(());
         }
 
-        let embeddings = prepare_embeddings(&self.config, Arc::clone(&self.status)).await?;
+        let embeddings = prepare_embeddings(
+            &self.config,
+            Arc::clone(&self.status),
+            self.frame_tx.clone(),
+        )
+        .await?;
         self.indexer = Some(Arc::new(Indexer::new(
             Arc::clone(&self.config.vault),
             Arc::clone(&self.config.database),
@@ -442,25 +453,16 @@ impl DeamonRuntime {
     }
 
     async fn process_paths(&self, paths: Vec<PathBuf>, queued_jobs: usize) -> Result<()> {
-        let snapshot: InventorySnapshot = self.config.vault.inventory_snapshot()?;
         let mut targets = HashSet::new();
 
         for path in paths {
-            if let Some(entry) = snapshot.get_by_path(&path) {
+            if let Some(entry) = self.config.vault.inventory_entry_for_path(&path)? {
                 targets.insert(entry.absolute_path.clone());
                 continue;
             }
 
             if let Some((_, relative)) = self.config.vault.normalise_note_path(&path) {
-                let absolute = self.config.vault.note_path(relative);
-                targets.insert(absolute);
-                continue;
-            }
-
-            if let Some(note_id) = snapshot.note_id_for_path(&path) {
-                let mut relative = PathBuf::from(&note_id);
-                relative.set_extension("md");
-                let absolute = snapshot.paths().root.join(relative);
+                let absolute = self.config.vault.note_path(&relative);
                 targets.insert(absolute);
             }
         }
@@ -532,7 +534,13 @@ impl DeamonRuntime {
     where
         F: FnMut(&mut DeamonStatus),
     {
-        persist_status_to_path(&self.status, &self.config.status_path, update).await
+        persist_status_to_path(
+            &self.status,
+            &self.config.status_path,
+            Some(&self.frame_tx),
+            update,
+        )
+        .await
     }
 }
 
@@ -540,6 +548,7 @@ impl DeamonRuntime {
 async fn prepare_embeddings(
     config: &DeamonConfig,
     status: Arc<Mutex<DeamonStatus>>,
+    frame_tx: broadcast::Sender<StatusFrame>,
 ) -> Result<Option<Arc<EmbeddingPipeline>>> {
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -559,7 +568,7 @@ async fn prepare_embeddings(
             model = model_id.as_str(),
             "semantic indexing requested but embedding pipeline not supported in this build"
         );
-        record_embedding_unavailable(&status, &config.status_path, &model_id).await?;
+        record_embedding_unavailable(&status, &config.status_path, &frame_tx, &model_id).await?;
         return Ok(None);
     }
 
@@ -589,7 +598,7 @@ async fn prepare_embeddings(
         )
     })?;
 
-    persist_status_to_path(&status, &config.status_path, |snapshot| {
+    persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
         snapshot
             .downloads
             .retain(|entry| !entry.item.starts_with(descriptor.identifier()));
@@ -607,6 +616,7 @@ async fn prepare_embeddings(
         &descriptor,
         Arc::clone(&status),
         config.status_path.clone(),
+        frame_tx.clone(),
         rx,
     )
     .await?;
@@ -627,7 +637,7 @@ async fn prepare_embeddings(
                 "embedding download task panicked"
             );
         }
-        persist_status_to_path(&status, &config.status_path, |snapshot| {
+        persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
             if snapshot.activity.state == ActivityState::Downloading
                 || snapshot.activity.state == ActivityState::Faulted
             {
@@ -646,9 +656,15 @@ async fn prepare_embeddings(
                 model = descriptor.identifier(),
                 "embedding download failed"
             );
-            record_embedding_failure(&status, &config.status_path, &descriptor, err.to_string())
-                .await?;
-            persist_status_to_path(&status, &config.status_path, |snapshot| {
+            record_embedding_failure(
+                &status,
+                &config.status_path,
+                &descriptor,
+                &frame_tx,
+                err.to_string(),
+            )
+            .await?;
+            persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
                 snapshot.activity = ActivityStatus::idle();
             })
             .await?;
@@ -664,10 +680,11 @@ async fn prepare_embeddings(
                 &status,
                 &config.status_path,
                 &descriptor,
+                &frame_tx,
                 format!("download task panicked: {err}"),
             )
             .await?;
-            persist_status_to_path(&status, &config.status_path, |snapshot| {
+            persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
                 snapshot.activity = ActivityStatus::idle();
             })
             .await?;
@@ -678,7 +695,7 @@ async fn prepare_embeddings(
     match EmbeddingPipeline::initialise(&config.vault, &model_id).await {
         Ok(pipeline) => {
             if pipeline.model_changed() {
-                persist_status_to_path(&status, &config.status_path, |snapshot| {
+                persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
                     if let Some(entry) = snapshot
                         .downloads
                         .iter_mut()
@@ -689,7 +706,7 @@ async fn prepare_embeddings(
                 })
                 .await?;
             }
-            persist_status_to_path(&status, &config.status_path, |snapshot| {
+            persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
                 if snapshot.activity.state == ActivityState::Downloading
                     || snapshot.activity.state == ActivityState::Faulted
                 {
@@ -709,9 +726,15 @@ async fn prepare_embeddings(
                 model = descriptor.identifier(),
                 "failed to initialise embedding pipeline"
             );
-            record_embedding_failure(&status, &config.status_path, &descriptor, err.to_string())
-                .await?;
-            persist_status_to_path(&status, &config.status_path, |snapshot| {
+            record_embedding_failure(
+                &status,
+                &config.status_path,
+                &descriptor,
+                &frame_tx,
+                err.to_string(),
+            )
+            .await?;
+            persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
                 snapshot.activity = ActivityStatus::idle();
             })
             .await?;
@@ -881,6 +904,7 @@ async fn consume_download_events(
     descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
     status: Arc<Mutex<DeamonStatus>>,
     status_path: PathBuf,
+    frame_tx: broadcast::Sender<StatusFrame>,
     mut rx: UnboundedReceiver<DownloadEvent>,
 ) -> Result<bool> {
     let mut failed = false;
@@ -889,7 +913,7 @@ async fn consume_download_events(
         match event {
             DownloadEvent::Started { item, total } => {
                 info!(item = %item, total = total.unwrap_or(0), "embedding download started");
-                persist_status_to_path(&status, &status_path, |snapshot| {
+                persist_status_to_path(&status, &status_path, Some(&frame_tx), |snapshot| {
                     if snapshot.activity.state != ActivityState::Downloading {
                         snapshot.activity =
                             ActivityStatus::running(ActivityState::Downloading, None, 0);
@@ -911,7 +935,7 @@ async fn consume_download_events(
                 downloaded,
                 total,
             } => {
-                persist_status_to_path(&status, &status_path, |snapshot| {
+                persist_status_to_path(&status, &status_path, Some(&frame_tx), |snapshot| {
                     let entry = ensure_download_entry(snapshot, &item);
                     entry.state = DownloadState::InProgress;
                     entry.bytes_total = entry.bytes_total.or(total);
@@ -926,7 +950,7 @@ async fn consume_download_events(
                 cached,
             } => {
                 info!(item = %item, cached, downloaded, "embedding download completed");
-                persist_status_to_path(&status, &status_path, |snapshot| {
+                persist_status_to_path(&status, &status_path, Some(&frame_tx), |snapshot| {
                     let entry = ensure_download_entry(snapshot, &item);
                     entry.state = DownloadState::Completed;
                     entry.bytes_total = entry.bytes_total.or(total).or(Some(downloaded));
@@ -943,7 +967,7 @@ async fn consume_download_events(
                 failed = true;
                 let descriptor_id = descriptor.identifier().to_string();
                 warn!(item = %item, error = %message, "embedding download failed");
-                persist_status_to_path(&status, &status_path, move |snapshot| {
+                persist_status_to_path(&status, &status_path, Some(&frame_tx), move |snapshot| {
                     let entry = ensure_download_entry(snapshot, &item);
                     entry.state = DownloadState::Failed;
                     entry.message = Some(message.clone());
@@ -991,10 +1015,11 @@ async fn record_embedding_failure(
     status: &Arc<Mutex<DeamonStatus>>,
     status_path: &Path,
     descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
+    frame_tx: &broadcast::Sender<StatusFrame>,
     detail: String,
 ) -> Result<()> {
     let descriptor_id = descriptor.identifier().to_string();
-    persist_status_to_path(status, status_path, move |snapshot| {
+    persist_status_to_path(status, status_path, Some(frame_tx), move |snapshot| {
         snapshot
             .issues
             .retain(|issue| issue.code != EMBEDDING_INIT_ISSUE_CODE);
@@ -1023,9 +1048,10 @@ async fn record_embedding_failure(
 async fn record_embedding_unavailable(
     status: &Arc<Mutex<DeamonStatus>>,
     status_path: &Path,
+    frame_tx: &broadcast::Sender<StatusFrame>,
     model_id: &str,
 ) -> Result<()> {
-    persist_status_to_path(status, status_path, |snapshot| {
+    persist_status_to_path(status, status_path, Some(frame_tx), |snapshot| {
         snapshot
             .issues
             .retain(|issue| issue.code != EMBEDDINGS_UNAVAILABLE_ISSUE_CODE);
@@ -1062,6 +1088,7 @@ async fn record_embedding_unavailable(
 async fn prepare_embeddings(
     config: &DeamonConfig,
     status: Arc<Mutex<DeamonStatus>>,
+    frame_tx: broadcast::Sender<StatusFrame>,
 ) -> Result<Option<Arc<EmbeddingPipeline>>> {
     if let Some(model_id) = config.embedding_model.as_ref().and_then(|value| {
         let trimmed = value.trim();
@@ -1075,7 +1102,7 @@ async fn prepare_embeddings(
             model = model_id.as_str(),
             "semantic embeddings requested but the binary was built without LanceDB support"
         );
-        record_embedding_unavailable(&status, &config.status_path, &model_id).await?;
+        record_embedding_unavailable(&status, &config.status_path, &frame_tx, &model_id).await?;
     }
     Ok(None)
 }
@@ -1083,6 +1110,7 @@ async fn prepare_embeddings(
 async fn persist_status_to_path<F>(
     status: &Arc<Mutex<DeamonStatus>>,
     path: &Path,
+    frame_tx: Option<&broadcast::Sender<StatusFrame>>,
     mut update: F,
 ) -> Result<()>
 where
@@ -1093,7 +1121,13 @@ where
     guard.touch();
     guard
         .save_to_path(path)
-        .context("failed to persist deamon status")
+        .context("failed to persist deamon status")?;
+    let snapshot = guard.clone();
+    drop(guard);
+    if let Some(tx) = frame_tx {
+        let _ = tx.send(StatusFrame::new(snapshot));
+    }
+    Ok(())
 }
 
 const INDEX_ERROR_CODE: &str = "index_errors";
