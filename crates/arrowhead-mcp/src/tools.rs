@@ -114,8 +114,12 @@ pub struct SearchResultPayload {
     pub title: Option<String>,
     /// Combined relevance score reported by the search engine.
     pub score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     /// Raw BM25 rank returned by the FTS index (lower is better).
-    pub bm25: f32,
+    pub bm25: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Relative path of the note within the vault.
+    pub relative_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional preview snippet generated from the note content.
     pub preview: Option<String>,
@@ -133,7 +137,8 @@ impl SearchResultPayload {
             note_id: result.note_id.clone(),
             title: result.title.clone(),
             score: result.score,
-            bm25: result.bm25,
+            bm25: result.bm25_score(),
+            relative_path: result.relative_path.clone(),
             preview: result.preview.clone(),
             reason: result.reason.clone(),
             metadata: result.metadata.clone(),

@@ -452,6 +452,38 @@ impl IndexDatabase {
         Ok(result)
     }
 
+    /// Resolve relative paths for the supplied note identifiers.
+    pub fn relative_paths_for_notes(&self, note_ids: &[String]) -> Result<HashMap<String, String>> {
+        let mut result: HashMap<String, String> = HashMap::new();
+        if note_ids.is_empty() {
+            return Ok(result);
+        }
+
+        let conn = self.connection()?;
+        let placeholders = vec!["?"; note_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT id, relative_path FROM notes WHERE id IN ({})",
+            placeholders
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(note_ids.iter().map(|id| id.as_str())),
+            |row| {
+                let id: String = row.get(0)?;
+                let relative_path: String = row.get(1)?;
+                Ok((id, relative_path))
+            },
+        )?;
+
+        for row in rows {
+            let (id, relative_path) = row?;
+            result.insert(id, relative_path);
+        }
+
+        Ok(result)
+    }
+
     /// Fetch a brief excerpt of the note content for preview purposes.
     pub fn note_excerpt(&self, note_id: &str, limit: usize) -> Result<Option<String>> {
         let conn = self.connection()?;

@@ -22,6 +22,8 @@ pub struct SearchResult {
     pub score: f32,
     /// Raw BM25 rank reported by SQLite (lower is better).
     pub bm25: f32,
+    /// Relative path of the note within the vault, when known.
+    pub relative_path: Option<String>,
     /// Optional snippet or preview text.
     pub preview: Option<String>,
     /// High-level explanation of why this result ranked where it did.
@@ -39,10 +41,20 @@ impl SearchResult {
             note_id,
             score: 0.0,
             bm25: f32::MAX,
+            relative_path: None,
             preview: None,
             reason: None,
             metadata: MetadataMap::default(),
             title: None,
+        }
+    }
+
+    /// Normalised BM25 score that omits sentinel values.
+    pub fn bm25_score(&self) -> Option<f32> {
+        if !self.bm25.is_finite() || self.bm25 == f32::MAX {
+            None
+        } else {
+            Some(self.bm25)
         }
     }
 }
@@ -126,6 +138,7 @@ impl SearchService {
                     note_id: item.note_id,
                     score: rank_to_score(item.rank),
                     bm25,
+                    relative_path: Some(item.relative_path),
                     preview: item.snippet,
                     reason,
                     metadata,
@@ -190,6 +203,10 @@ impl SearchService {
             .database
             .titles_for_notes(&note_ids)
             .context("failed to load note titles for semantic results")?;
+        let relative_path_map = self
+            .database
+            .relative_paths_for_notes(&note_ids)
+            .context("failed to load note paths for semantic results")?;
 
         let mut results = Vec::new();
         for item in matches.into_iter().take(limit) {
@@ -203,6 +220,7 @@ impl SearchService {
                 .cloned()
                 .unwrap_or_default();
             let title = title_map.get(&item.note_id).cloned().unwrap_or(None);
+            let relative_path = relative_path_map.get(&item.note_id).cloned();
             let preview = self
                 .database
                 .note_excerpt(&item.note_id, 240)
@@ -212,6 +230,7 @@ impl SearchService {
                 note_id: item.note_id,
                 score: similarity,
                 bm25: f32::MAX,
+                relative_path,
                 preview,
                 reason: Some(format!("Semantic similarity {:.2}", similarity)),
                 metadata,
@@ -307,6 +326,10 @@ impl SearchService {
             .database
             .titles_for_notes(&missing_ids)
             .context("failed to load note titles for hybrid search results")?;
+        let relative_path_map = self
+            .database
+            .relative_paths_for_notes(&missing_ids)
+            .context("failed to load note paths for hybrid search results")?;
 
         let mut excerpt_map = HashMap::new();
         for note_id in &missing_ids {
@@ -343,11 +366,13 @@ impl SearchService {
                     if combined_score >= self.config.semantic_threshold {
                         let metadata = metadata_map.get(&note_id).cloned().unwrap_or_default();
                         let title = title_map.get(&note_id).cloned().unwrap_or(None);
+                        let relative_path = relative_path_map.get(&note_id).cloned();
                         let preview = excerpt_map.remove(&note_id).unwrap_or(None);
                         results.push(SearchResult {
                             note_id,
                             score: combined_score,
                             bm25: f32::MAX,
+                            relative_path,
                             preview,
                             reason: Some(format!("Semantic similarity {:.2}", semantic)),
                             metadata,
