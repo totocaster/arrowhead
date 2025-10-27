@@ -43,7 +43,7 @@ flowchart TB
     RemoteClient --> MCPHTTP
 ```
 
-Arrowhead Core runtime watches your vault, streams changes into a bounded writer queue, and persists both text and vector indexes without taking ownership of your files. Arrowhead clients—the CLI and the MCP transports—sit on top of that runtime, reading directly from the shared index to serve both local workflows and remote agent requests.
+The Arrowhead Core runtime watches your vault, streams changes into a bounded writer queue, and persists both text and vector indexes without taking ownership of your files. Arrowhead clients—the CLI and the MCP transports—sit on top of that runtime, reading directly from the shared index to serve both local workflows and remote agent requests.
 
 ## Features
 
@@ -56,26 +56,26 @@ Arrowhead Core runtime watches your vault, streams changes into a bounded writer
 
 ## Quick Start
 
-#### 1. Download arrowhead.
+#### 1. Install Arrowhead.
 
 ```bash
 brew install arrowhead
 ```
 
-#### 2. Navigate to your Obsidian vault and initialize Arrowhead. 
+#### 2. Navigate to your Obsidian vault and initialize Arrowhead.
 
 ```
 arrowhead init
 ```
 
-This will launch and register the daemon that will keep watching your files and keep the index ready for use. Initial indexing might take some time depending on the size of your vault. You can use the `arrowhead vault status` to check it.  
+This command launches and registers the daemon, which watches your files and keeps the index ready to use. Initial indexing might take some time depending on your vault size; run `arrowhead vault status` to monitor progress.
 
-#### 3. Start using Arrowhead
+#### 3. Start using Arrowhead.
 
-* CLI: It is recommended to use a CLI tool when working with coding agents that have access to the terminal (Claide Code, Codex CLI) for performance reasons.
-* MCP: For local remote AI agent instances such as Claude.app, use MCP client. 
+* CLI: Use the CLI when working with coding agents that have terminal access (Claude Code, Codex CLI) for the best performance.
+* MCP: Use the MCP client for local or remote AI agent instances such as Claude.app. 
 
-To cofigure local mcp use this snippet:
+To configure a local MCP client, add this snippet:
 
 ```json
 {
@@ -94,14 +94,14 @@ The daemon keeps semantic search ready by loading the `fastembed` model into an 
 If you only need full-text indexing or want a lighter runtime, disable embeddings:
 
 ```bash
-# Initialise the vault without semantic embeddings
+# Initialize the vault without semantic embeddings
 arrowhead init --fts-only
 
 # Or launch manually with embeddings disabled
 ARROWHEAD_EMBEDDING_MODEL=none arrowhead vault start
 ```
 
-This keeps FTS indexing and search working while skipping the model downloads and heap allocations that normally dominate the daemon’s memory footprint.
+This keeps FTS indexing and search working while skipping the model downloads and heap allocations that normally dominate the daemon's memory footprint.
 
 ## Architecture
 
@@ -147,7 +147,7 @@ cargo test
 ## Usage overview
 
 ```bash
-# Initialise a vault (creates .arrowhead/, prepares index DB, offers auto-start)
+# Initialize a vault (creates .arrowhead/, prepares index DB, offers auto-start)
 arrowhead init --vault /path/to/vault [--embeddings fast|good|better|none] [--fts-only]
 
 # Launch or check the background daemon
@@ -180,7 +180,7 @@ arrowhead graph context "Project Hub" --vault /path/to/vault
 tail -f /path/to/vault/.arrowhead/logs/cli.log
 tail -f /path/to/vault/.arrowhead/logs/daemon.log
 
-# Stop the daemon or clean up Arrowhead artefacts
+# Stop the daemon or clean up Arrowhead artifacts
 arrowhead vault stop
 arrowhead vault cleanup
 
@@ -209,7 +209,7 @@ at your option.
 
 ## Contributing
 
-We welcome issues and pull requests once the Phase 1 foundation is fully stabilised. Start by reading the [rewrite specification](docs/predev_synapse_rust_rewrite.md) and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
+We welcome issues and pull requests once the Phase 1 foundation is fully stabilized. Start by reading the [rewrite specification](docs/predev_synapse_rust_rewrite.md) and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
 
 ## Acknowledgments
 
