@@ -47,7 +47,8 @@ r2d2_sqlite = "0.31.0"
 # Vector dependencies
 fastembed = "5.2.0"
 ndarray = "0.16.1"
-lancedb = { version = "0.21.3", default-features = false }
+sqlite-vec = "0.1.6"
+zerocopy = "0.7"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 
 # HTTP dependencies

@@ -29,9 +29,7 @@ use crate::tools::{
     StyleGuidePayload, VaultConventionsPayload, VaultStatsPayload,
 };
 
-#[cfg(feature = "vector-lancedb")]
 use arrowhead_core::SearchResult;
-#[cfg(feature = "vector-lancedb")]
 use arrowhead_core::embeddings::EmbeddingPipeline;
 
 /// Configuration options used to bootstrap the MCP runtime.
@@ -102,33 +100,31 @@ impl McpRuntime {
         let database = Arc::new(IndexDatabase::open(&db_path)?);
         let graph = GraphService::new(Arc::clone(&database));
 
-        #[cfg(feature = "vector-lancedb")]
-        let (search, semantic_enabled) = {
-            let embeddings = if EmbeddingPipeline::is_supported() {
-                let model_id = options
-                    .embedding_model
-                    .clone()
-                    .unwrap_or_else(|| "fast".to_string());
-                let pipeline = EmbeddingPipeline::initialise(vault.as_ref(), &model_id)
+        let embedding_model = options.embedding_model.as_ref().and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let embeddings = if let Some(model_id) = embedding_model {
+            let pipeline =
+                EmbeddingPipeline::initialise(vault.as_ref(), Arc::clone(&database), &model_id)
                     .await
                     .with_context(|| {
                         format!("failed to prepare embedding pipeline '{model_id}'")
                     })?;
-                Some(Arc::new(pipeline))
-            } else {
-                None
-            };
-            let enabled = embeddings.is_some();
-            (
-                SearchService::new(Arc::clone(&database), SearchConfig::default(), embeddings),
-                enabled,
-            )
+            Some(Arc::new(pipeline))
+        } else {
+            None
         };
-
-        #[cfg(not(feature = "vector-lancedb"))]
-        let (search, semantic_enabled) = (
-            SearchService::new(Arc::clone(&database), SearchConfig::default(), None),
-            false,
+        let semantic_enabled = embeddings.is_some();
+        let search = SearchService::new(
+            Arc::clone(&database),
+            SearchConfig::default(),
+            embeddings.clone(),
         );
 
         let vault_paths = vault.paths().clone();
@@ -420,26 +416,8 @@ impl McpRuntime {
 
         let mut related = match effective_strategy {
             RelatedNotesStrategy::Graph => self.related_notes_graph(&anchor.id, limit).await?,
-            RelatedNotesStrategy::Semantic => {
-                #[cfg(feature = "vector-lancedb")]
-                {
-                    self.related_notes_semantic(&anchor, limit).await?
-                }
-                #[cfg(not(feature = "vector-lancedb"))]
-                {
-                    unreachable!("semantic strategy should be unreachable without LanceDB support");
-                }
-            }
-            RelatedNotesStrategy::Hybrid => {
-                #[cfg(feature = "vector-lancedb")]
-                {
-                    self.related_notes_hybrid(&anchor, limit).await?
-                }
-                #[cfg(not(feature = "vector-lancedb"))]
-                {
-                    unreachable!("hybrid strategy should be unreachable without LanceDB support");
-                }
-            }
+            RelatedNotesStrategy::Semantic => self.related_notes_semantic(&anchor, limit).await?,
+            RelatedNotesStrategy::Hybrid => self.related_notes_hybrid(&anchor, limit).await?,
             RelatedNotesStrategy::Auto => {
                 unreachable!("auto strategy should be resolved before dispatching")
             }
@@ -530,7 +508,6 @@ impl McpRuntime {
             .collect())
     }
 
-    #[cfg(feature = "vector-lancedb")]
     async fn related_notes_semantic(
         &self,
         anchor: &NoteRecord,
@@ -543,7 +520,6 @@ impl McpRuntime {
         ))
     }
 
-    #[cfg(feature = "vector-lancedb")]
     async fn related_notes_hybrid(
         &self,
         anchor: &NoteRecord,
@@ -795,7 +771,6 @@ fn build_obsidian_settings(vault: &Vault) -> Option<ObsidianSettingsPayload> {
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
 fn build_similarity_query(note: &NoteRecord) -> String {
     let mut segments = Vec::new();
     if let Some(title) = &note.title {
@@ -833,7 +808,6 @@ fn build_similarity_query(note: &NoteRecord) -> String {
     query
 }
 
-#[cfg(feature = "vector-lancedb")]
 fn build_related_from_search_results(
     results: Vec<SearchResult>,
     anchor_id: &str,

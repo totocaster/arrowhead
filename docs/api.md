@@ -54,7 +54,7 @@ Implemented tool surface:
 - Protocol: `mcp.protocol.initialize`, `mcp.protocol.tools/list`
 
 Semantic and hybrid search remain feature-gated by the optional
-`vector-lancedb` build flag; discovery handlers fall back to graph heuristics
+Embeddings load by default via sqlite-vec; discovery handlers fall back to graph heuristics if embeddings are disabled at runtime.
 when vectors are unavailable.
 
 Further transport and schema details live in `docs/mcp_protocol.md`.

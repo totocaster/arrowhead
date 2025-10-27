@@ -205,12 +205,11 @@ impl HandlerRegistry {
         })
     }
 
-    #[cfg(feature = "vector-lancedb")]
     async fn handle_search_semantic(&self, request: Request) -> Result<Value, ProtocolError> {
         if !self.runtime.semantic_search_enabled() {
             return Err(ProtocolError::custom(
                 ErrorCode::ToolDisabled,
-                "semantic search is disabled. Enable the `vector-lancedb` feature and reindex the vault.",
+                "semantic search is disabled because embeddings are not initialised.",
                 None,
             ));
         }
@@ -234,21 +233,11 @@ impl HandlerRegistry {
         })
     }
 
-    #[cfg(not(feature = "vector-lancedb"))]
-    async fn handle_search_semantic(&self, _request: Request) -> Result<Value, ProtocolError> {
-        Err(ProtocolError::custom(
-            ErrorCode::ToolDisabled,
-            "semantic search requires Arrowhead to be built with the `vector-lancedb` feature.",
-            None,
-        ))
-    }
-
-    #[cfg(feature = "vector-lancedb")]
     async fn handle_search_hybrid(&self, request: Request) -> Result<Value, ProtocolError> {
         if !self.runtime.semantic_search_enabled() {
             return Err(ProtocolError::custom(
                 ErrorCode::ToolDisabled,
-                "hybrid search is disabled. Enable the `vector-lancedb` feature and reindex the vault.",
+                "hybrid search is disabled because embeddings are not initialised.",
                 None,
             ));
         }
@@ -270,15 +259,6 @@ impl HandlerRegistry {
         serde_json::to_value(payload).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise search results: {err}"))
         })
-    }
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    async fn handle_search_hybrid(&self, _request: Request) -> Result<Value, ProtocolError> {
-        Err(ProtocolError::custom(
-            ErrorCode::ToolDisabled,
-            "hybrid search requires Arrowhead to be built with the `vector-lancedb` feature.",
-            None,
-        ))
     }
 
     async fn handle_vault_status(&self) -> Result<Value, ProtocolError> {
@@ -543,7 +523,7 @@ impl HandlerRegistry {
     }
 
     fn build_tool_descriptors(&self) -> Vec<ToolDescriptor> {
-        let semantic_flag = Some("vector-lancedb".to_string());
+        let semantic_flag = None;
         let mut tools = vec![
             ToolDescriptor {
                 name: "mcp.graph.get_context".to_string(),
@@ -626,7 +606,7 @@ impl HandlerRegistry {
             ToolDescriptor {
                 name: "mcp.search.semantic".to_string(),
                 category: "search".to_string(),
-                description: "Execute a semantic similarity search (requires LanceDB vectors)."
+                description: "Execute a semantic similarity search (requires embeddings)."
                     .to_string(),
                 input_schema: None,
                 output_schema: None,
@@ -640,7 +620,7 @@ impl HandlerRegistry {
             ToolDescriptor {
                 name: "mcp.search.hybrid".to_string(),
                 category: "search".to_string(),
-                description: "Execute a hybrid FTS + semantic search (requires LanceDB vectors)."
+                description: "Execute a hybrid FTS + semantic search (requires embeddings)."
                     .to_string(),
                 input_schema: None,
                 output_schema: None,
@@ -916,7 +896,7 @@ fn map_search_error(err: Error) -> ProtocolError {
     let message = err.to_string();
     if message.contains("empty search query") {
         ProtocolError::invalid_params("search query must not be empty")
-    } else if message.contains("requires Arrowhead to be built with the `vector-lancedb` feature") {
+    } else if message.contains("requires embeddings") {
         ProtocolError::custom(ErrorCode::ToolDisabled, message, None)
     } else {
         ProtocolError::internal(message)

@@ -1,11 +1,11 @@
 //! Search coordination across FTS, semantic, and hybrid strategies.
 
-use std::sync::{Arc, LazyLock};
-#[cfg(feature = "vector-lancedb")]
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
-#[cfg(feature = "vector-lancedb")]
-use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use tokio::task;
@@ -70,7 +70,6 @@ impl Default for SearchConfig {
 pub struct SearchService {
     database: Arc<IndexDatabase>,
     config: SearchConfig,
-    #[cfg(feature = "vector-lancedb")]
     embeddings: Option<Arc<EmbeddingPipeline>>,
 }
 
@@ -81,13 +80,9 @@ impl SearchService {
         config: SearchConfig,
         embeddings: Option<Arc<EmbeddingPipeline>>,
     ) -> Self {
-        #[cfg(not(feature = "vector-lancedb"))]
-        let _ = embeddings;
-
         Self {
             database,
             config,
-            #[cfg(feature = "vector-lancedb")]
             embeddings,
         }
     }
@@ -149,7 +144,6 @@ impl SearchService {
     }
 
     /// Execute a semantic similarity search.
-    #[cfg(feature = "vector-lancedb")]
     pub async fn search_semantic(
         &self,
         query: &str,
@@ -160,12 +154,10 @@ impl SearchService {
             bail!("empty search query");
         }
 
-        let pipeline = self
-            .embeddings
-            .as_ref()
-            .ok_or_else(|| anyhow!(
-                "semantic search requires Arrowhead to be built with LanceDB support. Rebuild with the `vector-lancedb` feature and reindex the vault."
-            ))?;
+        let pipeline = match self.embeddings.as_ref() {
+            Some(pipeline) => pipeline,
+            None => bail!("semantic search requires embeddings to be enabled"),
+        };
 
         let limit = limit.unwrap_or(self.config.default_limit).max(1);
         info!(query = query, limit, "executing semantic search");
@@ -237,7 +229,6 @@ impl SearchService {
     }
 
     /// Execute a hybrid search, combining semantic and keyword results.
-    #[cfg(feature = "vector-lancedb")]
     pub async fn search_hybrid(
         &self,
         query: &str,
@@ -251,12 +242,10 @@ impl SearchService {
             bail!("empty search query");
         }
 
-        let pipeline = self
-            .embeddings
-            .as_ref()
-            .ok_or_else(|| anyhow!(
-                "hybrid search requires Arrowhead to be built with LanceDB support. Rebuild with the `vector-lancedb` feature and reindex the vault."
-            ))?;
+        let pipeline = match self.embeddings.as_ref() {
+            Some(pipeline) => pipeline,
+            None => bail!("hybrid search requires embeddings to be enabled"),
+        };
 
         let limit = limit.unwrap_or(self.config.default_limit).max(1);
         info!(query = query, limit, "executing hybrid search");
@@ -380,26 +369,6 @@ impl SearchService {
             "hybrid search completed"
         );
         Ok(results)
-    }
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    #[allow(missing_docs)]
-    pub async fn search_semantic(
-        &self,
-        _query: &str,
-        _limit: Option<usize>,
-    ) -> Result<Vec<SearchResult>> {
-        bail!("semantic search requires Arrowhead to be built with the `vector-lancedb` feature.")
-    }
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    #[allow(missing_docs)]
-    pub async fn search_hybrid(
-        &self,
-        _query: &str,
-        _limit: Option<usize>,
-    ) -> Result<Vec<SearchResult>> {
-        bail!("hybrid search requires Arrowhead to be built with the `vector-lancedb` feature.")
     }
 
     /// Access the current search configuration.

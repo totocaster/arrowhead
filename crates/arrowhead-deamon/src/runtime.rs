@@ -8,7 +8,6 @@ use std::{
 
 use crate::logging::LoggingGuard;
 use anyhow::{Context, Result, anyhow};
-#[cfg(feature = "vector-lancedb")]
 use arrowhead_core::embeddings::EmbeddingDescriptor;
 use arrowhead_core::embeddings::EmbeddingPipeline;
 use arrowhead_core::indexer::{Indexer, IndexerConfig};
@@ -17,11 +16,8 @@ use arrowhead_core::{
     ActivityState, ActivityStatus, DeamonStatus, DownloadState, DownloadStatus, IssueSeverity,
     StatusFrame, StatusIssue, Vault, VaultConfig,
 };
-#[cfg(feature = "vector-lancedb")]
 use fastembed::{EmbeddingModel, ModelTrait};
-#[cfg(feature = "vector-lancedb")]
 use hf_hub::api::{Progress, sync::ApiBuilder};
-#[cfg(feature = "vector-lancedb")]
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{
     sync::{Mutex, broadcast, mpsc},
@@ -544,7 +540,6 @@ impl DeamonRuntime {
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
 async fn prepare_embeddings(
     config: &DeamonConfig,
     status: Arc<Mutex<DeamonStatus>>,
@@ -563,15 +558,6 @@ async fn prepare_embeddings(
         return Ok(None);
     };
 
-    if !EmbeddingPipeline::is_supported() {
-        warn!(
-            model = model_id.as_str(),
-            "semantic indexing requested but embedding pipeline not supported in this build"
-        );
-        record_embedding_unavailable(&status, &config.status_path, &frame_tx, &model_id).await?;
-        return Ok(None);
-    }
-
     let descriptor = EmbeddingDescriptor::resolve(&model_id)
         .with_context(|| format!("invalid embedding preset `{model_id}`"))?;
     info!(
@@ -583,18 +569,11 @@ async fn prepare_embeddings(
         .arrowhead_dir
         .join("models")
         .join(descriptor.identifier());
-    let vectors_dir = paths.arrowhead_dir.join("vectors");
 
     std::fs::create_dir_all(&models_dir).with_context(|| {
         format!(
             "failed to create embedding cache directory {}",
             models_dir.display()
-        )
-    })?;
-    std::fs::create_dir_all(&vectors_dir).with_context(|| {
-        format!(
-            "failed to create vectors directory {}",
-            vectors_dir.display()
         )
     })?;
 
@@ -692,7 +671,9 @@ async fn prepare_embeddings(
         }
     }
 
-    match EmbeddingPipeline::initialise(&config.vault, &model_id).await {
+    match EmbeddingPipeline::initialise(&config.vault, Arc::clone(&config.database), &model_id)
+        .await
+    {
         Ok(pipeline) => {
             if pipeline.model_changed() {
                 persist_status_to_path(&status, &config.status_path, Some(&frame_tx), |snapshot| {
@@ -721,11 +702,6 @@ async fn prepare_embeddings(
             Ok(Some(Arc::new(pipeline)))
         }
         Err(err) => {
-            warn!(
-                error = ?err,
-                model = descriptor.identifier(),
-                "failed to initialise embedding pipeline"
-            );
             record_embedding_failure(
                 &status,
                 &config.status_path,
@@ -743,7 +719,6 @@ async fn prepare_embeddings(
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
 #[derive(Debug, Clone)]
 enum DownloadEvent {
     Started {
@@ -767,7 +742,6 @@ enum DownloadEvent {
     },
 }
 
-#[cfg(feature = "vector-lancedb")]
 #[derive(Default, Clone)]
 struct ProgressState {
     downloaded: u64,
@@ -775,14 +749,12 @@ struct ProgressState {
     last_reported: u64,
 }
 
-#[cfg(feature = "vector-lancedb")]
 struct ObserverProgress {
     item: String,
     sender: UnboundedSender<DownloadEvent>,
     state: Arc<StdMutex<ProgressState>>,
 }
 
-#[cfg(feature = "vector-lancedb")]
 impl ObserverProgress {
     fn with_state(
         item: String,
@@ -797,7 +769,6 @@ impl ObserverProgress {
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
 impl Progress for ObserverProgress {
     fn init(&mut self, size: usize, _filename: &str) {
         if let Ok(mut guard) = self.state.lock() {
@@ -840,7 +811,6 @@ impl Progress for ObserverProgress {
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
 fn download_embedding_assets(
     descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
     cache_dir: &Path,
@@ -899,7 +869,6 @@ fn download_embedding_assets(
     Ok(())
 }
 
-#[cfg(feature = "vector-lancedb")]
 async fn consume_download_events(
     descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
     status: Arc<Mutex<DeamonStatus>>,
@@ -995,7 +964,6 @@ async fn consume_download_events(
     Ok(failed)
 }
 
-#[cfg(feature = "vector-lancedb")]
 fn ensure_download_entry<'a>(status: &'a mut DeamonStatus, item: &str) -> &'a mut DownloadStatus {
     if let Some(index) = status.downloads.iter().position(|entry| entry.item == item) {
         &mut status.downloads[index]
@@ -1010,7 +978,6 @@ fn ensure_download_entry<'a>(status: &'a mut DeamonStatus, item: &str) -> &'a mu
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
 async fn record_embedding_failure(
     status: &Arc<Mutex<DeamonStatus>>,
     status_path: &Path,
@@ -1045,68 +1012,6 @@ async fn record_embedding_failure(
     .await
 }
 
-async fn record_embedding_unavailable(
-    status: &Arc<Mutex<DeamonStatus>>,
-    status_path: &Path,
-    frame_tx: &broadcast::Sender<StatusFrame>,
-    model_id: &str,
-) -> Result<()> {
-    persist_status_to_path(status, status_path, Some(frame_tx), |snapshot| {
-        snapshot
-            .issues
-            .retain(|issue| issue.code != EMBEDDINGS_UNAVAILABLE_ISSUE_CODE);
-        if let Some(entry) = snapshot
-            .downloads
-            .iter_mut()
-            .find(|entry| entry.item == model_id)
-        {
-            entry.state = DownloadState::Failed;
-            entry.message = Some("binary lacks LanceDB support".to_string());
-        } else {
-            let mut entry = DownloadStatus::pending(model_id.to_string());
-            entry.state = DownloadState::Failed;
-            entry.message = Some("binary lacks LanceDB support".to_string());
-            snapshot.downloads.push(entry);
-        }
-        let mut issue = StatusIssue::new(
-            EMBEDDINGS_UNAVAILABLE_ISSUE_CODE,
-            format!(
-                "semantic embeddings disabled (model `{model_id}` requires vector-lancedb feature)"
-            ),
-            IssueSeverity::Warning,
-        );
-        issue.detail = Some(
-            "Rebuild Arrowhead with --features vector-lancedb to enable semantic search."
-                .to_string(),
-        );
-        snapshot.issues.push(issue);
-    })
-    .await
-}
-
-#[cfg(not(feature = "vector-lancedb"))]
-async fn prepare_embeddings(
-    config: &DeamonConfig,
-    status: Arc<Mutex<DeamonStatus>>,
-    frame_tx: broadcast::Sender<StatusFrame>,
-) -> Result<Option<Arc<EmbeddingPipeline>>> {
-    if let Some(model_id) = config.embedding_model.as_ref().and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    }) {
-        warn!(
-            model = model_id.as_str(),
-            "semantic embeddings requested but the binary was built without LanceDB support"
-        );
-        record_embedding_unavailable(&status, &config.status_path, &frame_tx, &model_id).await?;
-    }
-    Ok(None)
-}
-
 async fn persist_status_to_path<F>(
     status: &Arc<Mutex<DeamonStatus>>,
     path: &Path,
@@ -1131,11 +1036,8 @@ where
 }
 
 const INDEX_ERROR_CODE: &str = "index_errors";
-#[cfg(feature = "vector-lancedb")]
 const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
-#[cfg(feature = "vector-lancedb")]
 const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
-const EMBEDDINGS_UNAVAILABLE_ISSUE_CODE: &str = "embedding_unavailable";
 
 fn update_index_error_issue(status: &mut DeamonStatus, errors: u64) {
     status.error_notes = errors;

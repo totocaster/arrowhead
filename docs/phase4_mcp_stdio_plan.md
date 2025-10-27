@@ -49,13 +49,13 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
    - `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid`.
    - `mcp.vault.status` (align with `arrowhead status --json`).
    - `mcp.notes.read`, `mcp.notes.list`, `mcp.notes.metadata`.
-   - Feature-gated `mcp.search.semantic` when `vector-lancedb` is disabled.
+   - `mcp.search.semantic` returns `ToolDisabled` only when embeddings failed to initialise.
    - Request validation (note IDs, pagination, vault path) with actionable
      error messages.
 
 4. **Runtime Integration**
    - `arrowhead-cli` gains a `--mcp` mode that bootstraps config, connects to
-     the existing SQLite/LanceDB stores, and runs the stdio server until EOF.
+     the shared SQLite database (with sqlite-vec vectors), and runs the stdio server until EOF.
    - When the daemon is offline, MCP methods must emit `ServiceUnavailable`
      errors consistent with CLI behaviour.
    - Shared status caches & config loading reused from CLI modules.
@@ -106,7 +106,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
 2. Map MCP method names to handler functions.
 3. Implement `get_context`, `get_backlinks`, `get_forward_links` using
    `GraphService`. Ensure outputs match CLI JSON schema.
-4. Wire `search` methods, including optional LanceDB gating. Respect query
+4. Wire `search` methods, returning ToolDisabled when embeddings are unavailable. Respect query
    result limits; include score + snippet when available.
 5. Implement `vault.status` by delegating to existing status retrieval helpers.
 6. Add note read/list/metadata methods reusing CLI logic.
@@ -122,7 +122,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
 6. Expand integration tests:
    - Happy-path coverage for each method.
    - Error cases (invalid params, note not found, daemon offline).
-   - Feature flag permutations (with/without `vector-lancedb`).
+   - Embedding permutations (semantic enabled vs. `--fts-only`).
 
 ### Stage 4 — CLI & Documentation
 

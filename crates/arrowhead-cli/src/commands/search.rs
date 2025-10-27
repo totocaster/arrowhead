@@ -64,11 +64,7 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
 
     let logs_dir = vault.paths().logs_dir();
 
-    #[cfg(feature = "vector-lancedb")]
     let logging_enabled = std::env::var_os("ARROWHEAD_ENABLE_FILE_LOGS").is_some();
-
-    #[cfg(not(feature = "vector-lancedb"))]
-    let logging_enabled = std::env::var_os("ARROWHEAD_DISABLE_FILE_LOGS").is_none();
 
     let _logging_guard = if logging_enabled {
         Some(logging::scoped_file_logging(&logs_dir, ctx.verbosity())?)
@@ -76,18 +72,23 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         None
     };
 
-    let model_id = ctx
+    let selected_model = ctx
         .config
         .embedding_model
         .clone()
         .unwrap_or_else(|| "fast".to_string());
-    let embeddings = if EmbeddingPipeline::is_supported() {
-        let pipeline = EmbeddingPipeline::initialise(vault.as_ref(), &model_id)
+    let embeddings = match &command.mode {
+        SearchMode::Fts(_) => None,
+        _ => {
+            let pipeline = EmbeddingPipeline::initialise(
+                vault.as_ref(),
+                Arc::clone(&database),
+                &selected_model,
+            )
             .await
-            .context("failed to prepare embedding pipeline")?;
-        Some(Arc::new(pipeline))
-    } else {
-        None
+            .with_context(|| format!("failed to prepare embedding pipeline `{selected_model}`"))?;
+            Some(Arc::new(pipeline))
+        }
     };
 
     let status = ensure_deamon_ready(ctx, vault.as_ref()).await?;
@@ -101,7 +102,7 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         );
     }
 
-    let service = SearchService::new(database, SearchConfig::default(), embeddings);
+    let service = SearchService::new(database, SearchConfig::default(), embeddings.clone());
 
     match &command.mode {
         SearchMode::Fts(args) => {
@@ -111,6 +112,9 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
             Ok(())
         }
         SearchMode::Semantic(args) => {
+            let _ = embeddings
+                .as_ref()
+                .expect("embedding pipeline required for semantic search");
             info!(query = args.query.as_str(), limit = ?args.limit, "executing semantic search");
             let results = service
                 .search_semantic(&args.query, args.limit)
@@ -120,6 +124,9 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
             Ok(())
         }
         SearchMode::Hybrid(args) => {
+            let _ = embeddings
+                .as_ref()
+                .expect("embedding pipeline required for hybrid search");
             info!(query = args.query.as_str(), limit = ?args.limit, "executing hybrid search");
             let results = service
                 .search_hybrid(&args.query, args.limit)

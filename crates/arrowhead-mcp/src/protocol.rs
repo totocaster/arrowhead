@@ -470,7 +470,7 @@ pub enum ErrorCode {
     ServerError = -32000,
     /// Transport or service dependency unavailable.
     ServiceUnavailable = -32002,
-    /// Feature is disabled (e.g., semantic search without LanceDB).
+    /// Feature is disabled (e.g., semantic search when embeddings are not initialised).
     ToolDisabled = -32003,
     /// Request timed out before completion.
     Timeout = -32004,

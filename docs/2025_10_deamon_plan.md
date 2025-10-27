@@ -10,7 +10,7 @@
 - Current state: `arrowhead-deamon` maintains the hot index (watcher + incremental
   delete support), and CLI commands trust the daemon status instead of launching
   ad-hoc indexing passes.
-- Constraints: Rust 1.86 toolchain, optional LanceDB feature, cross-platform
+- Constraints: Rust 1.86 toolchain, sqlite-vec-backed embeddings, cross-platform
   support (macOS + Linux), maintainability & testability per rewrite spec.
 
 ## Feasibility Summary
@@ -117,7 +117,7 @@
    - Platform tests (behind feature flags) that validate `launchd` plist generation
      and `systemd` units compile and round-trip.
    - Ensure `cargo fmt`, `cargo clippy --all-targets --all-features`, `cargo test`
-     remain green with and without `vector-lancedb`.
+     remain green with embeddings enabled by default.
 
 5. **Documentation & Rollout**
    - Update `docs/predev_synapse_rust_rewrite.md` with the deamon architecture,

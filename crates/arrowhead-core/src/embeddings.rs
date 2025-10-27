@@ -1,20 +1,21 @@
 //! Embedding generation, configuration, and persistence.
 
 use std::{
+    collections::BTreeSet,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-#[cfg(feature = "vector-lancedb")]
 use chrono::{DateTime, Utc};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-#[cfg(feature = "vector-lancedb")]
-use serde::{Deserialize, Serialize};
+use rusqlite::{Connection, OptionalExtension, params};
+use tokio::task;
 use tracing::{debug, info};
+use zerocopy::AsBytes;
 
-use crate::Vault;
+use crate::{Vault, sqlite::IndexDatabase};
 
 /// User-facing presets for embedding model quality/speed trade-offs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,27 +374,11 @@ fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
     Ok(vector)
 }
 
-#[cfg(feature = "vector-lancedb")]
-use {
-    arrow_array::builder::{FixedSizeListBuilder, Float32Builder, Int64Builder, StringBuilder},
-    arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator},
-    arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef},
-    futures::StreamExt,
-    lancedb::{
-        DistanceType, connect,
-        connection::Connection,
-        query::{ExecutableQuery, QueryBase},
-    },
-    std::collections::BTreeSet,
-    tokio::sync::Mutex as AsyncMutex,
-};
-
-#[cfg(feature = "vector-lancedb")]
 const EMBEDDING_TABLE_NAME: &str = "note_embeddings";
+const EMBEDDING_METADATA_SINGLETON: i64 = 1;
 
-#[cfg(feature = "vector-lancedb")]
-#[derive(Debug, Clone)]
 /// Embedding payload captured during indexing for a single note.
+#[derive(Debug, Clone)]
 pub struct EmbeddingRecord {
     /// Identifier of the note the vector belongs to.
     pub note_id: String,
@@ -403,27 +388,15 @@ pub struct EmbeddingRecord {
     pub indexed_at: DateTime<Utc>,
 }
 
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(missing_docs)]
+/// Result row returned from sqlite-vec vector search.
 #[derive(Debug, Clone)]
-pub struct EmbeddingRecord;
-
-#[cfg(feature = "vector-lancedb")]
-#[derive(Debug, Clone)]
-/// Result row returned from LanceDB vector search.
 pub struct EmbeddingMatch {
-    /// Note identifier matched by LanceDB.
+    /// Note identifier matched by the vector search.
     pub note_id: String,
-    /// Raw cosine distance reported by LanceDB.
+    /// Raw cosine distance reported by sqlite-vec (lower is closer).
     pub distance: f32,
 }
 
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(missing_docs)]
-#[derive(Debug, Clone)]
-pub struct EmbeddingMatch;
-
-#[cfg(feature = "vector-lancedb")]
 struct EmbeddingPipelineInner {
     descriptor: EmbeddingDescriptor,
     generator: Arc<EmbeddingGenerator>,
@@ -434,55 +407,31 @@ struct EmbeddingPipelineInner {
 /// Combined embedding generator + persistence pipeline.
 #[derive(Clone)]
 pub struct EmbeddingPipeline {
-    #[cfg(feature = "vector-lancedb")]
     inner: Arc<EmbeddingPipelineInner>,
-    #[cfg(not(feature = "vector-lancedb"))]
-    _marker: std::marker::PhantomData<()>,
 }
 
 impl EmbeddingPipeline {
-    /// Whether LanceDB-backed embeddings are compiled into this build.
+    /// Semantic embeddings are always available now that sqlite-vec ships in every build.
     pub fn is_supported() -> bool {
-        cfg!(feature = "vector-lancedb")
+        true
     }
-}
 
-impl fmt::Debug for EmbeddingPipeline {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(feature = "vector-lancedb")]
-        {
-            return f
-                .debug_struct("EmbeddingPipeline")
-                .field("model", &self.descriptor().identifier())
-                .field("model_changed", &self.model_changed())
-                .finish();
-        }
-
-        #[cfg(not(feature = "vector-lancedb"))]
-        {
-            f.debug_struct("EmbeddingPipeline")
-                .field("supported", &false)
-                .finish()
-        }
-    }
-}
-
-#[cfg(feature = "vector-lancedb")]
-impl EmbeddingPipeline {
     /// Prepare the embedding pipeline for the supplied vault and model identifier.
-    pub async fn initialise(vault: &Vault, model_id: &str) -> Result<Self> {
+    pub async fn initialise(
+        vault: &Vault,
+        database: Arc<IndexDatabase>,
+        model_id: &str,
+    ) -> Result<Self> {
         let descriptor = EmbeddingDescriptor::resolve(model_id)?;
         let vault_paths = vault.paths();
         let models_dir = vault_paths
             .arrowhead_dir
             .join("models")
             .join(descriptor.identifier());
-        let vectors_dir = vault_paths.arrowhead_dir.join("vectors");
 
         info!(
             model = descriptor.identifier(),
             models_dir = %models_dir.display(),
-            vectors_dir = %vectors_dir.display(),
             "initialising embedding pipeline"
         );
 
@@ -493,15 +442,12 @@ impl EmbeddingPipeline {
             )
         })?;
 
-        let model_changed = prepare_vector_directory(&vectors_dir, &descriptor)?;
-
         let generator = EmbeddingGenerator::initialise(EmbeddingConfig::new(
             descriptor.clone(),
             models_dir.clone(),
         ))?;
-        let store = EmbeddingStore::connect(&vectors_dir, &descriptor).await?;
-
-        write_metadata(&vectors_dir, &descriptor).context("failed to write embedding metadata")?;
+        let (store, model_changed) =
+            EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
 
         let pipeline = Self {
             inner: Arc::new(EmbeddingPipelineInner {
@@ -524,7 +470,7 @@ impl EmbeddingPipeline {
         self.inner.generator.as_ref()
     }
 
-    /// Access the LanceDB store.
+    /// Access the embedding store.
     pub fn store(&self) -> &EmbeddingStore {
         self.inner.store.as_ref()
     }
@@ -540,475 +486,404 @@ impl EmbeddingPipeline {
     }
 }
 
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(missing_docs)]
-impl EmbeddingPipeline {
-    /// Stub initialiser when LanceDB support is not compiled.
-    pub async fn initialise(_vault: &Vault, _model_id: &str) -> Result<Self> {
-        bail!(
-            "semantic embeddings require the `vector-lancedb` Cargo feature. Rebuild Arrowhead with --features vector-lancedb."
-        );
-    }
-
-    pub fn generator(&self) -> &EmbeddingGenerator {
-        panic!("semantic embeddings are unavailable in this build")
-    }
-
-    pub fn store(&self) -> &EmbeddingStore {
-        panic!("semantic embeddings are unavailable in this build")
-    }
-
-    pub fn descriptor(&self) -> &EmbeddingDescriptor {
-        panic!("semantic embeddings are unavailable in this build")
-    }
-
-    pub fn model_changed(&self) -> bool {
-        false
+impl fmt::Debug for EmbeddingPipeline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EmbeddingPipeline")
+            .field("model", &self.descriptor().identifier())
+            .field("model_changed", &self.model_changed())
+            .finish()
     }
 }
 
-#[cfg(feature = "vector-lancedb")]
+/// sqlite-vec backed note embedding store.
 #[derive(Clone)]
-/// Wrapper over the LanceDB table used to persist note embeddings.
 pub struct EmbeddingStore {
-    connection: Arc<Connection>,
-    table_name: String,
+    database: Arc<IndexDatabase>,
     dimension: usize,
     model_id: String,
-    write_lock: Arc<AsyncMutex<()>>,
 }
 
-#[cfg(feature = "vector-lancedb")]
 impl EmbeddingStore {
-    /// Open (or create) the embeddings table for the supplied vault/model pair.
-    pub async fn connect(path: &Path, descriptor: &EmbeddingDescriptor) -> Result<Self> {
-        info!(
-            model = descriptor.identifier(),
-            path = %path.display(),
-            "connecting LanceDB embedding store"
-        );
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create vectors directory {}", parent.display())
-            })?;
-        }
-        fs::create_dir_all(path)
-            .with_context(|| format!("failed to create vectors directory {}", path.display()))?;
-
-        let uri = path
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid vectors path: {}", path.display()))?;
-        let connection = connect(uri)
-            .execute()
-            .await
-            .context("failed to open LanceDB connection")?;
-
-        ensure_table_schema(&connection, EMBEDDING_TABLE_NAME, descriptor)
-            .await
-            .context("failed to prepare LanceDB table for embeddings")?;
+    /// Ensure the sqlite-vec table exists and matches the requested descriptor.
+    pub async fn bootstrap(
+        database: Arc<IndexDatabase>,
+        descriptor: &EmbeddingDescriptor,
+    ) -> Result<(Self, bool)> {
+        let descriptor_clone = descriptor.clone();
+        let db_for_task = Arc::clone(&database);
+        let model_changed = task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = db_for_task
+                .connection()
+                .context("failed to open SQLite connection for embeddings")?;
+            let tx = conn
+                .transaction()
+                .context("failed to open transaction for embedding bootstrap")?;
+            let changed = ensure_embedding_schema(&tx, &descriptor_clone)?;
+            tx.commit()
+                .context("failed to commit embedding bootstrap transaction")?;
+            Ok(changed)
+        })
+        .await
+        .context("embedding bootstrap task aborted")??;
 
         let store = Self {
-            connection: Arc::new(connection),
-            table_name: EMBEDDING_TABLE_NAME.to_string(),
+            database,
             dimension: descriptor.dimension(),
             model_id: descriptor.identifier().to_string(),
-            write_lock: Arc::new(AsyncMutex::new(())),
         };
-        info!(
-            model = descriptor.identifier(),
-            table = EMBEDDING_TABLE_NAME,
-            "embedding store ready"
-        );
-        Ok(store)
+        Ok((store, model_changed))
     }
 
-    /// Upsert the supplied embeddings into the LanceDB table.
+    /// Persist (or replace) embeddings for the supplied records.
     pub async fn upsert_embeddings(&self, records: &[EmbeddingRecord]) -> Result<()> {
         if records.is_empty() {
             debug!(
-                table = self.table_name.as_str(),
+                table = EMBEDDING_TABLE_NAME,
                 "skipping embedding upsert for empty batch"
             );
             return Ok(());
         }
 
+        let entries = records
+            .iter()
+            .map(|record| {
+                ensure_dimension(&record.vector, self.dimension)?;
+                let blob = vector_to_blob(&record.vector);
+                let timestamp = record.indexed_at.timestamp_micros();
+                Ok((record.note_id.clone(), blob, timestamp))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let database = Arc::clone(&self.database);
+        let model_id = self.model_id.clone();
+        let count = entries.len();
+
         info!(
-            table = self.table_name.as_str(),
-            model = self.model_id.as_str(),
-            count = records.len(),
+            table = EMBEDDING_TABLE_NAME,
+            model = model_id.as_str(),
+            count,
             "upserting embeddings batch"
         );
-        let _guard = self.write_lock.lock().await;
-        let table = self
-            .connection
-            .open_table(&self.table_name)
-            .execute()
-            .await
-            .context("failed to open embedding table")?;
 
-        let mut unique_ids = BTreeSet::new();
-        for record in records {
-            unique_ids.insert(record.note_id.clone());
-        }
+        task::spawn_blocking(move || -> Result<()> {
+            let mut conn = database
+                .connection()
+                .context("failed to open SQLite connection for embedding upsert")?;
+            let tx = conn
+                .transaction()
+                .context("failed to open transaction for embedding upsert")?;
 
-        for chunk in unique_ids.iter().collect::<Vec<_>>().chunks(256) {
-            let predicate = chunk
-                .iter()
-                .map(|id| format!("note_id = '{}'", id.replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            table.delete(&predicate).await.with_context(|| {
-                format!("failed to delete embeddings for predicate {predicate}")
-            })?;
-        }
+            {
+                let mut delete_stmt = tx.prepare_cached(&format!(
+                    "DELETE FROM {EMBEDDING_TABLE_NAME} WHERE note_id = ?1"
+                ))?;
+                for (note_id, _, _) in &entries {
+                    delete_stmt
+                        .execute([note_id])
+                        .context("failed to delete existing embedding row")?;
+                }
+            }
 
-        let batch = build_embedding_batch(records, self.dimension, &self.model_id)?;
-        table
-            .add(batch)
-            .execute()
-            .await
-            .context("failed to append embeddings into LanceDB")?;
+            {
+                let mut insert_stmt = tx.prepare_cached(&format!(
+                    "INSERT INTO {EMBEDDING_TABLE_NAME} (note_id, vector, model, indexed_at) VALUES (?1, ?2, ?3, ?4)"
+                ))?;
+                for (note_id, blob, timestamp) in &entries {
+                    insert_stmt.execute(params![
+                        note_id,
+                        blob.as_slice(),
+                        &model_id,
+                        timestamp
+                    ])?;
+                }
+            }
+
+            tx.commit()
+                .context("failed to commit embedding upsert transaction")?;
+            Ok(())
+        })
+        .await
+        .context("embedding upsert task aborted")??;
 
         Ok(())
     }
 
-    /// Delete embeddings for the supplied note identifiers.
+    /// Remove stored embeddings for the supplied note identifiers.
     pub async fn delete_embeddings(&self, note_ids: &[String]) -> Result<()> {
         if note_ids.is_empty() {
             return Ok(());
         }
 
-        let _guard = self.write_lock.lock().await;
-        let table = self
-            .connection
-            .open_table(&self.table_name)
-            .execute()
-            .await
-            .context("failed to open embedding table for deletion")?;
+        let unique_ids: Vec<String> = {
+            let mut set = BTreeSet::new();
+            for id in note_ids {
+                set.insert(id.clone());
+            }
+            set.into_iter().collect()
+        };
 
-        for chunk in note_ids.chunks(256) {
-            let predicate = chunk
-                .iter()
-                .map(|id| format!("note_id = '{}'", id.replace('\'', "''")))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            table.delete(&predicate).await.with_context(|| {
-                format!("failed to delete embeddings for predicate {predicate}")
-            })?;
-        }
+        let database = Arc::clone(&self.database);
+
+        task::spawn_blocking(move || -> Result<()> {
+            let mut conn = database
+                .connection()
+                .context("failed to open SQLite connection for embedding delete")?;
+            let tx = conn
+                .transaction()
+                .context("failed to open transaction for embedding delete")?;
+            {
+                let mut stmt = tx.prepare_cached(&format!(
+                    "DELETE FROM {EMBEDDING_TABLE_NAME} WHERE note_id = ?1"
+                ))?;
+                for note_id in &unique_ids {
+                    stmt.execute([note_id])
+                        .context("failed to delete embedding row")?;
+                }
+            }
+            tx.commit()
+                .context("failed to commit embedding delete transaction")?;
+            Ok(())
+        })
+        .await
+        .context("embedding delete task aborted")??;
 
         Ok(())
     }
 
-    /// Execute a vector search using cosine distance.
+    /// Execute a cosine similarity search via sqlite-vec.
     pub async fn search(
         &self,
         query: &[f32],
         limit: usize,
         threshold: f32,
     ) -> Result<Vec<EmbeddingMatch>> {
-        if query.len() != self.dimension {
-            bail!(
-                "query vector dimension mismatch: expected {}, got {}",
-                self.dimension,
-                query.len()
-            );
-        }
+        ensure_dimension(query, self.dimension)?;
+        let blob = vector_to_blob(query);
+        let database = Arc::clone(&self.database);
+        let model_id = self.model_id.clone();
+        let limit = limit.max(1) as i64;
 
-        let table = self
-            .connection
-            .open_table(&self.table_name)
-            .execute()
-            .await
-            .context("failed to open embedding table for search")?;
+        let matches = task::spawn_blocking(move || -> Result<Vec<EmbeddingMatch>> {
+            let conn = database
+                .connection()
+                .context("failed to open SQLite connection for embedding search")?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT note_id, distance \
+                 FROM {EMBEDDING_TABLE_NAME} \
+                 WHERE vector MATCH ?1 AND model = ?2 \
+                 ORDER BY distance \
+                 LIMIT ?3"
+            ))?;
+            let mut rows = stmt.query(params![blob.as_slice(), &model_id, limit])?;
+            let mut results = Vec::new();
+            while let Some(row) = rows.next()? {
+                let note_id: String = row.get(0)?;
+                let distance: f32 = row.get(1)?;
+                results.push(EmbeddingMatch { note_id, distance });
+            }
+            Ok(results)
+        })
+        .await
+        .context("embedding search task aborted")??;
 
-        let mut stream = table
-            .vector_search(query.to_vec())
-            .context("failed to prepare vector search")?
-            .distance_type(DistanceType::Cosine)
-            .limit(limit.max(1))
-            .execute()
-            .await
-            .context("semantic search execution failed")?;
-
-        let mut matches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch.context("failed to read LanceDB result batch")?;
-            let note_ids = batch
-                .column_by_name("note_id")
-                .context("LanceDB result missing note_id column")?
-                .as_any()
-                .downcast_ref::<arrow_array::StringArray>()
-                .context("invalid arrow type for note_id column")?;
-            let distances = batch
-                .column_by_name("_distance")
-                .context("LanceDB result missing _distance column")?
-                .as_any()
-                .downcast_ref::<arrow_array::Float32Array>()
-                .context("invalid arrow type for _distance column")?;
-            for index in 0..batch.num_rows() {
-                let note_id = note_ids.value(index).to_string();
-                let distance = distances.value(index);
-                let similarity = (1.0_f32 - distance).max(0.0_f32);
-                if similarity >= threshold {
-                    matches.push(EmbeddingMatch { note_id, distance });
-                }
+        let mut filtered = Vec::new();
+        for item in matches {
+            let similarity = (1.0 - item.distance).max(0.0);
+            if similarity >= threshold {
+                filtered.push(item);
             }
         }
-
-        // Results are already distance-sorted; retain ordering while enforcing limit.
-        if matches.len() > limit {
-            matches.truncate(limit);
-        }
-
-        Ok(matches)
+        Ok(filtered)
     }
 }
 
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(missing_docs)]
-#[derive(Clone)]
-pub struct EmbeddingStore;
-
-#[cfg(not(feature = "vector-lancedb"))]
-#[allow(missing_docs)]
-impl EmbeddingStore {
-    pub async fn upsert_embeddings(&self, _records: &[EmbeddingRecord]) -> Result<()> {
-        bail!("semantic embeddings are unavailable in this build")
-    }
-
-    pub async fn delete_embeddings(&self, _note_ids: &[String]) -> Result<()> {
-        bail!("semantic embeddings are unavailable in this build")
-    }
-
-    pub async fn search(
-        &self,
-        _query: &[f32],
-        _limit: usize,
-        _threshold: f32,
-    ) -> Result<Vec<EmbeddingMatch>> {
-        bail!("semantic embeddings are unavailable in this build")
-    }
-}
-
-#[cfg(feature = "vector-lancedb")]
-fn build_embedding_batch(
-    records: &[EmbeddingRecord],
+#[derive(Debug, Clone)]
+struct StoredEmbeddingMetadata {
+    model_id: String,
     dimension: usize,
-    model_id: &str,
-) -> Result<RecordBatchIterator<std::vec::IntoIter<Result<RecordBatch, ArrowError>>>> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("note_id", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dimension as i32,
-            ),
-            false,
-        ),
-        Field::new("model", DataType::Utf8, false),
-        Field::new("indexed_at", DataType::Int64, false),
-    ]));
+}
 
-    let mut id_builder = StringBuilder::new();
-    let mut model_builder = StringBuilder::new();
-    let mut timestamp_builder = Int64Builder::with_capacity(records.len());
-    let value_builder = Float32Builder::with_capacity(records.len() * dimension);
-    let mut vector_builder = FixedSizeListBuilder::new(value_builder, dimension as i32);
+fn ensure_embedding_schema(conn: &Connection, descriptor: &EmbeddingDescriptor) -> Result<bool> {
+    let metadata = load_embedding_metadata(conn)?;
+    let table_exists = embedding_table_exists(conn)?;
+    let mut model_changed = false;
 
-    for record in records {
-        if record.vector.len() != dimension {
-            bail!(
-                "embedding dimension mismatch: expected {}, got {}",
-                dimension,
-                record.vector.len()
-            );
-        }
-        id_builder.append_value(&record.note_id);
-        model_builder.append_value(model_id);
-        timestamp_builder.append_value(record.indexed_at.timestamp_micros());
-        {
-            let values = vector_builder.values();
-            for value in &record.vector {
-                values.append_value(*value);
+    match (metadata, table_exists) {
+        (Some(existing), true) => {
+            if existing.model_id != descriptor.identifier()
+                || existing.dimension != descriptor.dimension()
+            {
+                drop_embedding_table(conn)?;
+                create_embedding_table(conn, descriptor)?;
+                model_changed = true;
             }
         }
-        vector_builder.append(true);
-    }
-
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(id_builder.finish()),
-        Arc::new(vector_builder.finish()),
-        Arc::new(model_builder.finish()),
-        Arc::new(timestamp_builder.finish()),
-    ];
-
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
-        .context("failed to assemble embedding record batch")?;
-
-    Ok(RecordBatchIterator::new(
-        vec![Ok::<_, ArrowError>(batch)].into_iter(),
-        schema,
-    ))
-}
-
-#[cfg(feature = "vector-lancedb")]
-async fn ensure_table_schema(
-    connection: &Connection,
-    table_name: &str,
-    descriptor: &EmbeddingDescriptor,
-) -> Result<()> {
-    let names = connection
-        .table_names()
-        .execute()
-        .await
-        .context("failed to list LanceDB tables")?;
-
-    if !names.iter().any(|name| name == table_name) {
-        create_table(connection, table_name, descriptor)
-            .await
-            .context("failed to create embedding table")?;
-        return Ok(());
-    }
-
-    let table = connection
-        .open_table(table_name)
-        .execute()
-        .await
-        .context("failed to open embedding table for validation")?;
-
-    let schema = table
-        .schema()
-        .await
-        .context("failed to fetch LanceDB table schema")?;
-
-    if schema_compatible(&schema, descriptor.dimension()) {
-        return Ok(());
-    }
-
-    connection
-        .drop_table(table_name)
-        .await
-        .context("failed to drop incompatible embedding table")?;
-    create_table(connection, table_name, descriptor)
-        .await
-        .context("failed to recreate embedding table")
-}
-
-#[cfg(feature = "vector-lancedb")]
-fn schema_compatible(schema: &Schema, dimension: usize) -> bool {
-    fn field_dim(field: &Field) -> Option<usize> {
-        match field.data_type() {
-            DataType::FixedSizeList(inner, len) => {
-                if !matches!(inner.data_type(), DataType::Float32) {
-                    return None;
-                }
-                Some(*len as usize)
-            }
-            _ => None,
+        (Some(_), false) => {
+            create_embedding_table(conn, descriptor)?;
+            model_changed = true;
+        }
+        (None, true) => {
+            drop_embedding_table(conn)?;
+            create_embedding_table(conn, descriptor)?;
+            model_changed = true;
+        }
+        (None, false) => {
+            create_embedding_table(conn, descriptor)?;
         }
     }
 
-    let vector_field = schema.field_with_name("vector").ok();
-    let note_id_field = schema.field_with_name("note_id").ok();
-    let model_field = schema.field_with_name("model").ok();
-    let indexed_field = schema.field_with_name("indexed_at").ok();
-
-    match (vector_field, note_id_field, model_field, indexed_field) {
-        (Some(vector), Some(note_id), Some(model), Some(indexed)) => {
-            vector.is_nullable() == false
-                && note_id.data_type() == &DataType::Utf8
-                && !note_id.is_nullable()
-                && model.data_type() == &DataType::Utf8
-                && !model.is_nullable()
-                && indexed.data_type() == &DataType::Int64
-                && !indexed.is_nullable()
-                && field_dim(vector) == Some(dimension)
-        }
-        _ => false,
-    }
+    write_embedding_metadata(conn, descriptor)?;
+    Ok(model_changed)
 }
 
-#[cfg(feature = "vector-lancedb")]
-async fn create_table(
-    connection: &Connection,
-    table_name: &str,
-    descriptor: &EmbeddingDescriptor,
-) -> Result<()> {
-    let schema: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new("note_id", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                descriptor.dimension() as i32,
-            ),
-            false,
-        ),
-        Field::new("model", DataType::Utf8, false),
-        Field::new("indexed_at", DataType::Int64, false),
-    ]));
+fn load_embedding_metadata(conn: &Connection) -> Result<Option<StoredEmbeddingMetadata>> {
+    conn.query_row(
+        "SELECT model_id, repository, dimension FROM embedding_metadata WHERE singleton = ?1",
+        [EMBEDDING_METADATA_SINGLETON],
+        |row| {
+            let model_id: String = row.get(0)?;
+            let _repository: String = row.get(1)?;
+            let dimension: i64 = row.get(2)?;
+            Ok(StoredEmbeddingMetadata {
+                model_id,
+                dimension: dimension as usize,
+            })
+        },
+    )
+    .optional()
+    .context("failed to load embedding metadata")
+}
 
-    connection
-        .create_empty_table(table_name, schema)
-        .execute()
-        .await
-        .context("failed to create LanceDB embeddings table")?;
+fn write_embedding_metadata(conn: &Connection, descriptor: &EmbeddingDescriptor) -> Result<()> {
+    let timestamp = Utc::now().timestamp_micros();
+    conn.execute(
+        "INSERT INTO embedding_metadata (singleton, model_id, repository, dimension, updated_at)\n         VALUES (?1, ?2, ?3, ?4, ?5)\n         ON CONFLICT(singleton) DO UPDATE SET\n            model_id = excluded.model_id,\n            repository = excluded.repository,\n            dimension = excluded.dimension,\n            updated_at = excluded.updated_at",
+        params![
+            EMBEDDING_METADATA_SINGLETON,
+            descriptor.identifier(),
+            descriptor.repository(),
+            descriptor.dimension() as i64,
+            timestamp
+        ],
+    )
+    .context("failed to persist embedding metadata")?;
     Ok(())
 }
 
-#[cfg(feature = "vector-lancedb")]
-fn prepare_vector_directory(path: &Path, descriptor: &EmbeddingDescriptor) -> Result<bool> {
-    let metadata_path = path.join("metadata.json");
-    if !path.exists() {
-        return Ok(false);
-    }
+fn embedding_table_exists(conn: &Connection) -> Result<bool> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [EMBEDDING_TABLE_NAME],
+            |row| row.get::<_, i32>(0),
+        )
+        .optional()
+        .context("failed to probe sqlite-vec table")?;
+    Ok(exists.is_some())
+}
 
-    let existing = fs::read_to_string(&metadata_path).ok();
-    if let Some(raw) = existing {
-        if let Ok(metadata) = serde_json::from_str::<EmbeddingMetadata>(&raw) {
-            if metadata.model_id == descriptor.identifier()
-                && metadata.dimension == descriptor.dimension()
-            {
-                return Ok(false);
-            }
+fn drop_embedding_table(conn: &Connection) -> Result<()> {
+    conn.execute(&format!("DROP TABLE IF EXISTS {EMBEDDING_TABLE_NAME}"), [])
+        .context("failed to drop existing embedding table")?;
+    Ok(())
+}
+
+fn create_embedding_table(conn: &Connection, descriptor: &EmbeddingDescriptor) -> Result<()> {
+    let sql = format!(
+        "CREATE VIRTUAL TABLE {EMBEDDING_TABLE_NAME} USING vec0(\n            note_id TEXT,\n            vector FLOAT[{dimension}] distance_metric=cosine,\n            model TEXT,\n            indexed_at INTEGER\n        )",
+        dimension = descriptor.dimension()
+    );
+    conn.execute(&sql, [])
+        .context("failed to create sqlite-vec embeddings table")?;
+    Ok(())
+}
+
+fn ensure_dimension(vector: &[f32], expected: usize) -> Result<()> {
+    if vector.len() != expected {
+        bail!(
+            "embedding dimension mismatch: expected {}, got {}",
+            expected,
+            vector.len()
+        );
+    }
+    Ok(())
+}
+
+fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
+    vector.as_bytes().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn unit_vector(dimension: usize, fill: f32) -> Vec<f32> {
+        let mut vec = vec![fill; dimension];
+        let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for value in vec.iter_mut() {
+            *value /= norm;
         }
+        vec
     }
 
-    fs::remove_dir_all(path).with_context(|| {
-        format!(
-            "failed to clear obsolete embedding directory {}",
-            path.display()
-        )
-    })?;
-    fs::create_dir_all(path)
-        .with_context(|| format!("failed to recreate embedding directory {}", path.display()))?;
-    Ok(true)
-}
+    #[tokio::test]
+    async fn bootstrap_roundtrip_embeddings() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path)?);
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let (store, changed) =
+            EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        assert!(!changed, "unexpected model change during first bootstrap");
 
-#[cfg(feature = "vector-lancedb")]
-fn write_metadata(path: &Path, descriptor: &EmbeddingDescriptor) -> Result<()> {
-    let metadata_path = path.join("metadata.json");
-    let metadata = EmbeddingMetadata {
-        model_id: descriptor.identifier().to_string(),
-        repository: descriptor.repository().to_string(),
-        dimension: descriptor.dimension(),
-    };
-    let json = serde_json::to_string_pretty(&metadata)
-        .context("failed to serialise embedding metadata")?;
-    fs::write(&metadata_path, json).with_context(|| {
-        format!(
-            "failed to write embedding metadata to {}",
-            metadata_path.display()
-        )
-    })
-}
+        let timestamp = Utc::now();
+        let base_vector = unit_vector(descriptor.dimension(), 1.0);
+        let alt_vector = unit_vector(descriptor.dimension(), -1.0);
 
-#[cfg(feature = "vector-lancedb")]
-#[derive(Debug, Serialize, Deserialize)]
-struct EmbeddingMetadata {
-    model_id: String,
-    repository: String,
-    dimension: usize,
+        let record = EmbeddingRecord {
+            note_id: "note-1".to_string(),
+            vector: base_vector.clone(),
+            indexed_at: timestamp,
+        };
+        let other = EmbeddingRecord {
+            note_id: "note-2".to_string(),
+            vector: alt_vector.clone(),
+            indexed_at: timestamp,
+        };
+
+        store.upsert_embeddings(&[record, other]).await?;
+
+        let matches = store.search(&base_vector, 5, 0.3).await?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].note_id, "note-1");
+        assert!(matches[0].distance <= 1e-4);
+
+        store
+            .delete_embeddings(&["note-1".to_string(), "note-2".to_string()])
+            .await?;
+        let after = store.search(&base_vector, 5, 0.3).await?;
+        assert!(after.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_detects_model_change() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path)?);
+
+        let fast = EmbeddingDescriptor::resolve("fast")?;
+        let (_, changed_fast) = EmbeddingStore::bootstrap(Arc::clone(&database), &fast).await?;
+        assert!(!changed_fast);
+
+        let better = EmbeddingDescriptor::resolve("better")?;
+        let (_, changed_better) = EmbeddingStore::bootstrap(Arc::clone(&database), &better).await?;
+        assert!(changed_better);
+
+        let (_, changed_again) = EmbeddingStore::bootstrap(Arc::clone(&database), &better).await?;
+        assert!(!changed_again);
+        Ok(())
+    }
 }

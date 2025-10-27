@@ -5,11 +5,14 @@ use std::{
     collections::HashMap,
     fs,
     path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Once,
+        atomic::{AtomicI32, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -29,9 +32,11 @@ thread_local! {
 }
 
 static NEXT_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
+static SQLITE_VEC_REGISTER: Once = Once::new();
+static SQLITE_VEC_STATUS: AtomicI32 = AtomicI32::new(rusqlite::ffi::SQLITE_OK);
 
 /// Current schema version for the Arrowhead index database.
-const INDEX_SCHEMA_VERSION: i32 = 3;
+const INDEX_SCHEMA_VERSION: i32 = 4;
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +60,7 @@ impl IndexDatabase {
         let path = path.as_ref().to_path_buf();
         debug!(path = %path.display(), "initialising SQLite index database");
 
+        ensure_sqlite_vec_registered()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create database directory {}", parent.display())
@@ -469,6 +475,7 @@ impl IndexDatabase {
 }
 
 fn init_connection(conn: &Connection) -> Result<()> {
+    ensure_sqlite_vec_registered()?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .context("failed to set journal_mode")?;
     conn.pragma_update(None, "synchronous", "NORMAL")
@@ -523,12 +530,38 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             tokenize = 'porter unicode61',
             columnsize = 0
         );
+
+        CREATE TABLE IF NOT EXISTS embedding_metadata (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            model_id TEXT NOT NULL,
+            repository TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )
     .context("failed to apply schema migrations")?;
 
     conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
         .context("failed to set schema version")
+}
+
+fn ensure_sqlite_vec_registered() -> Result<()> {
+    SQLITE_VEC_REGISTER.call_once(|| unsafe {
+        let rc = rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+        SQLITE_VEC_STATUS.store(rc, Ordering::SeqCst);
+    });
+
+    let rc = SQLITE_VEC_STATUS.load(Ordering::SeqCst);
+    if rc != rusqlite::ffi::SQLITE_OK {
+        Err(anyhow!(
+            "failed to register sqlite-vec extension (sqlite rc {rc})"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Connection handle tied to a worker thread for SQLite reuse.
