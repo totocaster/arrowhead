@@ -149,6 +149,10 @@ arrowhead search hybrid "mixed query" --vault /path/to/vault
 arrowhead search fts "project roadmap" --vault /path/to/vault --format paths
 arrowhead search semantic "notes about embeddings" --vault /path/to/vault --format ids
 
+# Graph pipelines
+arrowhead graph orphans --vault /path/to/vault --format ids | head -20
+arrowhead graph backlinks "Project Hub" --vault /path/to/vault --format ids
+
 # CRUD helpers + graph analytics
 arrowhead notes list --vault /path/to/vault --json
 arrowhead graph context "Project Hub" --vault /path/to/vault
@@ -165,7 +169,7 @@ arrowhead vault cleanup
 arrowhead --mcp --stdio
 ```
 
-Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available.
+Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available. Graph listings pick up the same pipe-friendly `--format ids` option for backlinks, forward-links, orphans, and unresolved link reports.
 
 ## Roadmap
 
