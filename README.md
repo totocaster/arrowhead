@@ -1,4 +1,8 @@
-![Arrowhead banner](docs/assets/Arrowhead_GitHub_Logo.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/github-logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/github-logo-light.png">
+  <img alt="Arrowhead banner" src="docs/assets/github-logo-light.png">
+</picture>
 
 **Fast Obsidian search and discovery that makes AI agents your true knowledge assistant.**
 
