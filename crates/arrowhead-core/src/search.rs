@@ -313,9 +313,8 @@ impl SearchService {
 
         let missing_ids: Vec<String> = combined
             .iter()
-            .filter_map(|(note_id, entry)| {
-                (entry.fts.is_none() && entry.semantic.is_some()).then(|| note_id.clone())
-            })
+            .filter(|(_, entry)| entry.fts.is_none() && entry.semantic.is_some())
+            .map(|(note_id, _)| note_id.clone())
             .collect();
 
         let metadata_map = self

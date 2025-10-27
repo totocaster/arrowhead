@@ -580,9 +580,17 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
 fn ensure_sqlite_vec_registered() -> Result<()> {
     SQLITE_VEC_REGISTER.call_once(|| unsafe {
-        let rc = rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+        type ExtensionEntry = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> i32;
+
+        let entry: ExtensionEntry = std::mem::transmute::<*const (), ExtensionEntry>(
             sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        );
+
+        let rc = rusqlite::ffi::sqlite3_auto_extension(Some(entry));
         SQLITE_VEC_STATUS.store(rc, Ordering::SeqCst);
     });
 

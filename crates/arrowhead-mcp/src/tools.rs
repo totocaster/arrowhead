@@ -75,22 +75,13 @@ pub struct GraphLinksPayload {
 }
 
 /// Request parameters shared by all search methods.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SearchParams {
     /// Query string to evaluate.
     pub query: String,
     /// Optional maximum number of results to return.
     pub limit: Option<usize>,
-}
-
-impl Default for SearchParams {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            limit: None,
-        }
-    }
 }
 
 /// Response payload wrapping search results.
@@ -155,22 +146,13 @@ pub struct NoteReadParams {
 }
 
 /// Parameters for listing notes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct NotesListParams {
     /// When true, omit additional note metadata and return identifiers only.
     pub ids_only: bool,
     /// Maximum number of entries to return.
     pub limit: Option<usize>,
-}
-
-impl Default for NotesListParams {
-    fn default() -> Self {
-        Self {
-            ids_only: false,
-            limit: None,
-        }
-    }
 }
 
 /// Parameters for metadata lookups.
@@ -429,17 +411,11 @@ pub struct RelatedNotesPayload {
 }
 
 /// Optional parameters controlling vault statistics aggregation.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct VaultStatsParams {
     /// Maximum number of recent notes to include in the response.
     pub recent_limit: Option<usize>,
-}
-
-impl Default for VaultStatsParams {
-    fn default() -> Self {
-        Self { recent_limit: None }
-    }
 }
 
 /// Aggregated vault statistics for `mcp.discovery.get_vault_stats`.

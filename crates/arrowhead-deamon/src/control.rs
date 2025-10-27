@@ -136,19 +136,19 @@ async fn handle_connection(
             let response = ControlResponse::Status { status: snapshot };
             let mut writer = BufWriter::new(writer);
             write_response(&mut writer, &response).await?;
-            return Ok(());
+            Ok(())
         }
         ControlRequest::StatusSubscribe => {
             let writer = BufWriter::new(writer);
             stream_status(writer, status, frames).await?;
-            return Ok(());
+            Ok(())
         }
         ControlRequest::Shutdown => {
             let _ = shutdown_tx.send(());
             let mut writer = BufWriter::new(writer);
             let response = ControlResponse::ShutdownAck;
             write_response(&mut writer, &response).await?;
-            return Ok(());
+            Ok(())
         }
     }
 }

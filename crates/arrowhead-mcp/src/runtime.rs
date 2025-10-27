@@ -752,12 +752,7 @@ fn sort_value_kinds(kinds: &mut [MetadataValueKind]) {
 
 fn build_obsidian_settings(vault: &Vault) -> Option<ObsidianSettingsPayload> {
     let attachments = vault.settings().attachments_folder().map(PathBuf::from);
-    let ignored = vault
-        .settings()
-        .ignored_folders()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let ignored = vault.settings().ignored_folders().to_vec();
 
     if attachments.is_none() && ignored.is_empty() {
         None
