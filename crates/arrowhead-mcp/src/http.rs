@@ -114,8 +114,10 @@ where
 
     /// Construct a new server using default transport limits and the supplied auth settings.
     pub fn with_auth(handler: Arc<H>, auth: AuthConfig) -> Result<Self> {
-        let mut config = HttpServerConfig::default();
-        config.auth = auth;
+        let config = HttpServerConfig {
+            auth,
+            ..HttpServerConfig::default()
+        };
         Self::new(handler, config)
     }
 
@@ -169,7 +171,7 @@ where
             );
 
         Router::new()
-            .route("/health", get(handle_health::<H>))
+            .route("/health", get(handle_health))
             .route("/rpc", post(handle_rpc::<H>))
             .route("/rpc/{token}", post(handle_rpc_with_token::<H>))
             .with_state(state)
@@ -246,10 +248,7 @@ where
     }
 }
 
-async fn handle_health<H>() -> impl IntoResponse
-where
-    H: MessageHandler,
-{
+async fn handle_health() -> impl IntoResponse {
     #[derive(Serialize)]
     struct HealthResponse<'a> {
         status: &'a str,
@@ -623,9 +622,11 @@ mod tests {
     where
         H: MessageHandler,
     {
-        let mut config = HttpServerConfig::default();
-        config.auth = auth;
-        config.ip_allowlist = ip_allowlist;
+        let config = HttpServerConfig {
+            auth,
+            ip_allowlist,
+            ..HttpServerConfig::default()
+        };
         HttpServer::new(handler, config).expect("build http server")
     }
 
@@ -749,11 +750,13 @@ mod tests {
     #[tokio::test]
     async fn enforces_concurrency_limit() {
         let handler = Arc::new(SlowHandler);
-        let mut config = HttpServerConfig::default();
-        config.max_concurrency = 1;
         let mut builder = TokenStoreBuilder::new();
         builder.add_raw_token(TEST_TOKEN).unwrap();
-        config.auth = AuthConfig::new(AuthMode::Bearer, builder.build());
+        let config = HttpServerConfig {
+            max_concurrency: 1,
+            auth: AuthConfig::new(AuthMode::Bearer, builder.build()),
+            ..HttpServerConfig::default()
+        };
         let server = HttpServer::new(handler, config).expect("http server");
         let app = router_with_client(server, SocketAddr::from(([127, 0, 0, 1], 4003)));
 

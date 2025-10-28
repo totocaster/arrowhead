@@ -169,10 +169,12 @@ fn prepare_http_server(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<S
     let allow_list = build_allow_list(ctx, cli)?;
     let (token_store, display_tokens) = collect_tokens(ctx, cli)?;
 
-    let mut http_config = HttpServerConfig::default();
-    http_config.bind_address = bind;
-    http_config.auth = AuthConfig::new(auth_mode, token_store);
-    http_config.ip_allowlist = allow_list;
+    let mut http_config = HttpServerConfig {
+        bind_address: bind,
+        auth: AuthConfig::new(auth_mode, token_store),
+        ip_allowlist: allow_list,
+        ..HttpServerConfig::default()
+    };
     if let Some(limit) = cli.max_concurrency.or(ctx.config.mcp.max_concurrency) {
         http_config.max_concurrency = limit;
     }
@@ -278,7 +280,7 @@ fn collect_tokens(
     }
 
     if let Ok(value) = env::var(ENV_TOKEN) {
-        for token in value.split(|c| c == ',' || c == ' ') {
+        for token in value.split([',', ' ']) {
             let trimmed = token.trim();
             if trimmed.is_empty() {
                 continue;
@@ -303,7 +305,7 @@ fn read_lines_trimmed(path: &Path) -> Result<Vec<String>> {
     let reader = io::BufReader::new(file);
     Ok(reader
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(|line| line.ok())
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect())
