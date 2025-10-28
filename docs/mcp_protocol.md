@@ -26,7 +26,9 @@ with a JSON-RPC error payload, while authentication/account policy failures
 return `401` (missing credentials) or `403` (rejected token/IP). Request bodies
 are size-limited, the default bind is `127.0.0.1:3911`, and both bearer headers
 and link-token paths are supported (details below). A simple readiness probe
-is available at `GET /health`.
+is available at `GET /health`. For internet-facing deployments, terminate TLS
+and apply rate limiting via a reverse proxy (nginx, Caddy, Traefik, etc.) while
+keeping Arrowhead bound to localhost.
 
 Both transports reuse the shared request handlers defined in
 `crates/arrowhead-mcp`.
@@ -87,6 +89,31 @@ The HTTP transport restricts inbound traffic to localhost (`127.0.0.0/8` and
 (`--allow`, `--allow-file`) or `[mcp] allowed_ips` entries in the config file.
 Requests originating outside the allowlist are rejected with `403` before the
 authentication layer runs.
+
+### Recommended Reverse Proxy
+
+To operate securely on the public internet, run Arrowhead behind a reverse
+proxy that terminates HTTPS and forwards requests over HTTP to the local MCP
+server. A minimal nginx example:
+
+```
+server {
+    listen 443 ssl;
+    server_name arrowhead.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/arrowhead.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/arrowhead.example.com/privkey.pem;
+
+    location / {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_pass http://127.0.0.1:3911;
+    }
+}
+```
+
+Combine this with Arrowhead's IP allowlist (e.g., permit only `127.0.0.1`) so
+all internet traffic arrives through the proxy.
 
 ## Pending Work
 

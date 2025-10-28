@@ -10,7 +10,7 @@ exposes to other applications and tooling. Both the CLI and MCP transports
 - `arrowhead search` — execute FTS/semantic/hybrid searches.
 - `arrowhead notes` — CRUD operations for working with notes.
 - `arrowhead --mcp` — launch the stdio-based MCP server that exposes the same services to AI agents.
-- `arrowhead --mcp-server` — start the HTTP MCP transport (Axum-based JSON-RPC 2.0) with bearer/link-token authentication, IP allowlists, and health reporting. Key flags:
+- `arrowhead --mcp-server` — start the HTTP MCP transport (Axum-based JSON-RPC 2.0) with bearer/link-token authentication, IP allowlists, and health reporting. Pair it with a reverse proxy (nginx / Caddy / Cloudflare Tunnel) when exposing it outside localhost. Key flags:
   - `--bind <ADDR>` to override the bind address (defaults to `127.0.0.1:3911`).
   - `--auth-mode <bearer|link-token>` to choose authentication strategy.
   - `--token`, `--token-file`, `--token-hash` to provide raw or hashed credentials at runtime.

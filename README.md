@@ -89,7 +89,9 @@ To configure a local MCP client, add this snippet:
 }
 ```
 
-For remote or headerless clients, launch the HTTP transport instead:
+For remote or headerless clients, launch the HTTP transport instead (keep
+Arrowhead bound to localhost and put a TLS reverse proxy in front if you expose
+it beyond your machine):
 
 ```bash
 # Generate a new token (digest stored in config, raw token printed once)
