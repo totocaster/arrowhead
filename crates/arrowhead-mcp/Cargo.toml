@@ -35,6 +35,13 @@ tower-http.workspace = true
 
 # Logging
 tracing.workspace = true
+once_cell = "1.19"
+
+# Crypto & networking
+sha2.workspace = true
+subtle.workspace = true
+hex.workspace = true
+ipnet.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3.8"

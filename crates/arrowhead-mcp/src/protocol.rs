@@ -435,7 +435,7 @@ impl Incoming {
         match result {
             Ok(message) => Ok(message),
             Err(error) => match error.classify() {
-                Category::Syntax | Category::Io => {
+                Category::Syntax | Category::Io | Category::Eof => {
                     Err(ProtocolError::parse_error(error.to_string()))
                 }
                 _ => Err(ProtocolError::invalid_request(error.to_string())),
@@ -446,7 +446,9 @@ impl Incoming {
     /// Convert raw JSON into an `Incoming` message.
     pub fn from_value(value: Value) -> std::result::Result<Self, ProtocolError> {
         serde_json::from_value(value).map_err(|err| match err.classify() {
-            Category::Syntax | Category::Io => ProtocolError::parse_error(err.to_string()),
+            Category::Syntax | Category::Io | Category::Eof => {
+                ProtocolError::parse_error(err.to_string())
+            }
             _ => ProtocolError::invalid_request(err.to_string()),
         })
     }

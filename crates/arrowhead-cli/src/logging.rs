@@ -9,7 +9,7 @@ use tracing::Level;
 use tracing::dispatcher::DefaultGuard;
 use tracing_appender::{non_blocking, rolling};
 
-const LOG_FILE_NAME: &str = "cli.log";
+const CLI_LOG_FILE_NAME: &str = "cli.log";
 const MAX_LOG_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -24,12 +24,21 @@ pub struct LoggingGuard {
 ///
 /// The subscriber remains active until the returned guard is dropped.
 pub fn scoped_file_logging(log_root: &Path, verbosity: u8) -> Result<LoggingGuard> {
+    scoped_named_file_logging(log_root, verbosity, CLI_LOG_FILE_NAME)
+}
+
+/// Initialise a scoped file logger writing to the provided file name.
+pub fn scoped_named_file_logging(
+    log_root: &Path,
+    verbosity: u8,
+    file_name: &str,
+) -> Result<LoggingGuard> {
     fs::create_dir_all(log_root)
         .with_context(|| format!("failed to create log directory {}", log_root.display()))?;
 
-    prune_old_logs(log_root)?;
+    prune_old_logs(log_root, file_name)?;
 
-    let appender = rolling::never(log_root, LOG_FILE_NAME);
+    let appender = rolling::never(log_root, file_name);
     let (writer, writer_guard) = non_blocking(appender);
 
     let level = verbosity_to_level(verbosity);
@@ -74,7 +83,7 @@ fn verbosity_to_level(verbosity: u8) -> Level {
     }
 }
 
-fn prune_old_logs(log_root: &Path) -> Result<()> {
+fn prune_old_logs(log_root: &Path, primary: &str) -> Result<()> {
     let now = SystemTime::now();
 
     for entry in fs::read_dir(log_root)
@@ -92,7 +101,7 @@ fn prune_old_logs(log_root: &Path) -> Result<()> {
 
         let is_primary = path
             .file_name()
-            .map(|name| name == LOG_FILE_NAME)
+            .map(|name| name == primary)
             .unwrap_or(false);
 
         let too_old = age > MAX_LOG_AGE;

@@ -54,11 +54,16 @@ hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 # HTTP dependencies
 axum = "0.8.6"
 tower = "0.5.2"
-tower-http = { version = "0.6.6", features = ["trace"] }
+tower-http = { version = "0.6.6", features = ["trace", "limit"] }
 
 # Parsing dependencies
 serde_yaml = "0.9.34"
 regex = "1.12.2"
+hex = "0.4.3"
+ipnet = "2.9.0"
+subtle = "2.5.0"
+sha2 = "0.10.9"
+rand = "0.8.5"
 
 # UI dependencies
 indicatif = "0.18.0"

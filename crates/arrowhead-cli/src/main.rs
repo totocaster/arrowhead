@@ -12,6 +12,7 @@ mod commands;
 mod config;
 mod logging;
 
+use commands::mcp::McpServerCliArgs;
 use commands::{CommandContext, graph, init, mcp, notes, search, status, vault};
 use config::AppConfig;
 
@@ -30,8 +31,14 @@ struct Cli {
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
     /// Start the MCP stdio server instead of running a CLI subcommand.
-    #[arg(long, conflicts_with = "command")]
+    #[arg(long, conflicts_with = "command", conflicts_with = "mcp_server")]
     mcp: bool,
+    /// Start the MCP HTTP server.
+    #[arg(long, conflicts_with = "command", conflicts_with = "mcp")]
+    mcp_server: bool,
+    /// Options controlling MCP HTTP server behaviour.
+    #[command(flatten)]
+    mcp_server_opts: McpServerCliArgs,
     /// Command to execute.
     #[command(subcommand)]
     command: Option<Commands>,
@@ -72,7 +79,12 @@ async fn main() -> Result<()> {
     let mut ctx = CommandContext::new(config, cli.config.clone(), cli.verbose);
 
     if cli.mcp {
-        mcp::run(&mut ctx).await?;
+        mcp::run_stdio(&mut ctx).await?;
+        return Ok(());
+    }
+
+    if cli.mcp_server {
+        mcp::run_server(&mut ctx, &cli.mcp_server_opts).await?;
         return Ok(());
     }
 
