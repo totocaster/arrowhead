@@ -1,9 +1,8 @@
 # Arrowhead Public API
 
 This document captures the high-level API surface that Arrowhead currently
-exposes to other applications and tooling. The CLI and stdio MCP transport
-described below ship in the repository today; the HTTP transport remains on
-the roadmap.
+exposes to other applications and tooling. Both the CLI and MCP transports
+(stdio and HTTP) ship in the repository today.
 
 ## CLI Commands
 
@@ -11,6 +10,13 @@ the roadmap.
 - `arrowhead search` — execute FTS/semantic/hybrid searches.
 - `arrowhead notes` — CRUD operations for working with notes.
 - `arrowhead --mcp` — launch the stdio-based MCP server that exposes the same services to AI agents.
+- `arrowhead --mcp-server` — start the HTTP MCP transport (Axum-based JSON-RPC 2.0) with bearer/link-token authentication, IP allowlists, and health reporting. Key flags:
+  - `--bind <ADDR>` to override the bind address (defaults to `127.0.0.1:3911`).
+  - `--auth-mode <bearer|link-token>` to choose authentication strategy.
+  - `--token`, `--token-file`, `--token-hash` to provide raw or hashed credentials at runtime.
+  - `--allow`/`--allow-file` to append CIDR ranges to the default localhost allowlist.
+  - `--generate-token` to mint a new random token, persist its digest to the config, and print usable examples before exiting.
+  - Environment overrides: `ARROWHEAD_MCP_BIND` (bind address) and `ARROWHEAD_MCP_TOKEN` (additional raw tokens).
 - `arrowhead graph` — inspect WikiLink graph relationships.
   - Default invocation (`arrowhead graph <NOTE_ID>`) returns a combined context view listing outbound links, backlinks, and unresolved edges in one response.
   - All graph subcommands accept `--json` to emit machine-readable payloads mirroring the CLI output.
@@ -36,11 +42,16 @@ types defined in `types.rs`.
 
 ## MCP Integration
 
-`arrowhead-mcp` now ships a production-ready stdio transport that conforms to
-the Model Context Protocol (MCP). `arrowhead --mcp` launches a long-running
-process that reads newline-delimited JSON-RPC 2.0 frames from stdin and emits
-responses on stdout. The transport surfaces a bounded in-flight queue, request
-metrics (exposed via `StdioServer::metrics()`), and structured tracing.
+`arrowhead-mcp` now ships production-ready stdio *and* HTTP transports that
+conform to the Model Context Protocol (MCP). `arrowhead --mcp` launches a
+long-running process that reads newline-delimited JSON-RPC 2.0 frames from
+stdin and emits responses on stdout. `arrowhead --mcp-server` serves the same
+tool surface over `POST /rpc`, enforces bearer or link-token authentication,
+filters incoming requests via configurable CIDR allowlists, exposes `GET /health`
+for readiness probes, and mirrors the stdio backpressure semantics (429 when
+the concurrency guard is saturated). Both transports reuse the shared handler
+registry and structured tracing, ensuring identical behaviour regardless of
+client transport.
 
 Implemented tool surface:
 

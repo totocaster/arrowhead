@@ -23,7 +23,6 @@ use arrowhead_core::{
 use crate::{
     protocol::{ErrorCode, Notification, ProtocolError, Request},
     runtime::McpRuntime,
-    stdio::MessageHandler,
     tools::{
         DaemonStatusPayload, GraphContextPayload, GraphLinksPayload, GraphNoteParams,
         GraphOrphansPayload, GraphUnresolvedPayload, InitializeParams, InitializePayload,
@@ -33,6 +32,7 @@ use crate::{
         SearchResultPayload, SearchResultsPayload, ServerCapabilitiesPayload, ServerInfoPayload,
         ToolDescriptor, ToolExample, ToolsListPayload, VaultStatsParams,
     },
+    transport::MessageHandler,
 };
 
 /// Dispatches MCP method calls to concrete implementations.

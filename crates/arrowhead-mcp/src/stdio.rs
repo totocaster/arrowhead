@@ -8,7 +8,6 @@ use std::sync::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     sync::{Semaphore, mpsc, mpsc::error::TrySendError},
@@ -19,6 +18,8 @@ use tracing::{Instrument, debug, error, info, trace, warn};
 use crate::protocol::{
     ErrorCode, Id, Incoming, Message, Notification, ProtocolError, Request, Response,
 };
+
+pub use crate::transport::MessageHandler;
 
 /// Default size of the inbound request queue.
 const DEFAULT_CHANNEL_CAPACITY: usize = 64;
@@ -153,25 +154,6 @@ impl StdioMetrics {
             notifications_dropped: self.inner.notifications_dropped.load(Ordering::Relaxed),
             parse_errors: self.inner.parse_errors.load(Ordering::Relaxed),
         }
-    }
-}
-
-/// Trait implemented by request dispatchers consumed by the stdio transport.
-#[async_trait]
-pub trait MessageHandler: Send + Sync + 'static {
-    /// Handle an RPC request and return the JSON result payload.
-    async fn handle_request(
-        &self,
-        request: Request,
-    ) -> std::result::Result<serde_json::Value, ProtocolError>;
-
-    /// Handle a JSON-RPC notification (no response emitted on success).
-    async fn handle_notification(
-        &self,
-        notification: Notification,
-    ) -> std::result::Result<(), ProtocolError> {
-        let _ = notification;
-        Ok(())
     }
 }
 

@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use arrowhead_core::status::ActivityState;
+use arrowhead_mcp::auth::{AuthMode, TokenDigest};
 use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,9 @@ pub struct AppConfig {
     /// Deamon configuration and cached status.
     #[serde(default, skip_serializing_if = "DeamonConfig::is_empty")]
     pub deamon: DeamonConfig,
+    /// MCP HTTP server configuration.
+    #[serde(default, skip_serializing_if = "McpHttpConfig::is_empty")]
+    pub mcp: McpHttpConfig,
 }
 
 impl Default for AppConfig {
@@ -26,6 +30,7 @@ impl Default for AppConfig {
             vault: None,
             embedding_model: Some("fast".to_string()),
             deamon: DeamonConfig::default(),
+            mcp: McpHttpConfig::default(),
         }
     }
 }
@@ -93,6 +98,54 @@ impl DeamonConfig {
     }
 }
 
+/// HTTP MCP server configuration persisted in the CLI config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpHttpConfig {
+    /// Socket address to bind to when launching the server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_address: Option<String>,
+    /// Authentication mode enforced by the server.
+    pub auth_mode: AuthMode,
+    /// Persisted hashed tokens accepted by the server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<TokenDigest>,
+    /// Additional IP ranges (CIDR) granted access beyond localhost.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ips: Vec<String>,
+    /// Optional override for the maximum concurrent requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
+    /// Optional override for the maximum request body size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
+}
+
+impl Default for McpHttpConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: None,
+            auth_mode: AuthMode::Bearer,
+            tokens: Vec::new(),
+            allowed_ips: Vec::new(),
+            max_concurrency: None,
+            max_body_bytes: None,
+        }
+    }
+}
+
+impl McpHttpConfig {
+    /// Determine whether the configuration contains any persisted values.
+    pub fn is_empty(&self) -> bool {
+        self.bind_address.is_none()
+            && self.tokens.is_empty()
+            && self.allowed_ips.is_empty()
+            && self.max_concurrency.is_none()
+            && self.max_body_bytes.is_none()
+            && matches!(self.auth_mode, AuthMode::Bearer)
+    }
+}
+
 /// Lightweight cache of the most recently observed deamon status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeamonStatusSummary {
@@ -133,5 +186,24 @@ mod tests {
         let toml = toml::to_string(&config).expect("serialize config");
         assert!(toml.contains("socket_path"));
         assert!(toml.contains("auto_start_enabled"));
+    }
+
+    #[test]
+    fn default_config_omits_mcp_section() {
+        let config = AppConfig::default();
+        let toml = toml::to_string(&config).expect("serialize config");
+        assert!(!toml.contains("mcp"));
+    }
+
+    #[test]
+    fn persisted_mcp_tokens_serialise() {
+        let mut config = AppConfig::default();
+        config.mcp.bind_address = Some("0.0.0.0:8080".to_string());
+        config.mcp.allowed_ips = vec!["10.0.0.0/8".to_string()];
+        config.mcp.tokens.push(TokenDigest::hash("test-token"));
+        let toml = toml::to_string(&config).expect("serialize config");
+        assert!(toml.contains("0.0.0.0:8080"));
+        assert!(toml.contains("10.0.0.0/8"));
+        assert!(toml.contains("tokens"));
     }
 }

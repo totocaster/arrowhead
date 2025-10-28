@@ -51,6 +51,7 @@ The Arrowhead Core runtime watches your vault, streams changes into a bounded wr
 - Vault-aware indexing that respects `.obsidian` settings, templates, and ignore lists.
 - Full-text, semantic, and hybrid search with snippet generation and metadata filters.
 - Notes CRUD, graph analytics, and discovery helpers via CLI or MCP tool surface.
+- HTTP MCP transport with bearer/link-token authentication, CIDR allowlists, and `/health` readiness probes.
 - Semantic embeddings using fastembed with vectors stored in sqlite-vec alongside the primary index.
 - Auto-start manifests for macOS (launchd) and Linux (`systemd --user`) with CLI management.
 
@@ -88,6 +89,20 @@ To configure a local MCP client, add this snippet:
 }
 ```
 
+For remote or headerless clients, launch the HTTP transport instead:
+
+```bash
+# Generate a new token (digest stored in config, raw token printed once)
+arrowhead --mcp-server --generate-token
+
+# Start the server on an explicit bind address, allowing a CIDR range
+arrowhead --mcp-server --bind 0.0.0.0:3911 --allow 10.0.0.0/8 --token $ARROWHEAD_TOKEN
+```
+
+The server enforces bearer headers by default. In link-token mode
+(`--auth-mode link-token`) clients without header support can call
+`POST /rpc/<token>`; combine with HTTPS via a reverse proxy for production.
+
 ### Memory footprint
 
 The daemon keeps semantic search ready by loading the `fastembed` model into an embedding pool sized to your CPU count (up to eight concurrent model handles). Each handle pulls the ~90 MB ONNX weights plus ONNX Runtime state, so full semantic mode typically consumes around 1 GB of RAM even when idle.  
@@ -123,7 +138,7 @@ arrowhead/
 - **Daemon runtime**: `tokio` 1.40+ with `notify`-backed filesystem watching.
 - **Database**: SQLite (`rusqlite`) with FTS5 and JSON metadata columns.
 - **Vectors**: `fastembed` embeddings persisted via sqlite-vec inside the SQLite index.
-- **MCP**: Standards-compliant stdio transport; HTTP transport under active development.
+- **MCP**: Standards-compliant stdio and Axum-based HTTP transports with shared request handlers.
 
 ## Building
 
@@ -149,6 +164,7 @@ cargo test
 ```bash
 # Initialize a vault (creates .arrowhead/, prepares index DB, offers auto-start)
 arrowhead init --vault /path/to/vault [--embeddings fast|good|better|none] [--fts-only]
+# (Subsequent commands reuse the stored vault path.)
 
 # Launch or check the background daemon
 arrowhead vault start
@@ -160,21 +176,21 @@ arrowhead vault autostart status
 arrowhead vault autostart disable
 
 # Search (FTS, semantic, or hybrid)
-arrowhead search fts "project roadmap" --vault /path/to/vault
-arrowhead search semantic "notes about embeddings" --vault /path/to/vault
-arrowhead search hybrid "mixed query" --vault /path/to/vault
+arrowhead search fts "project roadmap"
+arrowhead search semantic "notes about embeddings"
+arrowhead search hybrid "mixed query"
 
 # Pipe-friendly search output
-arrowhead search fts "project roadmap" --vault /path/to/vault --format paths
-arrowhead search semantic "notes about embeddings" --vault /path/to/vault --format ids
+arrowhead search fts "project roadmap" --format paths
+arrowhead search semantic "notes about embeddings" --format ids
 
 # Graph pipelines
-arrowhead graph orphans --vault /path/to/vault --format ids | head -20
-arrowhead graph backlinks "Project Hub" --vault /path/to/vault --format ids
+arrowhead graph orphans --format ids | head -20
+arrowhead graph backlinks "Project Hub" --format ids
 
 # CRUD helpers + graph analytics
-arrowhead notes list --vault /path/to/vault --json
-arrowhead graph context "Project Hub" --vault /path/to/vault
+arrowhead notes list --json
+arrowhead graph context "Project Hub"
 
 # Tail structured logs
 tail -f /path/to/vault/.arrowhead/logs/cli.log
@@ -185,14 +201,20 @@ arrowhead vault stop
 arrowhead vault cleanup
 
 # Run the MCP stdio server for Claude or other clients
-arrowhead --mcp --stdio
+arrowhead --mcp
+
+# Launch the HTTP MCP transport (bearer auth by default)
+arrowhead --mcp-server --bind 127.0.0.1:3911 --token $ARROWHEAD_TOKEN
+
+# Generate a token (digest persisted, token printed once)
+arrowhead --mcp-server --generate-token
 ```
 
 Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available. Graph listings pick up the same pipe-friendly `--format ids` option for backlinks, forward-links, orphans, and unresolved link reports.
 
 ## Roadmap
 
-- HTTP transport for MCP with bearer auth and multiplexed requests.
+- MCP observability: metrics/structured tracing for the HTTP transport plus TLS/reverse-proxy guidance.
 - Graph diagnostics: directional summaries, back-pressure metrics, large vault profiling.
 - Search hardening: semantic snippet tuning, sqlite-vec regression fixtures, hybrid scoring tweaks.
 - Model management UX: preset documentation, cache overrides, richer download progress.
