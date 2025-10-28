@@ -90,8 +90,8 @@ To configure a local MCP client, add this snippet:
 ```
 
 For remote or headerless clients, launch the HTTP transport instead (keep
-Arrowhead bound to localhost and put a TLS reverse proxy in front if you expose
-it beyond your machine):
+Arrowhead bound to localhost and put a TLS reverse proxy—or a zero-config mesh
+like Tailscale—in front if you expose it beyond your machine):
 
 ```bash
 # Generate a new token (digest stored in config, raw token printed once)
@@ -207,6 +207,9 @@ arrowhead --mcp
 
 # Launch the HTTP MCP transport (bearer auth by default)
 arrowhead --mcp-server --bind 127.0.0.1:3911 --token $ARROWHEAD_TOKEN
+
+# Run with a Tailscale funnel (after enabling funnel for your node)
+tailscale serve https / http://127.0.0.1:3911
 
 # Generate a token (digest persisted, token printed once)
 arrowhead --mcp-server --generate-token

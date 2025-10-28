@@ -115,6 +115,10 @@ server {
 Combine this with Arrowhead's IP allowlist (e.g., permit only `127.0.0.1`) so
 all internet traffic arrives through the proxy.
 
+If you prefer a zero-config tunnel, tools like Tailscale Funnel can expose the
+localhost server over HTTPS with a single command while still keeping Arrowhead
+bound to the loopback interface.
+
 ## Pending Work
 
 - Observability upgrades for the HTTP transport (metrics endpoint, structured
