@@ -362,11 +362,15 @@ fn default_related_notes_strategy() -> RelatedNotesStrategy {
 }
 
 /// Parameters for `mcp.discovery.get_related_notes`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct RelatedNotesParams {
     /// Anchor note identifier used as the similarity seed.
-    pub note_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Free-form query when no anchor note is provided.
+    pub query: Option<String>,
     #[serde(default)]
     /// Maximum number of related notes to return.
     pub limit: Option<usize>,
@@ -400,7 +404,11 @@ pub struct RelatedNotePayload {
 #[serde(rename_all = "camelCase")]
 pub struct RelatedNotesPayload {
     /// Identifier of the anchor note supplied by the client.
-    pub note_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Query string supplied by the client.
+    pub query: Option<String>,
     /// Strategy that produced the related notes.
     pub strategy: RelatedNotesStrategy,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -548,41 +556,80 @@ pub struct VaultConventionsPayload {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InitializeParams {
-    /// Name of the MCP client initiating the session.
-    pub client_name: String,
+    /// Protocol version requested by the client.
+    pub protocol_version: String,
     #[serde(default)]
-    /// Optional version string reported by the client.
-    pub client_version: Option<String>,
-    #[serde(default)]
-    /// Optional protocol version hint for forward compatibility.
-    pub protocol_version: Option<String>,
+    /// Capabilities advertised by the client.
+    pub capabilities: Value,
+    /// Descriptor of the connecting client.
+    pub client_info: ImplementationDescriptor,
 }
 
-/// Basic server descriptor emitted during `initialize`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerInfoPayload {
-    /// Display name of the Arrowhead MCP server.
+/// Basic implementation descriptor used by both client and server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImplementationDescriptor {
+    /// Programmatic identifier for the implementation.
     pub name: String,
-    /// Semantic version of the running server.
-    pub version: String,
+    /// Human-readable display name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Optional human-readable description.
-    pub description: Option<String>,
+    pub title: Option<String>,
+    /// Semantic version string.
+    pub version: String,
 }
 
 /// Capability flags advertised during `initialize`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerCapabilitiesPayload {
-    /// Indicates whether semantic search is available in this build.
-    pub semantic_search: bool,
-    /// Indicates whether note write operations are enabled.
-    pub note_writes: bool,
-    /// Indicates whether discovery analytics endpoints are registered.
-    pub discovery_tools: bool,
-    /// Indicates whether advanced graph analytics are enabled.
-    pub graph_tools: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional experimental capability payloads.
+    pub experimental: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional logging capability descriptor.
+    pub logging: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional completions capability descriptor.
+    pub completions: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional prompt capability descriptor.
+    pub prompts: Option<ListCapabilityPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional resource capability descriptor.
+    pub resources: Option<ResourceCapabilityPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional tool capability descriptor.
+    pub tools: Option<ToolCapabilityPayload>,
+}
+
+/// Capability payload describing list-style features.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListCapabilityPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Indicates whether list change notifications are supported.
+    pub list_changed: Option<bool>,
+}
+
+/// Capability payload describing resource support.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceCapabilityPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Indicates subscription support for resource updates.
+    pub subscribe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Indicates whether list change notifications are supported.
+    pub list_changed: Option<bool>,
+}
+
+/// Capability payload describing tool support.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCapabilityPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Indicates whether list change notifications are supported.
+    pub list_changed: Option<bool>,
 }
 
 /// Snapshot of daemon health exposed during initialization.
@@ -603,15 +650,19 @@ pub struct DaemonStatusPayload {
     pub queued_jobs: Option<usize>,
 }
 
-/// Response payload for `mcp.protocol.initialize`.
+/// Response payload for the spec `initialize` handshake.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InitializePayload {
-    /// Server descriptor for the Arrowhead MCP runtime.
-    pub server_info: ServerInfoPayload,
+pub struct InitializeResultPayload {
+    /// Negotiated protocol version.
+    pub protocol_version: String,
+    /// Server capabilities advertised to the client.
+    pub capabilities: ServerCapabilitiesPayload,
+    /// Descriptor for the running Arrowhead MCP server.
+    pub server_info: ImplementationDescriptor,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Capability flags advertised to the client.
-    pub capabilities: Option<ServerCapabilitiesPayload>,
+    /// Optional textual instructions for clients and LLMs.
+    pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional daemon status summary.
     pub daemon_status: Option<DaemonStatusPayload>,
@@ -621,43 +672,116 @@ pub struct InitializePayload {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDescriptor {
-    /// Fully qualified method name (e.g., `mcp.notes.read`).
+    /// Fully qualified tool identifier (e.g., `mcp.notes.read`).
     pub name: String,
-    /// Human-readable category grouping.
-    pub category: String,
-    /// Short description of what the tool does.
-    pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional human-friendly title.
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Short description of what the tool does.
+    pub description: Option<String>,
     /// JSON Schema describing request parameters.
-    pub input_schema: Option<Value>,
+    pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// JSON Schema describing the response payload.
     pub output_schema: Option<Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    /// Example invocations useful for client UX.
-    pub examples: Vec<ToolExample>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Optional feature flag required to enable the tool.
-    pub feature_flag: Option<String>,
+    /// Optional tool annotations surfaced to hosts.
+    pub annotations: Option<Value>,
 }
 
-/// Example helper embedded in `ToolDescriptor`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolExample {
-    /// Short label describing the example.
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Narrative summary of what the example demonstrates.
-    pub description: Option<String>,
-    /// Example request payload for the tool.
-    pub request: Value,
-}
-
-/// Response payload for `mcp.protocol.tools/list`.
+/// Response payload for `tools/list`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolsListPayload {
     /// Tools exposed by the Arrowhead MCP server keyed by method name.
     pub tools: Vec<ToolDescriptor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Cursor to continue pagination when more tools are available.
+    pub next_cursor: Option<String>,
+}
+
+/// Parameters for `tools/call`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallToolParams {
+    /// Name of the tool being invoked.
+    pub name: String,
+    #[serde(default)]
+    /// Arguments supplied to the tool invocation.
+    pub arguments: serde_json::Map<String, Value>,
+}
+
+/// Text content block returned from tool invocations.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextContentPayload {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    /// Text payload provided to the host/LLM.
+    pub text: String,
+}
+
+impl TextContentPayload {
+    /// Construct a text content block from the provided string.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            kind: "text",
+            text: text.into(),
+        }
+    }
+}
+
+/// Response payload for `tools/call`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallToolResultPayload {
+    /// Content segments produced by the tool invocation.
+    pub content: Vec<TextContentPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional structured data representation of the result.
+    pub structured_content: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Indicates whether the tool reported a recoverable error.
+    pub is_error: Option<bool>,
+}
+
+impl CallToolResultPayload {
+    /// Build a tool result from a structured payload.
+    pub fn from_value(result: Value) -> Self {
+        Self::from_value_with_message(result, None)
+    }
+
+    /// Build a tool result and optionally prepend a human-readable message.
+    pub fn from_value_with_message(result: Value, message: Option<String>) -> Self {
+        let structured_content = match &result {
+            Value::Object(_) => Some(result.clone()),
+            _ => None,
+        };
+
+        let mut content = Vec::new();
+        if let Some(message) = message {
+            if !message.is_empty() {
+                content.push(TextContentPayload::new(message));
+            }
+        }
+
+        let text = match &result {
+            Value::Null => "null".to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            Value::Number(num) => num.to_string(),
+            Value::String(s) => s.clone(),
+            Value::Array(_) | Value::Object(_) => {
+                serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+            }
+        };
+
+        content.push(TextContentPayload::new(text));
+
+        Self {
+            content,
+            structured_content,
+            is_error: None,
+        }
+    }
 }

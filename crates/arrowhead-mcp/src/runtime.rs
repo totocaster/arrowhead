@@ -14,7 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use arrowhead_core::vault::NoteInventoryEntry;
 use arrowhead_core::{
     GraphService, InventorySnapshot, MetadataMap, NoteRecord, SearchConfig, SearchService, Vault,
-    VaultConfig, VaultPaths, sqlite::IndexDatabase, status::DeamonStatus,
+    VaultConfig, VaultPaths,
+    sqlite::IndexDatabase,
+    status::{DeamonStatus, IssueSeverity, StatusIssue},
 };
 use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
 use chrono::Utc;
@@ -433,7 +435,82 @@ impl McpRuntime {
         }
 
         Ok(RelatedNotesPayload {
-            note_id: anchor.id,
+            note_id: Some(anchor.id),
+            query: None,
+            strategy: effective_strategy,
+            fallback_strategy,
+            related,
+        })
+    }
+
+    /// Determine related notes for a free-form query when no anchor note is supplied.
+    pub async fn compute_related_notes_for_query(
+        &self,
+        query: &str,
+        limit: Option<usize>,
+        strategy: RelatedNotesStrategy,
+    ) -> Result<RelatedNotesPayload> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            bail!("query must not be empty");
+        }
+
+        let limit = limit.unwrap_or(5).max(1);
+        let mut effective_strategy = match strategy {
+            RelatedNotesStrategy::Auto => {
+                if self.semantic_search_enabled() {
+                    RelatedNotesStrategy::Semantic
+                } else {
+                    RelatedNotesStrategy::Graph
+                }
+            }
+            other => other,
+        };
+
+        let mut fallback_strategy = None;
+        if !self.semantic_search_enabled()
+            && matches!(
+                effective_strategy,
+                RelatedNotesStrategy::Semantic | RelatedNotesStrategy::Hybrid
+            )
+        {
+            fallback_strategy = Some(effective_strategy);
+            effective_strategy = RelatedNotesStrategy::Graph;
+        }
+
+        let mut related = match effective_strategy {
+            RelatedNotesStrategy::Graph => {
+                let results = self.search.search_fts(trimmed, Some(limit * 2)).await?;
+                build_related_from_search_results(results, "", limit)
+            }
+            RelatedNotesStrategy::Semantic => {
+                let results = self
+                    .search
+                    .search_semantic(trimmed, Some(limit * 2))
+                    .await?;
+                build_related_from_search_results(results, "", limit)
+            }
+            RelatedNotesStrategy::Hybrid => {
+                let results = self.search.search_hybrid(trimmed, Some(limit * 2)).await?;
+                build_related_from_search_results(results, "", limit)
+            }
+            RelatedNotesStrategy::Auto => {
+                unreachable!("auto strategy should resolve before dispatching")
+            }
+        };
+
+        if related.is_empty() && !matches!(effective_strategy, RelatedNotesStrategy::Graph) {
+            let results = self.search.search_fts(trimmed, Some(limit * 2)).await?;
+            if !results.is_empty() {
+                fallback_strategy = Some(effective_strategy);
+                effective_strategy = RelatedNotesStrategy::Graph;
+                related = build_related_from_search_results(results, "", limit);
+            }
+        }
+
+        Ok(RelatedNotesPayload {
+            note_id: None,
+            query: Some(trimmed.to_string()),
             strategy: effective_strategy,
             fallback_strategy,
             related,
@@ -873,11 +950,19 @@ impl DaemonClient {
                         .await
                         .context("status fallback task aborted")??;
 
-                if let Some(status) = fallback {
-                    Err(anyhow!(
-                        "arrowhead deamon appears offline (last update {}). Start it with `arrowhead vault start` and retry.",
-                        status.updated_at.to_rfc3339()
-                    ))
+                if let Some(mut status) = fallback {
+                    let code = "daemon_offline_cached_status";
+                    let already_recorded = status.issues.iter().any(|issue| issue.code == code);
+                    if !already_recorded {
+                        let mut issue = StatusIssue::new(
+                            code,
+                            "Using cached daemon status because the live daemon could not be reached.",
+                            IssueSeverity::Warning,
+                        );
+                        issue.detail = Some(err.to_string());
+                        status.issues.push(issue);
+                    }
+                    Ok(status)
                 } else {
                     Err(anyhow!(
                         "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead vault start` and retry.",

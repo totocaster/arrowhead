@@ -4,9 +4,10 @@ use std::{
     sync::Arc,
 };
 
+use arrowhead_core::status::DeamonStatus;
 use arrowhead_mcp::{
     handlers::HandlerRegistry,
-    protocol::{Params, Request},
+    protocol::{Params, ProtocolError, Request},
     runtime::{McpRuntime, RuntimeOptions},
     stdio::MessageHandler,
 };
@@ -60,19 +61,45 @@ async fn build_handler(temp_dir: &TempDir) -> HandlerRegistry {
     HandlerRegistry::new(Arc::new(runtime))
 }
 
+async fn call_tool(handler: &HandlerRegistry, name: &str, arguments: Value) -> Value {
+    let params = Params::new(json!({ "name": name, "arguments": arguments })).expect("tool params");
+    let request = Request::new(0, "tools/call", params);
+    handler
+        .handle_request(request)
+        .await
+        .expect("tool call succeeds")
+}
+
+async fn call_tool_structured(
+    handler: &HandlerRegistry,
+    name: &str,
+    arguments: Value,
+) -> serde_json::Map<String, Value> {
+    call_tool(handler, name, arguments)
+        .await
+        .get("structuredContent")
+        .and_then(Value::as_object)
+        .cloned()
+        .expect("structured content present")
+}
+
+async fn call_tool_error(handler: &HandlerRegistry, name: &str, arguments: Value) -> ProtocolError {
+    let params = Params::new(json!({ "name": name, "arguments": arguments })).expect("tool params");
+    let request = Request::new(0, "tools/call", params);
+    handler
+        .handle_request(request)
+        .await
+        .expect_err("tool call should fail")
+}
+
 #[tokio::test]
 async fn notes_list_ids_only_returns_results() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let params = Params::new(json!({ "idsOnly": true })).expect("params");
-    let request = Request::new(1, "mcp.notes.list", params);
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("list request succeeds");
+    let structured = call_tool_structured(&handler, "notes_list", json!({ "idsOnly": true })).await;
 
-    let notes = value
+    let notes = structured
         .get("notes")
         .and_then(Value::as_array)
         .expect("notes array present");
@@ -88,19 +115,53 @@ async fn notes_read_returns_expected_fields() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let params = Params::new(json!({ "noteId": "Photography Equipment" })).expect("params");
-    let request = Request::new(2, "mcp.notes.read", params);
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("read request succeeds");
+    let structured = call_tool_structured(
+        &handler,
+        "notes_read",
+        json!({ "noteId": "Photography Equipment" }),
+    )
+    .await;
 
     assert_eq!(
-        value.get("noteId").and_then(Value::as_str),
+        structured.get("noteId").and_then(Value::as_str),
         Some("Photography Equipment")
     );
-    assert!(value.get("content").and_then(Value::as_str).is_some());
-    assert!(value.get("metadata").is_some());
+    assert!(structured.get("content").and_then(Value::as_str).is_some());
+    assert!(structured.get("metadata").is_some());
+}
+
+#[tokio::test]
+async fn vault_status_returns_cached_status_when_daemon_unreachable() {
+    let temp_dir = copy_fixture();
+    let status_path = temp_dir.path().join("status.json");
+    let mut status = DeamonStatus::new(temp_dir.path().join("daemon.log"));
+    status.indexed_notes = 42;
+    status.error_notes = 1;
+    status
+        .save_to_path(&status_path)
+        .expect("write status snapshot");
+
+    let handler = build_handler(&temp_dir).await;
+
+    let structured = call_tool_structured(&handler, "vault_status", json!({})).await;
+
+    assert_eq!(
+        structured
+            .get("indexedNotes")
+            .or_else(|| structured.get("indexed_notes"))
+            .and_then(Value::as_u64),
+        Some(42)
+    );
+    assert!(structured.get("summary").and_then(Value::as_str).is_some());
+
+    let issues = structured
+        .get("issues")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(issues.iter().any(|issue| {
+        issue.get("code").and_then(Value::as_str) == Some("daemon_offline_cached_status")
+    }));
 }
 
 #[tokio::test]
@@ -108,14 +169,10 @@ async fn graph_find_orphans_reports_notes() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let request = Request::new(3, "mcp.graph.find_orphans", Params::default());
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("graph orphan request succeeds");
+    let structured = call_tool_structured(&handler, "graph_find_orphans", json!({})).await;
 
-    let total = value.get("total").and_then(Value::as_u64).unwrap_or(0);
-    let notes = value
+    let total = structured.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let notes = structured
         .get("notes")
         .and_then(Value::as_array)
         .expect("notes array present");
@@ -127,18 +184,14 @@ async fn graph_find_unresolved_lists_links() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let request = Request::new(4, "mcp.graph.find_unresolved", Params::default());
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("graph unresolved request succeeds");
+    let structured = call_tool_structured(&handler, "graph_find_unresolved", json!({})).await;
 
-    let links = value
+    let links = structured
         .get("links")
         .and_then(Value::as_array)
         .expect("links array present");
     assert_eq!(
-        value.get("total").and_then(Value::as_u64).unwrap_or(0) as usize,
+        structured.get("total").and_then(Value::as_u64).unwrap_or(0) as usize,
         links.len()
     );
 }
@@ -149,34 +202,32 @@ async fn notes_create_update_delete_round_trip() {
     let handler = build_handler(&temp_dir).await;
 
     // Create a new note.
-    let create_params = Params::new(json!({
-        "title": "Projects/Test Plan",
-        "content": "# Test Plan\n- item one",
-        "metadata": { "tags": ["testing"] }
-    }))
-    .expect("create params");
-    let create_request = Request::new(5, "mcp.notes.create", create_params);
-    let created = handler
-        .handle_request(create_request)
-        .await
-        .expect("create succeeds");
+    let created = call_tool_structured(
+        &handler,
+        "notes_create",
+        json!({
+            "title": "Projects/Test Plan",
+            "content": "# Test Plan\n- item one",
+            "metadata": { "tags": ["testing"] }
+        }),
+    )
+    .await;
     assert_eq!(
         created.get("noteId").and_then(Value::as_str),
         Some("Projects/Test Plan")
     );
 
     // Update the created note.
-    let update_params = Params::new(json!({
-        "noteId": "Projects/Test Plan",
-        "content": "Updated body",
-        "metadata": { "status": "done" }
-    }))
-    .expect("update params");
-    let update_request = Request::new(6, "mcp.notes.update", update_params);
-    let updated = handler
-        .handle_request(update_request)
-        .await
-        .expect("update succeeds");
+    let updated = call_tool_structured(
+        &handler,
+        "notes_update",
+        json!({
+            "noteId": "Projects/Test Plan",
+            "content": "Updated body",
+            "metadata": { "status": "done" }
+        }),
+    )
+    .await;
     assert!(
         updated
             .get("metadata")
@@ -187,14 +238,33 @@ async fn notes_create_update_delete_round_trip() {
     );
 
     // Delete the note.
-    let delete_params =
-        Params::new(json!({ "noteId": "Projects/Test Plan", "confirm": true })).expect("delete");
-    let delete_request = Request::new(7, "mcp.notes.delete", delete_params);
-    let deleted = handler
-        .handle_request(delete_request)
-        .await
-        .expect("delete succeeds");
+    let deleted = call_tool_structured(
+        &handler,
+        "notes_delete",
+        json!({ "noteId": "Projects/Test Plan", "confirm": true }),
+    )
+    .await;
     assert_eq!(deleted.get("deleted").and_then(Value::as_bool), Some(true));
+}
+
+#[tokio::test]
+async fn notes_delete_requires_confirmation_flag() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler(&temp_dir).await;
+
+    let error = call_tool_error(
+        &handler,
+        "notes_delete",
+        json!({ "noteId": "Photography Equipment" }),
+    )
+    .await;
+
+    match error {
+        ProtocolError::InvalidParams { message } => {
+            assert!(message.contains("confirm"), "unexpected message: {message}");
+        }
+        other => panic!("expected invalid params error, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -202,19 +272,37 @@ async fn discovery_related_notes_returns_payload() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let params =
-        Params::new(json!({ "noteId": "Photography Equipment", "limit": 3 })).expect("params");
-    let request = Request::new(8, "mcp.discovery.get_related_notes", params);
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("related notes request succeeds");
+    let structured = call_tool_structured(
+        &handler,
+        "discovery_get_related_notes",
+        json!({ "noteId": "Photography Equipment", "limit": 3 }),
+    )
+    .await;
 
     assert_eq!(
-        value.get("noteId").and_then(Value::as_str),
+        structured.get("noteId").and_then(Value::as_str),
         Some("Photography Equipment")
     );
-    assert!(value.get("related").is_some());
+    assert!(structured.get("related").is_some());
+}
+
+#[tokio::test]
+async fn discovery_related_notes_accepts_query() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "discovery_get_related_notes",
+        json!({ "query": "photography", "limit": 3 }),
+    )
+    .await;
+
+    assert_eq!(
+        structured.get("query").and_then(Value::as_str),
+        Some("photography")
+    );
+    assert!(structured.get("related").is_some());
 }
 
 #[tokio::test]
@@ -222,16 +310,16 @@ async fn discovery_vault_stats_returns_counts() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let params = Params::new(json!({ "recentLimit": 5 })).expect("stats params");
-    let request = Request::new(9, "mcp.discovery.get_vault_stats", params);
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("vault stats request succeeds");
+    let structured = call_tool_structured(
+        &handler,
+        "discovery_get_vault_stats",
+        json!({ "recentLimit": 5 }),
+    )
+    .await;
 
-    let total = value
+    let total = structured
         .get("totalNotes")
-        .or_else(|| value.get("total_notes")) // camelCase post-serialization
+        .or_else(|| structured.get("total_notes"))
         .and_then(Value::as_u64)
         .expect("total notes present");
     assert!(total > 0);
@@ -242,14 +330,11 @@ async fn discovery_vault_conventions_returns_patterns() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let request = Request::new(10, "mcp.discovery.get_vault_conventions", Params::default());
-    let value = handler
-        .handle_request(request)
-        .await
-        .expect("vault conventions succeeds");
+    let structured =
+        call_tool_structured(&handler, "discovery_get_vault_conventions", json!({})).await;
 
-    assert!(value.get("namingPatterns").is_some());
-    assert!(value.get("metadataFields").is_some());
+    assert!(structured.get("namingPatterns").is_some());
+    assert!(structured.get("metadataFields").is_some());
 }
 
 #[tokio::test]
@@ -257,27 +342,31 @@ async fn protocol_initialize_reports_capabilities() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let params = Params::new(json!({ "clientName": "Integration Test", "clientVersion": "1.0.0" }))
-        .expect("init params");
-    let request = Request::new(11, "mcp.protocol.initialize", params);
+    let params = Params::new(json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": { "name": "integration-test", "version": "1.0.0" }
+    }))
+    .expect("init params");
+    let request = Request::new(11, "initialize", params);
     let value = handler
         .handle_request(request)
         .await
         .expect("initialize succeeds");
 
     assert_eq!(
+        value.get("protocolVersion").and_then(Value::as_str),
+        Some("2025-06-18")
+    );
+    assert_eq!(
         value
             .get("serverInfo")
-            .or_else(|| value.get("server_info"))
             .and_then(|info| info.get("name"))
             .and_then(Value::as_str),
-        Some("Arrowhead MCP")
+        Some("arrowhead-mcp")
     );
     assert!(
-        value
-            .get("capabilities")
-            .or_else(|| value.get("capabilities"))
-            .is_some(),
+        value.get("capabilities").is_some(),
         "capabilities should be present"
     );
 }
@@ -287,7 +376,7 @@ async fn protocol_tools_list_contains_note_create() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
-    let request = Request::new(12, "mcp.protocol.tools/list", Params::default());
+    let request = Request::new(12, "tools/list", Params::default());
     let value = handler
         .handle_request(request)
         .await
@@ -300,7 +389,7 @@ async fn protocol_tools_list_contains_note_create() {
     assert!(
         tools
             .iter()
-            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("mcp.notes.create")),
-        "tool list should include mcp.notes.create"
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("notes_create")),
+        "tool list should include notes_create"
     );
 }

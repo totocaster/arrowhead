@@ -21,16 +21,17 @@ use arrowhead_core::{
 };
 
 use crate::{
-    protocol::{ErrorCode, Notification, ProtocolError, Request},
+    protocol::{ErrorCode, Notification, Params, ProtocolError, Request},
     runtime::McpRuntime,
     tools::{
-        DaemonStatusPayload, GraphContextPayload, GraphLinksPayload, GraphNoteParams,
-        GraphOrphansPayload, GraphUnresolvedPayload, InitializeParams, InitializePayload,
-        LinkEdgePayload, NoteContentPayload, NoteCreateParams, NoteDeleteParams, NoteDeletePayload,
-        NoteListItem, NoteMetadataParams, NoteMetadataPayload, NoteReadParams, NoteUpdateParams,
-        NotesListParams, NotesListPayload, OrphanNotePayload, RelatedNotesParams, SearchParams,
-        SearchResultPayload, SearchResultsPayload, ServerCapabilitiesPayload, ServerInfoPayload,
-        ToolDescriptor, ToolExample, ToolsListPayload, VaultStatsParams,
+        CallToolParams, CallToolResultPayload, DaemonStatusPayload, GraphContextPayload,
+        GraphLinksPayload, GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload,
+        ImplementationDescriptor, InitializeParams, InitializeResultPayload, LinkEdgePayload,
+        NoteContentPayload, NoteCreateParams, NoteDeleteParams, NoteDeletePayload, NoteListItem,
+        NoteMetadataParams, NoteMetadataPayload, NoteReadParams, NoteUpdateParams, NotesListParams,
+        NotesListPayload, OrphanNotePayload, RelatedNotesParams, SearchParams, SearchResultPayload,
+        SearchResultsPayload, ServerCapabilitiesPayload, ToolCapabilityPayload, ToolDescriptor,
+        ToolsListPayload, VaultStatsParams,
     },
     transport::MessageHandler,
 };
@@ -40,6 +41,8 @@ use crate::{
 pub struct HandlerRegistry {
     runtime: Arc<McpRuntime>,
 }
+
+const SUPPORTED_PROTOCOL_VERSION: &str = "2025-06-18";
 
 impl HandlerRegistry {
     /// Create a new registry instance with the provided runtime.
@@ -263,9 +266,21 @@ impl HandlerRegistry {
 
     async fn handle_vault_status(&self) -> Result<Value, ProtocolError> {
         let status = self.daemon_status().await?;
-        serde_json::to_value(status).map_err(|err| {
+        let mut value = serde_json::to_value(&status).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise vault status: {err}"))
-        })
+        })?;
+
+        if let Value::Object(ref mut map) = value {
+            let activity =
+                summarise_activity(&status.activity).unwrap_or_else(|| "idle".to_string());
+            let message = format!(
+                "Daemon activity: {activity}. Indexed {} notes ({} errors).",
+                status.indexed_notes, status.error_notes
+            );
+            map.insert("summary".to_string(), json!(message));
+        }
+
+        Ok(value)
     }
 
     async fn handle_note_read(&self, request: Request) -> Result<Value, ProtocolError> {
@@ -431,13 +446,37 @@ impl HandlerRegistry {
         request: Request,
     ) -> Result<Value, ProtocolError> {
         let params: RelatedNotesParams = request.params.deserialize()?;
-        let payload = self
-            .runtime
-            .compute_related_notes(&params.note_id, params.limit, params.strategy)
-            .await
-            .map_err(|err| {
-                ProtocolError::internal(format!("failed to compute related notes: {err}"))
-            })?;
+        let limit = params.limit;
+        let strategy = params.strategy;
+
+        let payload = if let Some(note_id) = params.note_id.as_deref() {
+            let trimmed = note_id.trim();
+            if trimmed.is_empty() {
+                return Err(ProtocolError::invalid_params(
+                    "noteId must not be empty when provided",
+                ));
+            }
+            self.runtime
+                .compute_related_notes(trimmed, limit, strategy)
+                .await
+        } else if let Some(query) = params.query.as_deref() {
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                return Err(ProtocolError::invalid_params(
+                    "query must not be empty when provided",
+                ));
+            }
+            self.runtime
+                .compute_related_notes_for_query(trimmed, limit, strategy)
+                .await
+        } else {
+            return Err(ProtocolError::invalid_params(
+                "provide either noteId or query to compute related notes",
+            ));
+        }
+        .map_err(|err| {
+            ProtocolError::internal(format!("failed to compute related notes: {err}"))
+        })?;
 
         serde_json::to_value(payload).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise related notes: {err}"))
@@ -479,14 +518,33 @@ impl HandlerRegistry {
         })
     }
 
-    async fn handle_protocol_initialize(&self, request: Request) -> Result<Value, ProtocolError> {
-        let params: InitializeParams = request.params.deserialize()?;
-        let capabilities = ServerCapabilitiesPayload {
-            semantic_search: self.runtime.semantic_search_enabled(),
-            note_writes: true,
-            discovery_tools: true,
-            graph_tools: true,
+    async fn handle_initialize(&self, request: Request) -> Result<Value, ProtocolError> {
+        let InitializeParams {
+            protocol_version: requested_version,
+            capabilities: _client_capabilities,
+            client_info,
+        } = request.params.deserialize()?;
+        let mut tool_capabilities = ToolCapabilityPayload::default();
+        tool_capabilities.list_changed = Some(false);
+
+        let mut capabilities = ServerCapabilitiesPayload::default();
+        capabilities.tools = Some(tool_capabilities);
+        if self.runtime.semantic_search_enabled() {
+            let experimental = json!({
+                "arrowhead": {
+                    "semanticSearch": true
+                }
+            });
+            capabilities.experimental = Some(experimental);
+        }
+
+        let negotiated_version = if requested_version == SUPPORTED_PROTOCOL_VERSION {
+            requested_version
+        } else {
+            SUPPORTED_PROTOCOL_VERSION.to_string()
         };
+
+        let client_label = client_info.title.as_deref().unwrap_or(&client_info.name);
 
         let daemon_status = self
             .runtime
@@ -494,16 +552,19 @@ impl HandlerRegistry {
             .await
             .map(build_daemon_status_payload);
 
-        let payload = InitializePayload {
-            server_info: ServerInfoPayload {
-                name: "Arrowhead MCP".to_string(),
+        let payload = InitializeResultPayload {
+            protocol_version: negotiated_version,
+            capabilities,
+            server_info: ImplementationDescriptor {
+                name: "arrowhead-mcp".to_string(),
+                title: Some("Arrowhead MCP".to_string()),
                 version: env!("CARGO_PKG_VERSION").to_string(),
-                description: Some(format!(
-                    "Arrowhead MCP stdio server (client: {})",
-                    params.client_name
-                )),
             },
-            capabilities: Some(capabilities),
+            instructions: Some(format!(
+                "Arrowhead indexes your Obsidian vault. Use tools/list to discover search, graph, \
+                 and note-management tools. Ensure the arrowhead daemon is running for up-to-date \
+                 data. Client: {client_label}."
+            )),
             daemon_status,
         };
 
@@ -512,9 +573,10 @@ impl HandlerRegistry {
         })
     }
 
-    async fn handle_protocol_tools_list(&self) -> Result<Value, ProtocolError> {
+    async fn handle_tools_list(&self, _request: Request) -> Result<Value, ProtocolError> {
         let payload = ToolsListPayload {
             tools: self.build_tool_descriptors(),
+            next_cursor: None,
         };
 
         serde_json::to_value(payload).map_err(|err| {
@@ -522,285 +584,301 @@ impl HandlerRegistry {
         })
     }
 
+    async fn handle_tools_call(&self, request: Request) -> Result<Value, ProtocolError> {
+        let CallToolParams { name, arguments } = request.params.deserialize()?;
+        let method = resolve_tool_method(&name)
+            .map(str::to_owned)
+            .or_else(|| {
+                if name.contains('.') {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| ProtocolError::MethodNotFound {
+                method: name.clone(),
+            })?;
+
+        let tool_arguments = Value::Object(arguments);
+        let tool_params = Params::new(tool_arguments)
+            .map_err(|err| ProtocolError::invalid_params(err.to_string()))?;
+        let tool_request = Request::new(request.id.clone(), method, tool_params);
+        let result = self.handle_named_tool(tool_request).await?;
+        let payload = match name.as_str() {
+            "notes_delete" => {
+                let message = result.as_object().and_then(|map| {
+                    if map.get("deleted").and_then(Value::as_bool) == Some(true) {
+                        let note_id = map.get("noteId").and_then(Value::as_str).unwrap_or("note");
+                        Some(format!("Deleted note {note_id}."))
+                    } else {
+                        None
+                    }
+                });
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
+            "vault_status" => {
+                let message = result
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string());
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
+            _ => CallToolResultPayload::from_value(result),
+        };
+
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise tool result: {err}"))
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn handle_named_tool(&self, request: Request) -> Result<Value, ProtocolError> {
+        let method = request.method.clone();
+        match method.as_str() {
+            "mcp.graph.get_context" => self.handle_graph_context(request).await,
+            "mcp.graph.get_backlinks" => {
+                self.handle_graph_links(request, GraphDirection::Back).await
+            }
+            "mcp.graph.get_forward_links" => {
+                self.handle_graph_links(request, GraphDirection::Forward)
+                    .await
+            }
+            "mcp.graph.find_orphans" => self.handle_graph_orphans().await,
+            "mcp.graph.find_unresolved" => self.handle_graph_unresolved().await,
+            "mcp.search.fts" => self.handle_search_fts(request).await,
+            "mcp.search.semantic" => self.handle_search_semantic(request).await,
+            "mcp.search.hybrid" => self.handle_search_hybrid(request).await,
+            "mcp.vault.status" => self.handle_vault_status().await,
+            "mcp.notes.read" => self.handle_note_read(request).await,
+            "mcp.notes.list" => self.handle_note_list(request).await,
+            "mcp.notes.metadata" => self.handle_note_metadata(request).await,
+            "mcp.notes.create" => self.handle_note_create(request).await,
+            "mcp.notes.update" => self.handle_note_update(request).await,
+            "mcp.notes.delete" => self.handle_note_delete(request).await,
+            "mcp.discovery.get_related_notes" => self.handle_discovery_related_notes(request).await,
+            "mcp.discovery.get_vault_stats" => self.handle_discovery_vault_stats(request).await,
+            "mcp.discovery.get_vault_conventions" => {
+                self.handle_discovery_vault_conventions().await
+            }
+            _ => Err(ProtocolError::MethodNotFound {
+                method: method.as_str().to_owned(),
+            }),
+        }
+    }
+
     fn build_tool_descriptors(&self) -> Vec<ToolDescriptor> {
-        let semantic_flag = None;
+        let empty_schema = || json!({ "type": "object", "properties": {} });
+        let note_id_schema = json!({
+            "type": "object",
+            "properties": {
+                "noteId": { "type": "string" }
+            },
+            "required": ["noteId"]
+        });
+        let search_schema = json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["query"]
+        });
+        let notes_list_schema = json!({
+            "type": "object",
+            "properties": {
+                "idsOnly": { "type": "boolean" },
+                "limit": { "type": "integer", "minimum": 1 }
+            }
+        });
+        let note_create_schema = json!({
+            "type": "object",
+            "properties": {
+                "noteId": { "type": "string" },
+                "title": { "type": "string" },
+                "category": { "type": "string" },
+                "content": { "type": "string" },
+                "metadata": { "type": "object" }
+            }
+        });
+        let note_update_schema = json!({
+            "type": "object",
+            "properties": {
+                "noteId": { "type": "string" },
+                "title": { "type": "string" },
+                "content": { "type": "string" },
+                "metadata": { "type": "object" }
+            },
+            "required": ["noteId"]
+        });
+        let note_delete_schema = json!({
+            "type": "object",
+            "properties": {
+                "noteId": { "type": "string" },
+                "confirm": { "type": "boolean" }
+            },
+            "required": ["noteId", "confirm"]
+        });
+        let related_notes_schema = json!({
+            "type": "object",
+            "properties": {
+                "noteId": { "type": "string" },
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1 }
+            }
+        });
+
         let mut tools = vec![
             ToolDescriptor {
-                name: "mcp.graph.get_context".to_string(),
-                category: "graph".to_string(),
-                description: "Return backlinks and forward links for a note.".to_string(),
-                input_schema: None,
+                name: "graph_get_context".to_string(),
+                title: Some("Graph: Context".to_string()),
+                description: Some("Return backlinks and forward links for a note.".to_string()),
+                input_schema: note_id_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Context graph",
-                    "Graph context for Photography Equipment.",
-                    json!({ "noteId": "Photography Equipment" }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.graph.get_context" })),
             },
             ToolDescriptor {
-                name: "mcp.graph.get_backlinks".to_string(),
-                category: "graph".to_string(),
-                description: "List notes linking to the supplied note.".to_string(),
-                input_schema: None,
+                name: "graph_get_backlinks".to_string(),
+                title: Some("Graph: Backlinks".to_string()),
+                description: Some("Return backlinks for a note.".to_string()),
+                input_schema: note_id_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Backlinks",
-                    "All backlinks to Daily/2024-01-15.",
-                    json!({ "noteId": "Daily/2024-01-15" }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.graph.get_backlinks" })),
             },
             ToolDescriptor {
-                name: "mcp.graph.get_forward_links".to_string(),
-                category: "graph".to_string(),
-                description: "List outbound links from the supplied note.".to_string(),
-                input_schema: None,
+                name: "graph_get_forward_links".to_string(),
+                title: Some("Graph: Forward Links".to_string()),
+                description: Some("Return forward links for a note.".to_string()),
+                input_schema: note_id_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Forward links",
-                    "Forward links from Photography Equipment.",
-                    json!({ "noteId": "Photography Equipment" }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.graph.get_forward_links" })),
             },
             ToolDescriptor {
-                name: "mcp.graph.find_orphans".to_string(),
-                category: "graph".to_string(),
-                description: "Identify notes without inbound or outbound links.".to_string(),
-                input_schema: None,
+                name: "graph_find_orphans".to_string(),
+                title: Some("Graph: Orphans".to_string()),
+                description: Some(
+                    "List notes that are not referenced anywhere in the vault.".to_string(),
+                ),
+                input_schema: empty_schema(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Graph orphans",
-                    "List orphaned notes.",
-                    json!({}),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.graph.find_orphans" })),
             },
             ToolDescriptor {
-                name: "mcp.graph.find_unresolved".to_string(),
-                category: "graph".to_string(),
-                description: "List unresolved WikiLinks requiring manual attention.".to_string(),
-                input_schema: None,
+                name: "graph_find_unresolved".to_string(),
+                title: Some("Graph: Unresolved Links".to_string()),
+                description: Some(
+                    "List links that could not be resolved to an existing note.".to_string(),
+                ),
+                input_schema: empty_schema(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Unresolved links",
-                    "List unresolved links across the vault.",
-                    json!({}),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.graph.find_unresolved" })),
             },
             ToolDescriptor {
-                name: "mcp.search.fts".to_string(),
-                category: "search".to_string(),
-                description: "Execute a full-text search query.".to_string(),
-                input_schema: None,
+                name: "search_fts".to_string(),
+                title: Some("Search: Full Text".to_string()),
+                description: Some("Full-text search across all notes.".to_string()),
+                input_schema: search_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "FTS search",
-                    "Search for camera related notes.",
-                    json!({ "query": "camera" }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.search.fts" })),
             },
             ToolDescriptor {
-                name: "mcp.search.semantic".to_string(),
-                category: "search".to_string(),
-                description: "Execute a semantic similarity search (requires embeddings)."
-                    .to_string(),
-                input_schema: None,
+                name: "search_semantic".to_string(),
+                title: Some("Search: Semantic".to_string()),
+                description: Some("Semantic similarity search using embeddings.".to_string()),
+                input_schema: search_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Semantic search",
-                    "Find notes similar to a query sentence.",
-                    json!({ "query": "suggest travel packing lists" }),
-                )],
-                feature_flag: semantic_flag.clone(),
+                annotations: Some(json!({ "method": "mcp.search.semantic" })),
             },
             ToolDescriptor {
-                name: "mcp.search.hybrid".to_string(),
-                category: "search".to_string(),
-                description: "Execute a hybrid FTS + semantic search (requires embeddings)."
-                    .to_string(),
-                input_schema: None,
+                name: "search_hybrid".to_string(),
+                title: Some("Search: Hybrid".to_string()),
+                description: Some("Combine semantic and keyword search results.".to_string()),
+                input_schema: search_schema,
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Hybrid search",
-                    "Blend keyword and semantic results.",
-                    json!({ "query": "portrait lens recommendations" }),
-                )],
-                feature_flag: semantic_flag.clone(),
+                annotations: Some(json!({ "method": "mcp.search.hybrid" })),
             },
             ToolDescriptor {
-                name: "mcp.vault.status".to_string(),
-                category: "vault".to_string(),
-                description: "Fetch the current Arrowhead daemon status snapshot.".to_string(),
-                input_schema: None,
+                name: "vault_status".to_string(),
+                title: Some("Vault: Status".to_string()),
+                description: Some("Summarise daemon activity and queue status.".to_string()),
+                input_schema: empty_schema(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Vault status",
-                    "Daemon health summary.",
-                    json!({}),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.vault.status" })),
             },
             ToolDescriptor {
-                name: "mcp.notes.read".to_string(),
-                category: "notes".to_string(),
-                description: "Read the full content of a note.".to_string(),
-                input_schema: None,
+                name: "notes_read".to_string(),
+                title: Some("Notes: Read".to_string()),
+                description: Some("Read a note's metadata and content.".to_string()),
+                input_schema: note_id_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Read note",
-                    "Load the Photography Equipment note.",
-                    json!({ "noteId": "Photography Equipment" }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.notes.read" })),
             },
             ToolDescriptor {
-                name: "mcp.notes.list".to_string(),
-                category: "notes".to_string(),
-                description: "List notes in the vault with optional metadata.".to_string(),
-                input_schema: None,
+                name: "notes_list".to_string(),
+                title: Some("Notes: List".to_string()),
+                description: Some("List notes from the vault.".to_string()),
+                input_schema: notes_list_schema,
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "List notes",
-                    "List note identifiers only.",
-                    json!({ "idsOnly": true, "limit": 20 }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.notes.list" })),
             },
             ToolDescriptor {
-                name: "mcp.notes.metadata".to_string(),
-                category: "notes".to_string(),
-                description: "Fetch metadata for the supplied note without content.".to_string(),
-                input_schema: None,
+                name: "notes_metadata".to_string(),
+                title: Some("Notes: Metadata".to_string()),
+                description: Some("Fetch metadata for a specific note.".to_string()),
+                input_schema: note_id_schema.clone(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Note metadata",
-                    "Metadata for GTD/Inbox.",
-                    json!({ "noteId": "GTD/Inbox" }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.notes.metadata" })),
             },
             ToolDescriptor {
-                name: "mcp.notes.create".to_string(),
-                category: "notes".to_string(),
-                description: "Create a new note with optional metadata.".to_string(),
-                input_schema: None,
+                name: "notes_create".to_string(),
+                title: Some("Notes: Create".to_string()),
+                description: Some("Create a new note.".to_string()),
+                input_schema: note_create_schema,
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Create note",
-                    "Create a project brief with inline content.",
-                    json!({
-                        "title": "Projects/New Initiative",
-                        "content": "# Objectives\nDraft action items."
-                    }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.notes.create" })),
             },
             ToolDescriptor {
-                name: "mcp.notes.update".to_string(),
-                category: "notes".to_string(),
-                description: "Update note content or metadata.".to_string(),
-                input_schema: None,
+                name: "notes_update".to_string(),
+                title: Some("Notes: Update".to_string()),
+                description: Some("Update an existing note.".to_string()),
+                input_schema: note_update_schema,
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Update note",
-                    "Update the Photography Equipment note body.",
-                    json!({
-                        "noteId": "Photography Equipment",
-                        "content": "Updated packing list."
-                    }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.notes.update" })),
             },
             ToolDescriptor {
-                name: "mcp.notes.delete".to_string(),
-                category: "notes".to_string(),
-                description: "Delete a note after explicit confirmation.".to_string(),
-                input_schema: None,
+                name: "notes_delete".to_string(),
+                title: Some("Notes: Delete".to_string()),
+                description: Some("Delete a note (requires confirm = true).".to_string()),
+                input_schema: note_delete_schema,
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Delete note",
-                    "Delete an obsolete scratch note.",
-                    json!({ "noteId": "Scratch/Sandbox", "confirm": true }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.notes.delete" })),
             },
             ToolDescriptor {
-                name: "mcp.discovery.get_related_notes".to_string(),
-                category: "discovery".to_string(),
-                description: "Find notes related to the supplied anchor.".to_string(),
-                input_schema: None,
+                name: "discovery_get_related_notes".to_string(),
+                title: Some("Discovery: Related Notes".to_string()),
+                description: Some("Return notes related to a query or anchor note.".to_string()),
+                input_schema: related_notes_schema,
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Related notes",
-                    "Related notes for Photography Equipment.",
-                    json!({ "noteId": "Photography Equipment", "limit": 5 }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.discovery.get_related_notes" })),
             },
             ToolDescriptor {
-                name: "mcp.discovery.get_vault_stats".to_string(),
-                category: "discovery".to_string(),
-                description: "Aggregate vault statistics such as counts and recent notes."
-                    .to_string(),
-                input_schema: None,
+                name: "discovery_get_vault_stats".to_string(),
+                title: Some("Discovery: Vault Stats".to_string()),
+                description: Some("Summarise vault statistics.".to_string()),
+                input_schema: empty_schema(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Vault stats",
-                    "Generate statistics including recent notes.",
-                    json!({ "recentLimit": 5 }),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.discovery.get_vault_stats" })),
             },
             ToolDescriptor {
-                name: "mcp.discovery.get_vault_conventions".to_string(),
-                category: "discovery".to_string(),
-                description: "Summarise naming patterns, metadata usage, and conventions."
-                    .to_string(),
-                input_schema: None,
+                name: "discovery_get_vault_conventions".to_string(),
+                title: Some("Discovery: Vault Conventions".to_string()),
+                description: Some(
+                    "Summarise naming patterns, metadata usage, and conventions.".to_string(),
+                ),
+                input_schema: empty_schema(),
                 output_schema: None,
-                examples: vec![make_tool_example(
-                    "Vault conventions",
-                    "Summarise conventions for the active vault.",
-                    json!({}),
-                )],
-                feature_flag: None,
-            },
-            ToolDescriptor {
-                name: "mcp.protocol.initialize".to_string(),
-                category: "protocol".to_string(),
-                description: "Perform the MCP handshake and receive server capabilities."
-                    .to_string(),
-                input_schema: None,
-                output_schema: None,
-                examples: vec![make_tool_example(
-                    "Initialize",
-                    "Initialize the Arrowhead MCP session.",
-                    json!({
-                        "clientName": "Example Client",
-                        "clientVersion": "1.0.0"
-                    }),
-                )],
-                feature_flag: None,
-            },
-            ToolDescriptor {
-                name: "mcp.protocol.tools/list".to_string(),
-                category: "protocol".to_string(),
-                description: "List all tools exposed by the Arrowhead MCP server.".to_string(),
-                input_schema: None,
-                output_schema: None,
-                examples: vec![make_tool_example(
-                    "List tools",
-                    "Enumerate the MCP tool surface.",
-                    json!({}),
-                )],
-                feature_flag: None,
+                annotations: Some(json!({ "method": "mcp.discovery.get_vault_conventions" })),
             },
         ];
-
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
     }
@@ -838,51 +916,50 @@ impl HandlerRegistry {
 impl MessageHandler for HandlerRegistry {
     #[allow(clippy::too_many_lines)]
     async fn handle_request(&self, request: Request) -> Result<Value, ProtocolError> {
-        let method = request.method.clone();
-        match method.as_str() {
-            "mcp.graph.get_context" => self.handle_graph_context(request).await,
-            "mcp.graph.get_backlinks" => {
-                self.handle_graph_links(request, GraphDirection::Back).await
-            }
-            "mcp.graph.get_forward_links" => {
-                self.handle_graph_links(request, GraphDirection::Forward)
-                    .await
-            }
-            "mcp.graph.find_orphans" => self.handle_graph_orphans().await,
-            "mcp.graph.find_unresolved" => self.handle_graph_unresolved().await,
-            "mcp.search.fts" => self.handle_search_fts(request).await,
-            "mcp.search.semantic" => self.handle_search_semantic(request).await,
-            "mcp.search.hybrid" => self.handle_search_hybrid(request).await,
-            "mcp.vault.status" => self.handle_vault_status().await,
-            "mcp.notes.read" => self.handle_note_read(request).await,
-            "mcp.notes.list" => self.handle_note_list(request).await,
-            "mcp.notes.metadata" => self.handle_note_metadata(request).await,
-            "mcp.notes.create" => self.handle_note_create(request).await,
-            "mcp.notes.update" => self.handle_note_update(request).await,
-            "mcp.notes.delete" => self.handle_note_delete(request).await,
-            "mcp.discovery.get_related_notes" => self.handle_discovery_related_notes(request).await,
-            "mcp.discovery.get_vault_stats" => self.handle_discovery_vault_stats(request).await,
-            "mcp.discovery.get_vault_conventions" => {
-                let _ = request;
-                self.handle_discovery_vault_conventions().await
-            }
-            "mcp.protocol.initialize" => self.handle_protocol_initialize(request).await,
-            "mcp.protocol.tools/list" => {
-                let _ = request;
-                self.handle_protocol_tools_list().await
-            }
-            _ => Err(ProtocolError::MethodNotFound {
-                method: method.as_str().to_owned(),
-            }),
+        match request.method.as_str() {
+            "initialize" => self.handle_initialize(request).await,
+            "tools/list" => self.handle_tools_list(request).await,
+            "tools/call" => self.handle_tools_call(request).await,
+            "ping" => Ok(json!({})),
+            _ => self.handle_named_tool(request).await,
         }
     }
 
     async fn handle_notification(&self, notification: Notification) -> Result<(), ProtocolError> {
+        if notification.method.as_str() == "notifications/initialized" {
+            debug!("received notifications/initialized acknowledgement");
+            return Ok(());
+        }
+
         debug!(
             method = %notification.method,
             "dropping unhandled notification"
         );
         Ok(())
+    }
+}
+
+fn resolve_tool_method(name: &str) -> Option<&'static str> {
+    match name {
+        "graph_get_context" => Some("mcp.graph.get_context"),
+        "graph_get_backlinks" => Some("mcp.graph.get_backlinks"),
+        "graph_get_forward_links" => Some("mcp.graph.get_forward_links"),
+        "graph_find_orphans" => Some("mcp.graph.find_orphans"),
+        "graph_find_unresolved" => Some("mcp.graph.find_unresolved"),
+        "search_fts" => Some("mcp.search.fts"),
+        "search_semantic" => Some("mcp.search.semantic"),
+        "search_hybrid" => Some("mcp.search.hybrid"),
+        "vault_status" => Some("mcp.vault.status"),
+        "notes_read" => Some("mcp.notes.read"),
+        "notes_list" => Some("mcp.notes.list"),
+        "notes_metadata" => Some("mcp.notes.metadata"),
+        "notes_create" => Some("mcp.notes.create"),
+        "notes_update" => Some("mcp.notes.update"),
+        "notes_delete" => Some("mcp.notes.delete"),
+        "discovery_get_related_notes" => Some("mcp.discovery.get_related_notes"),
+        "discovery_get_vault_stats" => Some("mcp.discovery.get_vault_stats"),
+        "discovery_get_vault_conventions" => Some("mcp.discovery.get_vault_conventions"),
+        _ => None,
     }
 }
 
@@ -1160,13 +1237,5 @@ fn summarise_activity(activity: &ActivityStatus) -> Option<String> {
         ActivityState::Removing => Some("removing stale entries".to_string()),
         ActivityState::Downloading => Some("downloading assets".to_string()),
         ActivityState::Faulted => Some("daemon faulted".to_string()),
-    }
-}
-
-fn make_tool_example(name: &str, description: &str, request: Value) -> ToolExample {
-    ToolExample {
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        request,
     }
 }
