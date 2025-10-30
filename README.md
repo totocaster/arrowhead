@@ -321,7 +321,7 @@ at your option.
 
 ## Contributing
 
-We welcome issues and pull requests once the Phase 1 foundation is fully stabilized. Start by reading the [rewrite specification](docs/predev_synapse_rust_rewrite.md) and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
+We welcome issues and pull requests once the Phase 1 foundation is fully stabilized. Start by reading this README, the [feature development guide](docs/feature_development_guide.md), and the living [roadmap](docs/roadmap.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
 
 ## Acknowledgments
 

@@ -1,7 +1,7 @@
 # Arrowhead Coding Agent Playbook
 
 ## Mission
-- Deliver the Arrowhead Rust rewrite according to `docs/predev_synapse_rust_rewrite.md`.
+- Deliver the Arrowhead Rust rewrite according to the consolidated spec in `README.md`.
 - Preserve repository cleanliness and avoid ambiguous states; never leave `todo!()` panics in committed code.
 - Prioritise maintainability, clear error handling, and strong test coverage using the provided fixture vault.
 
@@ -11,7 +11,7 @@
 3. **Style:** Follow idiomatic Rust (clippy clean, `cargo fmt`). Prefer explicit structs/enums over loose maps; document non-obvious flows with concise comments.
 4. **Error Handling:** Use `anyhow`/`thiserror` as scoped in the spec. Return actionable errors instead of panicking.
 5. **Testing:** Add unit tests alongside code (`#[cfg(test)]`) and integration tests under `tests/integration/`. Use `tests/fixtures/test-vault` as read-only input; write indexes to temp dirs.
-6. **Docs:** Update specs/design docs when behaviour or architecture shifts. `docs/dev_status.md` tracks high-level progress—keep it fresh after major milestones.
+6. **Docs:** Update specs/design docs when behaviour or architecture shifts. Keep `docs/roadmap.md` fresh after major milestones.
 
 ## Workflow Expectations
 - Start complex tasks with a brief plan (2–5 steps max) and keep it up to date.
@@ -35,9 +35,9 @@
 - Avoid silent scope creep—highlight optional improvements separately.
 
 ## Quick Reference
-- Spec: `docs/predev_synapse_rust_rewrite.md`
+- Spec: `README.md`
 - Feature guide: `docs/feature_development_guide.md`
-- Status: `docs/dev_status.md`
+- Roadmap: `docs/roadmap.md`
 - API overview: `README.md#cli-reference`
 - MCP notes: `README.md#mcp-protocol-details`
 - CLI commands: `crates/arrowhead-cli/src/commands/`

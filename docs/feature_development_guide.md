@@ -5,7 +5,7 @@ Arrowhead. Treat it as a companion to `AGENTS.md` and the rewrite
 specification.
 
 ## 1. Planning & Scope
-- Confirm the target phase and specification pages (`docs/predev_synapse_rust_rewrite.md`).
+- Confirm the target scope in `README.md` and cross-check `docs/roadmap.md` for active milestones.
 - Identify affected crates and command surfaces before coding.
 - Capture open questions early; never assume behaviour that contradicts the
   spec or existing UX.
@@ -34,13 +34,13 @@ specification.
 
 ## 4. Data & Persistence
 - SQLite changes require migrations in `sqlite.rs` plus tests proving schema
-  upgrades succeed. Document versioning decisions in `docs/dev_status.md` when
+  upgrades succeed. Document versioning decisions in `docs/roadmap.md` when
   they influence roll-outs.
 - Vault-aware features must respect detected Obsidian settings (e.g.
   `.obsidian/app.json` ignore filters, attachment directories) and surface them
   through the `VaultSettings` APIs.
 ## 5. Documentation & Communication
-- Update `docs/dev_status.md` after significant milestones or architecture
+- Update `docs/roadmap.md` after significant milestones or architecture
   shifts.
 - When a new workflow or guideline emerges, add it here and cross-reference
   from `AGENTS.md`.
