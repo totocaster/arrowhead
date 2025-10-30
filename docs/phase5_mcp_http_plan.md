@@ -12,7 +12,7 @@ record the raw value when it is generated.
 
 ## Resources
 - Specification: `docs/predev_synapse_rust_rewrite.md` (Phase 5 scope, security)
-- MCP protocol reference: `docs/mcp_protocol.md`
+- MCP protocol reference: `README.md#mcp-protocol-details`
 - Phase 4 groundwork: `docs/phase4_mcp_stdio_plan.md`
 - HTTP stack: `axum`/`tower`/`tower-http` crates already listed in workspace
 - Security notes: `docs/dev_status.md` and spec security section
@@ -145,7 +145,7 @@ record the raw value when it is generated.
    offline.
 2. Expand unit tests in `auth.rs` and `http.rs` to cover edge cases (batch
    requests, malformed JSON, token rotation, rate limiting).
-3. Refresh documentation: CLI help text, `README.md#cli-reference`, `docs/mcp_protocol.md`,
+3. Refresh documentation: CLI help text, `README.md#cli-reference`, `README.md#mcp-protocol-details`,
    `docs/dev_status.md`, and add examples for reverse proxy deployment.
 4. Wire new tests into CI and ensure `cargo fmt`, `cargo clippy`, and
    workspace checks remain clean.
@@ -187,7 +187,7 @@ record the raw value when it is generated.
 ## Documentation & Developer Experience
 - Update CLI reference (`README.md#cli-reference`) with new flags, environment variables,
   and usage examples (curl + Claude Desktop over HTTP).
-- Expand `docs/mcp_protocol.md` transport section to include HTTP wire format,
+- Expand `README.md#mcp-protocol-details` transport section to include HTTP wire format,
   auth headers, error examples, and operational notes.
 - Add a deployment checklist (firewall, reverse proxy, logs) either here or in
   `docs/feature_development_guide.md`.

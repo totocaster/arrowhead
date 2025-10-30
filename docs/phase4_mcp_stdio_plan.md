@@ -129,7 +129,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
 1. Extend `clap` configuration in `crates/arrowhead-cli` with `--mcp`.
 2. Bootstrapping: load config, ensure vault is configured, verify daemon health,
    instantiate MCP server.
-3. Update CLI help text, `README.md#cli-reference`, and `docs/mcp_protocol.md` with method
+3. Update CLI help text, `README.md#cli-reference`, and `README.md#mcp-protocol-details` with method
    catalog and example payloads.
 4. Provide usage examples (`docs/examples/` if necessary) showing how to launch
    the stdio server and interact via `stdio` pipes.
@@ -147,7 +147,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
 
 ## Documentation & Developer Experience
 
-- Create `docs/mcp_protocol.md` appendices detailing method schemas, request/
+- Create `README.md#mcp-protocol-details` appendices detailing method schemas, request/
   response examples, and error codes once implementation stabilises.
 - Provide README section for `arrowhead-mcp` crate explaining layering.
 - Ensure `feature_development_guide.md` references the MCP addition workflow.
@@ -169,7 +169,7 @@ rules (`cargo fmt`, `cargo check`, `cargo test`).
 - [x] `arrowhead-cli --mcp` entry point.
 - [x] Method implementations covering graph/search/vault/notes.
 - [x] Unit + integration tests for the new surface.
-- [x] Documentation updates (`README.md#cli-reference`, `docs/mcp_protocol.md`, usage guide).
+- [x] Documentation updates (`README.md#cli-reference`, `README.md#mcp-protocol-details`, usage guide).
 - [ ] CI updated if extra tooling/tests introduced.
 
 Follow this plan sequentially, opening follow-up issues for out-of-scope items

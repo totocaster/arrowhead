@@ -39,7 +39,7 @@
 - Feature guide: `docs/feature_development_guide.md`
 - Status: `docs/dev_status.md`
 - API overview: `README.md#cli-reference`
-- MCP notes: `docs/mcp_protocol.md`
+- MCP notes: `README.md#mcp-protocol-details`
 - CLI commands: `crates/arrowhead-cli/src/commands/`
 - Core modules: `crates/arrowhead-core/src/`
 

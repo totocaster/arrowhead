@@ -252,6 +252,56 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 
 Semantic and hybrid tools require embeddings; discovery fallbacks lean on graph heuristics when embeddings are disabled.
 
+## MCP Protocol Details
+
+### Transport modes
+
+- **stdio (`arrowhead --mcp`)**: newline-delimited JSON-RPC 2.0 over stdin/stdout with a bounded request queue (64 pending by default). When the queue or worker pool is saturated the server returns a `RateLimited` error and logs summary metrics on shutdown.
+- **HTTP (`arrowhead --mcp-server`)**: JSON-RPC 2.0 on `POST /rpc` with identical handler logic, request limits, and error mapping; malformed JSON produces `400`, authentication failures produce `401`/`403`, and backpressure surfaces as HTTP 429. `GET /health` offers a readiness probe.
+
+Both transports share the handlers defined in `crates/arrowhead-mcp`, so behaviour is consistent regardless of client wiring.
+
+### Authentication & network policy
+
+- Tokens are hashed with SHA-256 before persistence; raw strings never touch disk or logs.
+- Bearer mode (default) expects `Authorization: Bearer <token>` headers; link-token mode accepts `/rpc/<token>` paths while still honouring bearer headers. Prefer HTTPS when using link-token to keep credentials out of plaintext URLs.
+- `--generate-token` prints a one-time secret and stores only the digest; record the raw value immediately.
+- The HTTP transport allows only localhost traffic by default (`127.0.0.0/8`, `::1/128`). Extend access with `--allow`, `--allow-file`, or corresponding config entries so that non-local clients are admitted intentionally.
+
+### Example request
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"mcp.notes.create","params":{"title":"Projects/Test Plan","content":"# Test Plan"}}
+```
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"noteId":"Projects/Test Plan","title":"Projects/Test Plan","metadata":{"title":"Projects/Test Plan"},"content":"# Test Plan","relativePath":"Projects/Test Plan.md","fileModifiedAt":"2024-01-18T08:53:00Z"}}
+```
+
+### Reverse proxy guidance
+
+Terminate TLS in a reverse proxy (nginx, Caddy, Traefik, Cloudflare Tunnel, Tailscale Funnel, etc.) and forward traffic to the loopback-bound MCP server. A minimal nginx snippet:
+
+```
+server {
+    listen 443 ssl http2;
+    server_name arrowhead.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/arrowhead.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/arrowhead.example.com/privkey.pem;
+
+    location / {
+        proxy_pass       http://127.0.0.1:3911;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+Keep the Arrowhead allowlist scoped to loopback so all external traffic is funneled through the proxy. Layer OAuth/OIDC (e.g., oauth2-proxy, Cloudflare Access) in front when you need user-facing authentication.
+
 ## Roadmap
 
 - MCP observability: metrics/structured tracing for the HTTP transport plus TLS/reverse-proxy guidance.
