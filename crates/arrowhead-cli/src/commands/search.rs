@@ -39,7 +39,7 @@ pub enum SearchMode {
 /// Shared arguments for search queries.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct QueryArgs {
-    /// Query string to execute.
+    /// Query string to execute (supports boolean operators and date filters).
     pub query: String,
     /// Maximum number of results to return.
     #[arg(long)]

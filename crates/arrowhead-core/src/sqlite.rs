@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{
@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
 use serde_json::Value;
 use tracing::{debug, info};
 
@@ -24,6 +24,7 @@ use crate::{
     MetadataMap, NoteRecord,
     graph::{LinkResolutionRecord, normalise_link_lookup},
     metadata::MetadataExtraction,
+    query::{QueryFilters, parse_absolute_date},
 };
 
 thread_local! {
@@ -36,7 +37,7 @@ static SQLITE_VEC_REGISTER: Once = Once::new();
 static SQLITE_VEC_STATUS: AtomicI32 = AtomicI32::new(rusqlite::ffi::SQLITE_OK);
 
 /// Current schema version for the Arrowhead index database.
-const INDEX_SCHEMA_VERSION: i32 = 4;
+const INDEX_SCHEMA_VERSION: i32 = 5;
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +325,16 @@ impl IndexDatabase {
             .context("failed to insert metadata row")?;
         }
 
+        tx.execute("DELETE FROM metadata_dates WHERE note_id = ?1", [&note.id])
+            .context("failed to clear metadata date rows")?;
+        for (key, micros) in collect_metadata_date_values(&extraction.metadata) {
+            tx.execute(
+                "INSERT INTO metadata_dates (note_id, key, value) VALUES (?1, ?2, ?3)",
+                params![&note.id, key, micros],
+            )
+            .context("failed to insert metadata date row")?;
+        }
+
         tx.execute("DELETE FROM notes_fts WHERE id = ?1", [&note.id])
             .context("failed to remove stale FTS row")?;
         let fts_content = format_content_for_fts(note);
@@ -356,21 +367,37 @@ impl IndexDatabase {
         tx.commit().context("failed to commit indexing transaction")
     }
 
-    /// Execute a full-text search query against the FTS index.
+    /// Execute a full-text search query against the FTS index without additional filters.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsMatch>> {
+        self.search_fts_with_filters(query, limit, &QueryFilters::default())
+    }
+
+    /// Execute a full-text search query with optional filesystem and metadata filters.
+    pub fn search_fts_with_filters(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: &QueryFilters,
+    ) -> Result<Vec<FtsMatch>> {
         let limit = limit.max(1) as i64;
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
+
+        let mut sql = String::from(
             "SELECT n.id, n.title, n.relative_path, bm25(notes_fts) AS rank,
                     snippet(notes_fts, 1, '[[', ']]', '...', 20) AS snippet
              FROM notes_fts
              JOIN notes n ON notes_fts.id = n.id
-             WHERE notes_fts MATCH ?1
-             ORDER BY rank ASC
-             LIMIT ?2",
-        )?;
+             WHERE notes_fts MATCH ?",
+        );
 
-        let rows = stmt.query_map(params![query, limit], |row| {
+        let mut params: Vec<SqlValue> = vec![SqlValue::from(query.to_string())];
+        Self::append_filter_clauses(&mut sql, &mut params, filters);
+
+        sql.push_str(" ORDER BY rank ASC LIMIT ?");
+        params.push(SqlValue::from(limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
             let snippet: Option<String> = row.get(4)?;
             Ok(FtsMatch {
                 note_id: row.get(0)?,
@@ -387,6 +414,116 @@ impl IndexDatabase {
         }
 
         Ok(matches)
+    }
+
+    /// Return the subset of `note_ids` that satisfy the supplied filters.
+    pub fn filter_note_ids(
+        &self,
+        note_ids: &[String],
+        filters: &QueryFilters,
+    ) -> Result<HashSet<String>> {
+        if filters.is_empty() || note_ids.is_empty() {
+            return Ok(note_ids.iter().cloned().collect());
+        }
+
+        let conn = self.connection()?;
+        let placeholders = vec!["?"; note_ids.len()].join(", ");
+        let mut sql = format!("SELECT n.id FROM notes n WHERE n.id IN ({placeholders})");
+        let mut params: Vec<SqlValue> = note_ids.iter().cloned().map(SqlValue::from).collect();
+
+        Self::append_filter_clauses(&mut sql, &mut params, filters);
+        sql.push_str(" GROUP BY n.id");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let mut allowed = HashSet::new();
+        for row in rows {
+            allowed.insert(row?);
+        }
+
+        Ok(allowed)
+    }
+
+    /// Retrieve note identifiers that match an FTS expression without limit.
+    pub fn matching_note_ids(&self, query: &str) -> Result<HashSet<String>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare("SELECT n.id FROM notes_fts JOIN notes n ON notes_fts.id = n.id WHERE notes_fts MATCH ?")
+            .context("failed to prepare FTS id query")?;
+        let rows = stmt.query_map(params![query], |row| row.get::<_, String>(0))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            ids.insert(row?);
+        }
+        Ok(ids)
+    }
+
+    /// Retrieve note identifiers that satisfy the supplied filters, ordered by modified time.
+    pub fn notes_for_filters(&self, filters: &QueryFilters, limit: usize) -> Result<Vec<String>> {
+        let mut sql = String::from("SELECT n.id FROM notes n WHERE 1 = 1");
+        let mut params: Vec<SqlValue> = Vec::new();
+        Self::append_filter_clauses(&mut sql, &mut params, filters);
+        sql.push_str(" ORDER BY n.file_modified_at DESC, n.id ASC");
+
+        let limit = limit.max(1) as i64;
+        sql.push_str(" LIMIT ?");
+        params.push(SqlValue::from(limit));
+
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+
+        Ok(ids)
+    }
+
+    fn append_filter_clauses(sql: &mut String, params: &mut Vec<SqlValue>, filters: &QueryFilters) {
+        if let Some(range) = &filters.modified {
+            if let Some(start) = range.lower_bound_micros() {
+                sql.push_str(" AND n.file_modified_at >= ?");
+                params.push(SqlValue::from(start));
+            }
+            if let Some(end) = range.upper_bound_micros() {
+                sql.push_str(" AND n.file_modified_at <= ?");
+                params.push(SqlValue::from(end));
+            }
+        }
+
+        if let Some(range) = &filters.created {
+            if let Some(start) = range.lower_bound_micros() {
+                sql.push_str(" AND n.created_at >= ?");
+                params.push(SqlValue::from(start));
+            }
+            if let Some(end) = range.upper_bound_micros() {
+                sql.push_str(" AND n.created_at <= ?");
+                params.push(SqlValue::from(end));
+            }
+        }
+
+        for (field, range) in &filters.metadata_dates {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM metadata_dates md WHERE md.note_id = n.id AND md.key = ?");
+            params.push(SqlValue::from(field.clone()));
+
+            if let Some(start) = range.lower_bound_micros() {
+                sql.push_str(" AND md.value >= ?");
+                params.push(SqlValue::from(start));
+            }
+            if let Some(end) = range.upper_bound_micros() {
+                sql.push_str(" AND md.value <= ?");
+                params.push(SqlValue::from(end));
+            }
+
+            sql.push(')');
+        }
     }
 
     /// Load metadata maps for a collection of note identifiers.
@@ -540,6 +677,16 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_metadata_note_key ON metadata(note_id, key);
         CREATE INDEX IF NOT EXISTS idx_metadata_key ON metadata(key);
+
+        CREATE TABLE IF NOT EXISTS metadata_dates (
+            note_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value INTEGER NOT NULL,
+            FOREIGN KEY(note_id) REFERENCES notes(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metadata_dates_note_key ON metadata_dates(note_id, key);
+        CREATE INDEX IF NOT EXISTS idx_metadata_dates_key_value ON metadata_dates(key, value, note_id);
 
         CREATE TABLE IF NOT EXISTS note_links (
             source_id TEXT NOT NULL,
@@ -727,6 +874,30 @@ fn push_metadata_tokens(parts: &mut Vec<String>, key: &str, raw_value: &str) {
     parts.push(trimmed.to_string());
 }
 
+fn collect_metadata_date_values(metadata: &MetadataMap) -> Vec<(String, i64)> {
+    let mut results = Vec::new();
+    for (key, value) in metadata {
+        collect_dates_from_value(key, value, &mut results);
+    }
+    results
+}
+
+fn collect_dates_from_value(key: &str, value: &Value, output: &mut Vec<(String, i64)>) {
+    match value {
+        Value::String(text) => {
+            if let Ok(parsed) = parse_absolute_date(text) {
+                output.push((key.to_string(), parsed.instant.timestamp_micros()));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_dates_from_value(key, item, output);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1014,71 @@ mod tests {
             )
             .expect("count links");
         assert!(link_count >= 1);
+    }
+
+    #[test]
+    fn metadata_date_rows_are_recorded() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let note = load_note("Complex Metadata Types");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract succeeds");
+        let resolved_links = make_resolved_links(&extraction);
+
+        db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
+            .expect("upsert succeeds");
+
+        let conn = db.connection().expect("connection");
+        let mut stmt = conn
+            .prepare("SELECT value FROM metadata_dates WHERE note_id = ?1 AND key = 'date'")
+            .expect("prepare metadata date query");
+        let rows = stmt
+            .query_map([&note.id], |row| row.get::<_, i64>(0))
+            .expect("iterate metadata dates");
+
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row.expect("row value"));
+        }
+
+        let expected = parse_absolute_date("2024-01-20")
+            .expect("parse frontmatter date")
+            .instant
+            .timestamp_micros();
+        assert!(values.contains(&expected));
+    }
+
+    #[test]
+    fn filter_note_ids_respects_metadata_dates() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let note = load_note("Complex Metadata Types");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract succeeds");
+        let resolved_links = make_resolved_links(&extraction);
+
+        db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
+            .expect("upsert succeeds");
+
+        let matching_filters =
+            crate::query::parse_query("metadata AND date:2024-01-01..2024-01-31")
+                .expect("parse filters")
+                .filters;
+        let allowed = db
+            .filter_note_ids(&[note.id.clone()], &matching_filters)
+            .expect("filter applies");
+        assert!(allowed.contains(&note.id));
+
+        let non_matching_filters =
+            crate::query::parse_query("metadata AND date:2023-01-01..2023-12-31")
+                .expect("parse filters")
+                .filters;
+        let rejected = db
+            .filter_note_ids(&[note.id.clone()], &non_matching_filters)
+            .expect("filter applies");
+        assert!(!rejected.contains(&note.id));
     }
 
     #[test]

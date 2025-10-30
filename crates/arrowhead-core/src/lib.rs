@@ -16,6 +16,7 @@ pub mod embeddings;
 pub mod graph;
 pub mod indexer;
 pub mod metadata;
+pub mod query;
 pub mod search;
 pub mod sqlite;
 pub mod status;

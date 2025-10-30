@@ -2,16 +2,17 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
-    sync::{Arc, LazyLock},
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
-use regex::Regex;
 use tokio::task;
 use tracing::{debug, info};
 
-use crate::{MetadataMap, NoteId, embeddings::EmbeddingPipeline, sqlite::IndexDatabase};
+use crate::{
+    MetadataMap, NoteId, embeddings::EmbeddingPipeline, query::parse_query, sqlite::IndexDatabase,
+};
 
 /// Unified search result payload spanning the different search modes.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,40 +111,118 @@ impl SearchService {
             bail!("empty search query");
         }
 
+        let parsed = parse_query(query)
+            .with_context(|| format!("failed to parse search query `{query}`"))?;
+        let crate::query::ParsedQuery {
+            fts,
+            excludes,
+            filters,
+        } = parsed;
+
         let limit = _limit.unwrap_or(self.config.default_limit);
         let limit = limit.max(1);
-        let rewritten = process_query(query);
+        let filter_count = filters.active_count();
         let database = Arc::clone(&self.database);
+        let filters_clone = filters.clone();
+        let excludes_clone = excludes.clone();
+        let fetch_limit = if excludes.is_empty() {
+            limit
+        } else {
+            limit * 3
+        };
         info!(query = query, limit, "executing full-text search");
-        debug!(
-            query = query,
-            rewritten = rewritten.as_str(),
-            "rewrote query for FTS"
-        );
+        if let Some(ref fts_expr) = fts {
+            debug!(
+                query = query,
+                rewritten = fts_expr.as_str(),
+                filters = filter_count,
+                "parsed query for FTS"
+            );
+        } else {
+            debug!(
+                query = query,
+                filters = filter_count,
+                "executing filter-only query"
+            );
+        }
 
         let results = task::spawn_blocking(move || -> Result<Vec<SearchResult>> {
-            let matches = database.search_fts(&rewritten, limit)?;
-            let note_ids: Vec<String> = matches.iter().map(|item| item.note_id.clone()).collect();
-            let metadata_maps = database.metadata_for_notes(&note_ids)?;
+            let mut results = Vec::new();
 
-            let mut results = Vec::with_capacity(matches.len());
-            for item in matches {
-                let metadata = metadata_maps
-                    .get(&item.note_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let bm25 = item.rank as f32;
-                let reason = Some(format!("Full-text match (rank {:.2})", item.rank));
-                results.push(SearchResult {
-                    note_id: item.note_id,
-                    score: rank_to_score(item.rank),
-                    bm25,
-                    relative_path: Some(item.relative_path),
-                    preview: item.snippet,
-                    reason,
-                    metadata,
-                    title: item.title,
-                });
+            if let Some(fts_expr) = &fts {
+                let mut matches =
+                    database.search_fts_with_filters(fts_expr, fetch_limit, &filters_clone)?;
+                if !excludes_clone.is_empty() {
+                    let exclude_ids = collect_excluded_ids(&database, &excludes_clone)?;
+                    matches.retain(|item| !exclude_ids.contains(&item.note_id));
+                }
+                if matches.len() > limit {
+                    matches.truncate(limit);
+                }
+
+                let note_ids: Vec<String> =
+                    matches.iter().map(|item| item.note_id.clone()).collect();
+                let metadata_maps = database.metadata_for_notes(&note_ids)?;
+
+                for item in matches {
+                    let metadata = metadata_maps
+                        .get(&item.note_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let bm25 = item.rank as f32;
+                    let reason = Some(format!("Full-text match (rank {:.2})", item.rank));
+                    results.push(SearchResult {
+                        note_id: item.note_id,
+                        score: rank_to_score(item.rank),
+                        bm25,
+                        relative_path: Some(item.relative_path),
+                        preview: item.snippet,
+                        reason,
+                        metadata,
+                        title: item.title,
+                    });
+                }
+            } else {
+                let fetch_limit = if excludes_clone.is_empty() {
+                    fetch_limit
+                } else {
+                    limit * 3
+                };
+                let mut note_ids = database.notes_for_filters(&filters_clone, fetch_limit)?;
+                if !excludes_clone.is_empty() {
+                    let exclude_ids = collect_excluded_ids(&database, &excludes_clone)?;
+                    note_ids.retain(|id| !exclude_ids.contains(id));
+                }
+                if note_ids.len() > limit {
+                    note_ids.truncate(limit);
+                }
+
+                if note_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let metadata_maps = database.metadata_for_notes(&note_ids)?;
+                let title_map = database.titles_for_notes(&note_ids)?;
+                let relative_path_map = database.relative_paths_for_notes(&note_ids)?;
+
+                for note_id in note_ids {
+                    let metadata = metadata_maps.get(&note_id).cloned().unwrap_or_default();
+                    let title = title_map.get(&note_id).cloned().unwrap_or(None);
+                    let relative_path = relative_path_map.get(&note_id).cloned();
+                    let preview = database
+                        .note_excerpt(&note_id, 240)
+                        .context("failed to fetch note excerpt")?;
+                    results.push(SearchResult {
+                        note_id,
+                        score: 0.0,
+                        bm25: f32::MAX,
+                        relative_path,
+                        preview,
+                        reason: Some("Filter match".to_string()),
+                        metadata,
+                        title,
+                    });
+                }
             }
 
             Ok(results)
@@ -167,6 +246,24 @@ impl SearchService {
             bail!("empty search query");
         }
 
+        let parsed = parse_query(query)
+            .with_context(|| format!("failed to parse search query `{query}`"))?;
+        let crate::query::ParsedQuery {
+            fts,
+            excludes,
+            filters,
+        } = parsed;
+        let filters_clone = filters.clone();
+
+        let embedding_seed = fts
+            .as_ref()
+            .map(|value| semantic_embedding_text(value))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| query.to_string());
+        if embedding_seed.trim().is_empty() {
+            bail!("query must include at least one search term");
+        }
+
         let pipeline = match self.embeddings.as_ref() {
             Some(pipeline) => pipeline,
             None => bail!("semantic search requires embeddings to be enabled"),
@@ -176,12 +273,13 @@ impl SearchService {
         info!(query = query, limit, "executing semantic search");
         debug!(
             query = query,
+            filters = filters.active_count(),
             model = pipeline.descriptor().identifier(),
             "using embedding pipeline for semantic search"
         );
         let query_vector = pipeline
             .generator()
-            .embed_query(query)
+            .embed_query(&embedding_seed)
             .context("failed to embed search query")?;
 
         let matches = pipeline
@@ -195,21 +293,44 @@ impl SearchService {
         }
 
         let note_ids: Vec<String> = matches.iter().map(|m| m.note_id.clone()).collect();
+        let mut allowed_ids = if filters.is_empty() {
+            note_ids.iter().cloned().collect::<HashSet<_>>()
+        } else {
+            self.database
+                .filter_note_ids(&note_ids, &filters_clone)
+                .context("failed to apply filters to semantic results")?
+        };
+
+        if !excludes.is_empty() && !allowed_ids.is_empty() {
+            let exclude_ids = collect_excluded_ids(&self.database, &excludes)
+                .context("failed to apply NOT exclusions")?;
+            allowed_ids.retain(|id| !exclude_ids.contains(id));
+        }
+
+        if allowed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let allowed_list: Vec<String> = allowed_ids.iter().cloned().collect();
         let metadata_maps = self
             .database
-            .metadata_for_notes(&note_ids)
+            .metadata_for_notes(&allowed_list)
             .context("failed to load metadata for semantic results")?;
         let title_map = self
             .database
-            .titles_for_notes(&note_ids)
+            .titles_for_notes(&allowed_list)
             .context("failed to load note titles for semantic results")?;
         let relative_path_map = self
             .database
-            .relative_paths_for_notes(&note_ids)
+            .relative_paths_for_notes(&allowed_list)
             .context("failed to load note paths for semantic results")?;
 
         let mut results = Vec::new();
-        for item in matches.into_iter().take(limit) {
+        for item in matches {
+            if !allowed_ids.contains(&item.note_id) {
+                continue;
+            }
+
             let similarity = (1.0_f32 - item.distance).max(0.0_f32);
             if similarity < self.config.semantic_threshold {
                 continue;
@@ -236,6 +357,10 @@ impl SearchService {
                 metadata,
                 title,
             });
+
+            if results.len() >= limit {
+                break;
+            }
         }
 
         results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -261,6 +386,24 @@ impl SearchService {
             bail!("empty search query");
         }
 
+        let parsed = parse_query(query)
+            .with_context(|| format!("failed to parse search query `{query}`"))?;
+        let crate::query::ParsedQuery {
+            fts,
+            excludes,
+            filters,
+        } = parsed;
+        let filters_clone = filters.clone();
+
+        let embedding_seed = fts
+            .as_ref()
+            .map(|value| semantic_embedding_text(value))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| query.to_string());
+        if embedding_seed.trim().is_empty() {
+            bail!("query must include at least one search term");
+        }
+
         let pipeline = match self.embeddings.as_ref() {
             Some(pipeline) => pipeline,
             None => bail!("hybrid search requires embeddings to be enabled"),
@@ -270,13 +413,14 @@ impl SearchService {
         info!(query = query, limit, "executing hybrid search");
         debug!(
             query = query,
+            filters = filters.active_count(),
             model = pipeline.descriptor().identifier(),
             "using embedding pipeline for hybrid search"
         );
 
         let query_vector = pipeline
             .generator()
-            .embed_query(query)
+            .embed_query(&embedding_seed)
             .context("failed to embed search query")?;
 
         let semantic_matches = pipeline
@@ -284,6 +428,21 @@ impl SearchService {
             .search(&query_vector, limit * 3, self.config.semantic_threshold)
             .await
             .context("semantic vector search failed")?;
+
+        let semantic_ids: Vec<String> =
+            semantic_matches.iter().map(|m| m.note_id.clone()).collect();
+        let mut allowed_semantic_ids = if filters.is_empty() {
+            semantic_ids.iter().cloned().collect::<HashSet<_>>()
+        } else {
+            self.database
+                .filter_note_ids(&semantic_ids, &filters_clone)
+                .context("failed to apply filters to hybrid semantic results")?
+        };
+        if !excludes.is_empty() && !allowed_semantic_ids.is_empty() {
+            let exclude_ids = collect_excluded_ids(&self.database, &excludes)
+                .context("failed to apply NOT exclusions")?;
+            allowed_semantic_ids.retain(|id| !exclude_ids.contains(id));
+        }
 
         let fts_results = self
             .search_fts(query, Some(limit * 3))
@@ -304,6 +463,9 @@ impl SearchService {
         }
 
         for item in semantic_matches {
+            if !allowed_semantic_ids.contains(&item.note_id) {
+                continue;
+            }
             let similarity = (1.0_f32 - item.distance).max(0.0_f32);
             if similarity <= 0.0 {
                 continue;
@@ -410,185 +572,39 @@ fn rank_to_score(rank: f64) -> f32 {
     (-adjusted).exp() as f32
 }
 
-const FIELD_PATTERN_STR: &str = "(?P<field>[A-Za-z0-9_]+):(?P<value>\"[^\"]*\"|\\S+)";
-
-fn process_query(query: &str) -> String {
-    static FIELD_PATTERN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(FIELD_PATTERN_STR).expect("valid field:value regex"));
-
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return String::new();
+fn collect_excluded_ids(database: &IndexDatabase, excludes: &[String]) -> Result<HashSet<String>> {
+    let mut combined = HashSet::new();
+    for expr in excludes {
+        let ids = database
+            .matching_note_ids(expr)
+            .with_context(|| format!("failed to evaluate NOT clause `{expr}`"))?;
+        combined.extend(ids);
     }
-
-    let mut matches = Vec::new();
-    for captures in FIELD_PATTERN.captures_iter(trimmed) {
-        let full = captures.get(0).unwrap();
-        let field = captures.name("field").unwrap().as_str();
-        let value = captures.name("value").unwrap().as_str();
-        matches.push((
-            full.start(),
-            full.end(),
-            field.to_string(),
-            value.to_string(),
-        ));
-    }
-
-    let has_field_patterns = !matches.is_empty();
-    let mut processed = trimmed.to_string();
-
-    for (start, end, field, raw_value) in matches.into_iter().rev() {
-        let was_quoted = raw_value.starts_with('"') && raw_value.ends_with('"');
-        let inner = if was_quoted && raw_value.len() >= 2 {
-            raw_value[1..raw_value.len() - 1].to_string()
-        } else {
-            raw_value.clone()
-        };
-
-        if inner.contains("://") {
-            continue;
-        }
-
-        let replacement = if field == "content" {
-            if was_quoted {
-                let escaped = inner.replace('"', "\"\"");
-                format!("content:\"{}\"", escaped)
-            } else {
-                format!("content:{}", escape_fts_query(&inner))
-            }
-        } else {
-            let token = format!("{}:{}", field, inner);
-            let escaped = token.replace('"', "\"\"");
-            format!("metadata:\"{}\"", escaped)
-        };
-
-        processed.replace_range(start..end, &replacement);
-    }
-
-    if !has_field_patterns {
-        return format!("{{content metadata}} : {}", escape_fts_query(trimmed));
-    }
-
-    sanitize_mixed_query(&processed)
+    Ok(combined)
 }
 
-fn sanitize_mixed_query(processed: &str) -> String {
-    const METADATA_PREFIX: &str = "metadata:";
-    const CONTENT_PREFIX: &str = "content:";
-
-    let chars: Vec<(usize, char)> = processed.char_indices().collect();
-    let mut result = String::with_capacity(processed.len());
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        let (byte_index, ch) = chars[index];
-
-        if ch.is_whitespace() {
-            result.push(ch);
-            index += 1;
-            continue;
-        }
-
-        let remaining = &processed[byte_index..];
-        if remaining.starts_with(METADATA_PREFIX) {
-            result.push_str(METADATA_PREFIX);
-            index += METADATA_PREFIX.chars().count();
-            index = copy_field_value(&mut result, &chars, index);
-            continue;
-        }
-
-        if remaining.starts_with(CONTENT_PREFIX) {
-            result.push_str(CONTENT_PREFIX);
-            index += CONTENT_PREFIX.chars().count();
-            index = copy_field_value(&mut result, &chars, index);
-            continue;
-        }
-
-        let start_byte = byte_index;
-        let mut next = index;
-        while next < chars.len() && !chars[next].1.is_whitespace() {
-            next += 1;
-        }
-
-        let end_byte = if next < chars.len() {
-            chars[next].0
-        } else {
-            processed.len()
-        };
-
-        let token = processed[start_byte..end_byte].trim();
-        if !token.is_empty() {
-            result.push_str(&escape_fts_query(token));
-        }
-
-        index = next;
+fn semantic_embedding_text(fts: &str) -> String {
+    let mut text = fts.to_string();
+    for pattern in [
+        "{content metadata} :",
+        "metadata:",
+        "content:",
+        "AND",
+        "OR",
+        "NOT",
+    ] {
+        text = text.replace(pattern, " ");
     }
 
-    result.trim().to_string()
-}
-
-fn copy_field_value(result: &mut String, chars: &[(usize, char)], mut index: usize) -> usize {
-    if index >= chars.len() {
-        return index;
-    }
-
-    if chars[index].1 == '"' {
-        result.push('"');
-        index += 1;
-        let mut escaped = false;
-        while index < chars.len() {
-            let ch = chars[index].1;
-            result.push(ch);
-            if ch == '"' && !escaped {
-                index += 1;
-                break;
-            }
-            escaped = ch == '\\' && !escaped;
-            index += 1;
-        }
-    } else {
-        while index < chars.len() && !chars[index].1.is_whitespace() {
-            result.push(chars[index].1);
-            index += 1;
-        }
-    }
-
-    index
-}
-
-fn escape_fts_query(query: &str) -> String {
-    static HYPHEN_PATTERN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b[\w]+-[\w-]+\b").expect("valid hyphen regex"));
-
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-        return trimmed.to_string();
-    }
-
-    let has_hyphenated_terms = HYPHEN_PATTERN.is_match(trimmed);
-    let has_special_chars = trimmed
-        .chars()
-        .any(|ch| matches!(ch, '[' | ']' | '(' | ')' | '"' | '*'));
-    let starts_with_dash = trimmed.starts_with('-');
-    let contains_boolean =
-        trimmed.contains(" AND ") || trimmed.contains(" OR ") || trimmed.contains(" NOT ");
-
-    if has_hyphenated_terms || has_special_chars || starts_with_dash || contains_boolean {
-        let escaped = trimmed.replace('"', "\"\"");
-        format!("\"{}\"", escaped)
-    } else {
-        trimmed.to_string()
-    }
+    text = text.replace(['{', '}', '(', ')', '"'], " ");
+    text = text.replace(':', " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, path::Path, sync::Arc};
+    use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
     use tempfile::TempDir;
 
@@ -606,87 +622,6 @@ mod tests {
             .join("fixtures")
             .join("test-vault");
         Arc::new(Vault::new(VaultConfig::new(root)).expect("vault initialises"))
-    }
-
-    #[test]
-    fn escape_quotes_and_hyphenated_terms() {
-        assert_eq!(escape_fts_query("2025-10-06"), "\"2025-10-06\"");
-        assert_eq!(escape_fts_query("out-of-memory"), "\"out-of-memory\"");
-        assert_eq!(escape_fts_query("simple"), "simple");
-        assert_eq!(escape_fts_query("\"already quoted\""), "\"already quoted\"");
-    }
-
-    #[test]
-    fn escape_special_characters_and_booleans() {
-        assert_eq!(escape_fts_query("test[123]"), "\"test[123]\"");
-        assert_eq!(escape_fts_query("test(abc)"), "\"test(abc)\"");
-        assert_eq!(escape_fts_query("test*"), "\"test*\"");
-        assert_eq!(escape_fts_query("foo AND bar"), "\"foo AND bar\"");
-    }
-
-    #[test]
-    fn process_simple_queries() {
-        assert_eq!(
-            process_query("simple query"),
-            "{content metadata} : simple query"
-        );
-        assert_eq!(
-            process_query("2025-10-06"),
-            "{content metadata} : \"2025-10-06\""
-        );
-    }
-
-    #[test]
-    fn process_content_fields() {
-        assert_eq!(process_query("content:swift"), "content:swift");
-        assert_eq!(
-            process_query("content:\"async await\""),
-            "content:\"async await\""
-        );
-        assert_eq!(
-            process_query("content:2025-10-06"),
-            "content:\"2025-10-06\""
-        );
-    }
-
-    #[test]
-    fn process_metadata_fields() {
-        assert_eq!(
-            process_query("category:project"),
-            "metadata:\"category:project\""
-        );
-        assert_eq!(process_query("tags:swift"), "metadata:\"tags:swift\"");
-    }
-
-    #[test]
-    fn process_multiple_fields_and_plain_text() {
-        let query = "category:project tags:swift";
-        let result = process_query(query);
-        assert!(result.contains("metadata:\"category:project\""));
-        assert!(result.contains("metadata:\"tags:swift\""));
-
-        let mixed = process_query("category:project machine learning");
-        assert!(mixed.contains("metadata:\"category:project\""));
-        assert!(mixed.contains("machine learning"));
-    }
-
-    #[test]
-    fn process_quoted_and_date_values() {
-        assert_eq!(
-            process_query("category:\"my project\""),
-            "metadata:\"category:my project\""
-        );
-
-        let result = process_query("category:project 2025-10-06");
-        assert!(result.contains("metadata:\"category:project\""));
-        assert!(result.contains("\"2025-10-06\""));
-    }
-
-    #[test]
-    fn process_leaves_urls_intact() {
-        let result = process_query("http://example.com content:camera");
-        assert!(result.contains("http://example.com"));
-        assert!(result.contains("content:camera"));
     }
 
     #[tokio::test]
@@ -718,6 +653,158 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.starts_with("Full-text match"))
         }));
+    }
+
+    #[tokio::test]
+    async fn fts_search_applies_metadata_date_filters() {
+        let vault = fixture_vault();
+        let db_dir = TempDir::new().expect("tempdir");
+        let db_path = db_dir.path().join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("database opens"));
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+        indexer.index_all().await.expect("indexing succeeds");
+
+        let service = SearchService::new(database, SearchConfig::default(), None);
+        let results = service
+            .search_fts("metadata AND date:2024-01-01..2024-01-31", Some(10))
+            .await
+            .expect("search succeeds");
+        assert!(
+            results
+                .iter()
+                .any(|result| result.note_id == "Complex Metadata Types")
+        );
+
+        let empty = service
+            .search_fts("metadata AND date:2023-01-01..2023-12-31", Some(10))
+            .await
+            .expect("search succeeds");
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts_search_applies_modified_filters() {
+        let vault_dir = TempDir::new().expect("vault");
+        let note_path = vault_dir.path().join("Recent.md");
+        fs::write(
+            &note_path,
+            "---\ntitle: Recent Note\n---\n\nThis is a recent note for testing.",
+        )
+        .expect("write note");
+
+        let vault = Arc::new(
+            Vault::new(VaultConfig::new(vault_dir.path().to_path_buf()))
+                .expect("vault initialises"),
+        );
+        vault.ensure_arrowhead_dirs().expect("arrowhead dirs");
+        let db_path = vault.paths().arrowhead_dir.join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("database opens"));
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+        indexer.index_all().await.expect("indexing succeeds");
+
+        let service = SearchService::new(database, SearchConfig::default(), None);
+        let recent = service
+            .search_fts("recent AND modified:past7d", Some(5))
+            .await
+            .expect("search succeeds");
+        assert!(recent.iter().any(|result| result.note_id == "Recent"));
+
+        let stale = service
+            .search_fts("recent AND modified:<2000-01-01", Some(5))
+            .await
+            .expect("search succeeds");
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fts_search_supports_not_operator() {
+        let vault_dir = TempDir::new().expect("vault");
+        let analog_path = vault_dir.path().join("Analog.md");
+        fs::write(
+            &analog_path,
+            "---\ntitle: Analog Photography\n---\n\nAnalog photography gear and film notes.",
+        )
+        .expect("write note");
+        let digital_path = vault_dir.path().join("Digital.md");
+        fs::write(
+            &digital_path,
+            "---\ntitle: Digital Photography\n---\n\nDigital photography workflow and sensors.",
+        )
+        .expect("write note");
+
+        let vault = Arc::new(
+            Vault::new(VaultConfig::new(vault_dir.path().to_path_buf()))
+                .expect("vault initialises"),
+        );
+        vault.ensure_arrowhead_dirs().expect("arrowhead dirs");
+        let db_path = vault.paths().arrowhead_dir.join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("database opens"));
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+        indexer.index_all().await.expect("indexing succeeds");
+
+        let service = SearchService::new(database, SearchConfig::default(), None);
+        let results = service
+            .search_fts("photography NOT digital", Some(10))
+            .await
+            .expect("search succeeds");
+        assert!(results.iter().any(|r| r.note_id == "Analog"));
+        assert!(results.iter().all(|r| r.note_id != "Digital"));
+
+        let negative_only = service
+            .search_fts("NOT digital", Some(10))
+            .await
+            .expect("negative-only search succeeds");
+        assert!(negative_only.iter().all(|r| r.note_id != "Digital"));
+    }
+
+    #[tokio::test]
+    async fn filter_only_queries_return_results() {
+        let vault_dir = TempDir::new().expect("vault");
+        let note_path = vault_dir.path().join("Journal.md");
+        fs::write(
+            &note_path,
+            "---\ntitle: Daily Journal\n---\n\nNotes about the day.",
+        )
+        .expect("write note");
+
+        let vault = Arc::new(
+            Vault::new(VaultConfig::new(vault_dir.path().to_path_buf()))
+                .expect("vault initialises"),
+        );
+        vault.ensure_arrowhead_dirs().expect("arrowhead dirs");
+        let db_path = vault.paths().arrowhead_dir.join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("database opens"));
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+        indexer.index_all().await.expect("indexing succeeds");
+
+        let service = SearchService::new(database, SearchConfig::default(), None);
+        let results = service
+            .search_fts("modified:past30d", Some(5))
+            .await
+            .expect("filter-only search succeeds");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].note_id, "Journal");
+        assert_eq!(results[0].reason.as_deref(), Some("Filter match"));
     }
 
     #[tokio::test]

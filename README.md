@@ -193,6 +193,8 @@ arrowhead search hybrid "mixed query"
 arrowhead search fts "project roadmap" --format paths
 arrowhead search semantic "notes about embeddings" --format ids
 
+For boolean syntax, field scoping, and date filters, see [`docs/query_syntax.md`](docs/query_syntax.md).
+
 # Graph pipelines
 arrowhead graph orphans --format ids | head -20
 arrowhead graph backlinks "Project Hub" --format ids
