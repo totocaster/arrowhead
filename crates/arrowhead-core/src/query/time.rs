@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{
     DateTime, Datelike, Duration, Months, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc,
     Weekday,
@@ -190,23 +190,28 @@ pub fn parse_relative_range(value: &str, now: DateTime<Utc>) -> Result<Option<Da
         bail!("relative date `{value}` missing length component");
     }
 
-    let mut digits = String::new();
-    let mut chars = rest.chars();
-    while let Some(ch) = chars.next() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-        } else {
-            let unit = ch;
-            let length = u32::from_str(&digits)
-                .with_context(|| format!("relative date `{value}` missing numeric duration"))?;
-            if length == 0 {
-                bail!("relative date `{value}` must be at least 1");
-            }
-            return relative_range(direction, length, unit, now);
-        }
+    let split_index = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| anyhow!("relative date `{value}` missing unit suffix (d/w/m)"))?;
+
+    let digits = &rest[..split_index];
+    let unit_segment = &rest[split_index..];
+    let unit = unit_segment
+        .chars()
+        .next()
+        .expect("non-empty segment after split");
+
+    if unit_segment.len() > 1 {
+        bail!("relative date `{value}` has an invalid unit suffix");
     }
 
-    bail!("relative date `{value}` missing unit suffix (d/w/m)")
+    let length = u32::from_str(digits)
+        .with_context(|| format!("relative date `{value}` missing numeric duration"))?;
+    if length == 0 {
+        bail!("relative date `{value}` must be at least 1");
+    }
+
+    relative_range(direction, length, unit, now)
 }
 
 fn relative_range(

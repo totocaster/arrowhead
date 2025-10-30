@@ -641,11 +641,15 @@ impl Parser {
         loop {
             if self.matches(TokenKind::And) {
                 exprs.push(self.parse_unary()?);
-            } else if self.is_start_of_primary() {
-                exprs.push(self.parse_unary()?);
-            } else {
-                break;
+                continue;
             }
+
+            if self.is_start_of_primary() {
+                exprs.push(self.parse_unary()?);
+                continue;
+            }
+
+            break;
         }
 
         if exprs.len() == 1 {
