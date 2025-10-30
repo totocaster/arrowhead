@@ -403,9 +403,16 @@ fn add_months_clamped(ts: DateTime<Utc>, months: i32) -> DateTime<Utc> {
         year += 1;
     }
     let day = naive.day().min(days_in_month(year, month as u32));
-    Utc.with_ymd_and_hms(year, month as u32, day, naive.hour(), naive.minute(), naive.second())
-        .single()
-        .expect("valid adjusted month")
+    Utc.with_ymd_and_hms(
+        year,
+        month as u32,
+        day,
+        naive.hour(),
+        naive.minute(),
+        naive.second(),
+    )
+    .single()
+    .expect("valid adjusted month")
 }
 
 fn days_in_month(year: i32, month: u32) -> u32 {
