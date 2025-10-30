@@ -312,6 +312,14 @@ Keep the Arrowhead allowlist scoped to loopback so all external traffic is funne
 - Model management UX: preset documentation, cache overrides, richer download progress.
 - Vector dependency review and MSRV tracking for sqlite-vec releases.
 
+## Release Process
+
+- Tag the commit you want to ship with `vX.Y.Z`; pushing the tag triggers the `Release` workflow.
+- The workflow re-runs formatting, clippy, and tests on Ubuntu, then builds macOS Intel (macos-12) and Apple Silicon (macos-14) binaries with `cargo build --release`.
+- Binaries are packaged as `arrowhead-<version>-<target>.tar.gz` with `bin/arrowhead` plus the project README and uploaded to the GitHub release.
+- Set a personal access token with `repo` scope as the `HOMEBREW_TAP_TOKEN` repository secret so the workflow can push tap updates to `totocaster/homebrew-tap`.
+- The tap formula is rewritten automatically to point at the new release URLs and SHA256 sums for both macOS architectures.
+
 ## License
 
 Licensed under either of:
