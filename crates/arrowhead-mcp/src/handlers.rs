@@ -667,89 +667,713 @@ impl HandlerRegistry {
     }
 
     fn build_tool_descriptors(&self) -> Vec<ToolDescriptor> {
-        let empty_schema = || json!({ "type": "object", "properties": {} });
+        let empty_schema = || {
+            json!({
+                "type": "object",
+                "description": "This tool does not accept any parameters.",
+                "properties": {},
+                "additionalProperties": false
+            })
+        };
+
+        let note_id_examples = json!(["Projects/Test Plan", "2025-10-26-F130208"]);
+        let metadata_examples = json!([
+            {
+                "category": "project",
+                "status": "active",
+                "tags": ["ai", "tools"]
+            }
+        ]);
+        let query_examples = json!(["project status:active", "\"exact phrase\"", "tags:ai"]);
+
+        let metadata_map_schema = || {
+            json!({
+                "type": "object",
+                "description": "Frontmatter metadata as key-value pairs.",
+                "additionalProperties": true,
+                "examples": metadata_examples.clone()
+            })
+        };
+        let date_time_schema = |description: &str| {
+            json!({
+                "type": "string",
+                "format": "date-time",
+                "description": description
+            })
+        };
+        let path_schema = |description: &str| {
+            json!({
+                "type": "string",
+                "description": description
+            })
+        };
+
+        let note_id_field_schema = json!({
+            "type": "string",
+            "description": "Vault-relative note identifier without the .md extension.",
+            "examples": note_id_examples
+        });
+
         let note_id_schema = json!({
             "type": "object",
+            "description": "Parameters that identify a single note.",
+            "additionalProperties": false,
             "properties": {
-                "noteId": { "type": "string" }
+                "noteId": note_id_field_schema.clone()
             },
             "required": ["noteId"]
         });
         let search_schema = json!({
             "type": "object",
+            "description": "Parameters for Arrowhead search tools.",
+            "additionalProperties": false,
             "properties": {
-                "query": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 1 }
+                "query": {
+                    "type": "string",
+                    "description": "Query string to evaluate. Supports field:value metadata filters and quoted phrases for exact matches.",
+                    "examples": query_examples
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 10,
+                    "description": "Maximum number of results to return. Defaults to 10 when omitted.",
+                    "examples": [10]
+                }
             },
             "required": ["query"]
         });
         let notes_list_schema = json!({
             "type": "object",
+            "description": "Optional filters when listing notes from the vault.",
+            "additionalProperties": false,
             "properties": {
-                "idsOnly": { "type": "boolean" },
-                "limit": { "type": "integer", "minimum": 1 }
+                "idsOnly": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, return only note identifiers.",
+                    "examples": [true]
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional maximum number of notes to include.",
+                    "examples": [25]
+                }
             }
         });
         let note_create_schema = json!({
             "type": "object",
+            "description": "Parameters for creating a new note. Provide either noteId or title; the identifier becomes the filename.",
+            "additionalProperties": false,
             "properties": {
-                "noteId": { "type": "string" },
-                "title": { "type": "string" },
-                "category": { "type": "string" },
-                "content": { "type": "string" },
-                "metadata": { "type": "object" }
-            }
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Optional display title written into frontmatter.",
+                    "examples": ["Arrowhead CLI Roadmap"]
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional helper that prefixes the note ID with the provided folder.",
+                    "examples": ["Projects"]
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Markdown body for the note. Defaults to an empty document.",
+                    "default": "",
+                    "examples": ["# Arrowhead CLI\n\n- [ ] Ship MCP tooling"]
+                },
+                "metadata": metadata_map_schema()
+            },
+            "anyOf": [
+                { "required": ["noteId"] },
+                { "required": ["title"] }
+            ]
         });
         let note_update_schema = json!({
             "type": "object",
+            "description": "Partial update for an existing note. Omitted fields are left unchanged.",
+            "additionalProperties": false,
             "properties": {
-                "noteId": { "type": "string" },
-                "title": { "type": "string" },
-                "content": { "type": "string" },
-                "metadata": { "type": "object" }
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Replacement title written into frontmatter.",
+                    "examples": ["Updated Arrowhead Roadmap"]
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Replacement Markdown body.",
+                    "examples": ["# Updated Plan\n\nContent goes here."]
+                },
+                "metadata": metadata_map_schema()
             },
             "required": ["noteId"]
         });
         let note_delete_schema = json!({
             "type": "object",
+            "description": "Parameters required to delete a note. Deletion is refused unless confirm is true.",
+            "additionalProperties": false,
             "properties": {
-                "noteId": { "type": "string" },
-                "confirm": { "type": "boolean" }
+                "noteId": note_id_field_schema.clone(),
+                "confirm": {
+                    "type": "boolean",
+                    "const": true,
+                    "description": "Set to true to confirm permanent deletion.",
+                    "examples": [true]
+                }
             },
             "required": ["noteId", "confirm"]
         });
         let related_notes_schema = json!({
             "type": "object",
+            "description": "Return notes related to an anchor note or free-form query.",
+            "additionalProperties": false,
             "properties": {
-                "noteId": { "type": "string" },
-                "query": { "type": "string" },
-                "limit": { "type": "integer", "minimum": 1 }
+                "noteId": note_id_field_schema.clone(),
+                "query": {
+                    "type": "string",
+                    "description": "Natural language prompt when no anchor note is supplied.",
+                    "examples": ["project kickoff checklist"]
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 5,
+                    "description": "Maximum number of related notes to return. Defaults to 5.",
+                    "examples": [5]
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": ["auto", "semantic", "graph", "hybrid"],
+                    "default": "auto",
+                    "description": "Strategy hint controlling which signals to prioritise."
+                }
+            },
+            "anyOf": [
+                { "required": ["noteId"] },
+                { "required": ["query"] }
+            ],
+            "not": {
+                "required": ["noteId", "query"]
             }
+        });
+
+        let link_edge_schema = json!({
+            "type": "object",
+            "description": "WikiLink edge describing a relationship between notes.",
+            "required": ["source", "raw", "reason"],
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Identifier of the note containing the outbound link.",
+                    "examples": ["Projects/Test Plan"]
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Resolved identifier of the linked note when available."
+                },
+                "raw": {
+                    "type": "string",
+                    "description": "Raw link text as written in the source note."
+                },
+                "displayText": {
+                    "type": "string",
+                    "description": "Optional alias captured from [[target|alias]] syntax."
+                },
+                "heading": {
+                    "type": "string",
+                    "description": "Optional heading fragment captured from [[target#Heading]]."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Explanation of how the link target was resolved."
+                }
+            },
+            "additionalProperties": false
+        });
+        let note_list_item_schema = json!({
+            "type": "object",
+            "description": "Summary information for a single note.",
+            "required": ["noteId"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Optional title resolved from note metadata."
+                },
+                "relativePath": path_schema("Vault-relative filesystem path to the note file."),
+                "fileModifiedAt": date_time_schema("Last modification timestamp of the note file."),
+                "createdAt": date_time_schema("Creation timestamp recorded for the note, when available.")
+            },
+            "additionalProperties": false
+        });
+        let note_metadata_payload_schema = json!({
+            "type": "object",
+            "description": "Metadata for a single note without the Markdown body.",
+            "required": ["noteId", "metadata"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Optional note title."
+                },
+                "metadata": metadata_map_schema()
+            },
+            "additionalProperties": false
+        });
+        let note_content_payload_schema = json!({
+            "type": "object",
+            "description": "Complete note payload including metadata and Markdown content.",
+            "required": ["noteId", "metadata", "content", "relativePath", "fileModifiedAt"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Optional note title derived from metadata."
+                },
+                "metadata": metadata_map_schema(),
+                "content": {
+                    "type": "string",
+                    "description": "Markdown body with frontmatter removed."
+                },
+                "raw": {
+                    "type": "string",
+                    "description": "Full Markdown text including frontmatter when available."
+                },
+                "relativePath": path_schema("Vault-relative filesystem path to the note."),
+                "fileModifiedAt": date_time_schema("Last modification timestamp recorded for the note file."),
+                "createdAt": date_time_schema("Creation timestamp for the note, when known.")
+            },
+            "additionalProperties": false
+        });
+        let search_result_item_schema = json!({
+            "type": "object",
+            "description": "Individual search result entry.",
+            "required": ["noteId", "score", "metadata"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Optional title associated with the note."
+                },
+                "score": {
+                    "type": "number",
+                    "description": "Combined relevance score between 0 and 1."
+                },
+                "bm25": {
+                    "type": "number",
+                    "description": "Raw BM25 rank (lower is better) when returned by the FTS index."
+                },
+                "relativePath": path_schema("Vault-relative path for the note file."),
+                "preview": {
+                    "type": "string",
+                    "description": "Optional snippet excerpt that includes highlighted matches."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Human-readable explanation of why the note matched."
+                },
+                "metadata": metadata_map_schema()
+            },
+            "additionalProperties": false
+        });
+        let search_results_payload_schema = json!({
+            "type": "object",
+            "description": "Search response containing ranked results.",
+            "required": ["total", "results"],
+            "properties": {
+                "total": {
+                    "type": "integer",
+                    "description": "Number of results returned in this response."
+                },
+                "results": {
+                    "type": "array",
+                    "description": "Ranked search results.",
+                    "items": search_result_item_schema
+                }
+            },
+            "additionalProperties": false
+        });
+        let graph_context_output_schema = json!({
+            "type": "object",
+            "description": "Combined backlink and forward-link context for a note.",
+            "required": ["noteId", "backlinks", "forwardLinks"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "backlinks": {
+                    "type": "array",
+                    "description": "Notes that link to the requested note.",
+                    "items": link_edge_schema.clone()
+                },
+                "forwardLinks": {
+                    "type": "array",
+                    "description": "Links originating from the requested note.",
+                    "items": link_edge_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let graph_links_payload_schema = json!({
+            "type": "object",
+            "description": "Directional graph links for a note.",
+            "required": ["noteId", "links"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "links": {
+                    "type": "array",
+                    "description": "Collected link edges in the requested direction.",
+                    "items": link_edge_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let graph_orphan_item_schema = json!({
+            "type": "object",
+            "description": "Note that currently has no inbound or outbound links.",
+            "required": ["noteId"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "title": {
+                    "type": "string",
+                    "description": "Optional note title."
+                },
+                "relativePath": path_schema("Vault-relative path for the orphaned note.")
+            },
+            "additionalProperties": false
+        });
+        let graph_orphans_payload_schema = json!({
+            "type": "object",
+            "description": "Summary of notes that are not referenced anywhere in the vault.",
+            "required": ["total", "notes"],
+            "properties": {
+                "total": {
+                    "type": "integer",
+                    "description": "Count of orphaned notes."
+                },
+                "notes": {
+                    "type": "array",
+                    "description": "Details of orphaned notes.",
+                    "items": graph_orphan_item_schema
+                }
+            },
+            "additionalProperties": false
+        });
+        let graph_unresolved_payload_schema = json!({
+            "type": "object",
+            "description": "Unresolved WikiLinks that do not point to existing notes.",
+            "required": ["total", "links"],
+            "properties": {
+                "total": {
+                    "type": "integer",
+                    "description": "Number of unresolved links discovered."
+                },
+                "links": {
+                    "type": "array",
+                    "description": "Link entries that failed to resolve.",
+                    "items": link_edge_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let note_delete_payload_schema = json!({
+            "type": "object",
+            "description": "Confirmation payload returned after deleting a note.",
+            "required": ["noteId", "deleted"],
+            "properties": {
+                "noteId": note_id_field_schema,
+                "deleted": {
+                    "type": "boolean",
+                    "description": "Indicates whether the note file was removed."
+                },
+                "prunedDirectories": {
+                    "type": "array",
+                    "description": "Vault-relative directories removed after deletion.",
+                    "items": path_schema("Directory pruned as part of note deletion."),
+                    "default": []
+                }
+            },
+            "additionalProperties": false
+        });
+        let related_note_schema = json!({
+            "type": "object",
+            "description": "Single related note surfaced by discovery tooling.",
+            "required": ["noteId"],
+            "properties": {
+                "noteId": {
+                    "type": "string",
+                    "description": "Identifier of the related note."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional title of the related note."
+                },
+                "score": {
+                    "type": "number",
+                    "description": "Similarity score reported by the strategy."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Explanation of why the note was returned."
+                },
+                "metadata": metadata_map_schema()
+            },
+            "additionalProperties": false
+        });
+        let related_notes_payload_schema = json!({
+            "type": "object",
+            "description": "Discovery results describing notes related to an anchor or query.",
+            "required": ["strategy", "related"],
+            "properties": {
+                "noteId": {
+                    "type": "string",
+                    "description": "Anchor note identifier when one was provided."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Original query string when discovery was seeded from free text."
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": ["auto", "semantic", "graph", "hybrid"],
+                    "description": "Strategy that produced the related notes."
+                },
+                "fallbackStrategy": {
+                    "type": "string",
+                    "enum": ["auto", "semantic", "graph", "hybrid"],
+                    "description": "Fallback strategy used when the requested one was unavailable."
+                },
+                "related": {
+                    "type": "array",
+                    "description": "Related notes ranked by relevance.",
+                    "items": related_note_schema
+                }
+            },
+            "additionalProperties": false
+        });
+        let vault_stats_payload_schema = json!({
+            "type": "object",
+            "description": "Aggregated vault statistics snapshot.",
+            "required": ["generatedAt", "totalNotes"],
+            "properties": {
+                "generatedAt": date_time_schema("Timestamp when the statistics snapshot was generated."),
+                "totalNotes": {
+                    "type": "integer",
+                    "description": "Total number of markdown notes discovered in the vault."
+                },
+                "indexedNotes": {
+                    "type": "integer",
+                    "description": "Number of notes currently indexed by the Arrowhead daemon."
+                },
+                "errorNotes": {
+                    "type": "integer",
+                    "description": "Number of notes that reported indexing errors."
+                },
+                "totalWords": {
+                    "type": "integer",
+                    "description": "Approximate aggregate word count across the vault."
+                },
+                "averageWordsPerNote": {
+                    "type": "number",
+                    "description": "Average word count per note."
+                },
+                "recentNotes": {
+                    "type": "array",
+                    "description": "Optional summary of recently modified notes.",
+                    "items": note_list_item_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let naming_pattern_schema = json!({
+            "type": "object",
+            "description": "Summary describing a naming convention detected in the vault.",
+            "required": ["pattern", "count"],
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Human-readable description of the naming pattern."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of notes matching the pattern."
+                },
+                "examples": {
+                    "type": "array",
+                    "description": "Representative examples illustrating the pattern.",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": []
+                }
+            },
+            "additionalProperties": false
+        });
+        let metadata_value_kind_schema = json!({
+            "type": "string",
+            "enum": ["string", "number", "boolean", "array", "object", "null"],
+            "description": "Metadata value kind observed for the field."
+        });
+        let metadata_common_value_schema = json!({
+            "type": "object",
+            "description": "Common metadata value and its frequency.",
+            "required": ["value", "count"],
+            "properties": {
+                "value": {
+                    "description": "Captured metadata value.",
+                    "default": null
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of notes that contained this value."
+                }
+            },
+            "additionalProperties": false
+        });
+        let metadata_field_stats_schema = json!({
+            "type": "object",
+            "description": "Aggregated metadata statistics for a single field.",
+            "required": ["field", "noteCount"],
+            "properties": {
+                "field": {
+                    "type": "string",
+                    "description": "Field name as it appears in note frontmatter."
+                },
+                "noteCount": {
+                    "type": "integer",
+                    "description": "Number of notes that specified the field."
+                },
+                "valueKinds": {
+                    "type": "array",
+                    "description": "Value categories observed for the field.",
+                    "items": metadata_value_kind_schema,
+                    "default": []
+                },
+                "commonValues": {
+                    "type": "array",
+                    "description": "Most common values ordered by frequency.",
+                    "items": metadata_common_value_schema,
+                    "default": []
+                }
+            },
+            "additionalProperties": false
+        });
+        let style_guide_schema = json!({
+            "type": "object",
+            "description": "User-authored style guide surfaced to agents.",
+            "required": ["relativePath", "content"],
+            "properties": {
+                "relativePath": path_schema("Vault-relative path to the style guide document."),
+                "content": {
+                    "type": "string",
+                    "description": "Raw Markdown content of the style guide."
+                }
+            },
+            "additionalProperties": false
+        });
+        let obsidian_settings_schema = json!({
+            "type": "object",
+            "description": "Subset of Obsidian settings relevant to conventions analysis.",
+            "properties": {
+                "attachmentsFolder": path_schema("Attachments directory relative to the vault root."),
+                "ignoredFolders": {
+                    "type": "array",
+                    "description": "User-defined ignore list derived from Obsidian preferences.",
+                    "items": path_schema("Folder ignored by Obsidian configuration."),
+                    "default": []
+                },
+                "dailyNoteFormat": {
+                    "type": "string",
+                    "description": "Daily note file name template if configured."
+                },
+                "linkStyle": {
+                    "type": "string",
+                    "description": "Preferred internal link style (e.g., with or without file extension)."
+                }
+            },
+            "additionalProperties": false
+        });
+        let vault_conventions_payload_schema = json!({
+            "type": "object",
+            "description": "Summary of naming patterns, metadata usage, and conventions.",
+            "required": ["namingPatterns", "metadataFields"],
+            "properties": {
+                "namingPatterns": {
+                    "type": "array",
+                    "description": "Detected naming patterns across the vault.",
+                    "items": naming_pattern_schema
+                },
+                "metadataFields": {
+                    "type": "array",
+                    "description": "Aggregated metadata field statistics.",
+                    "items": metadata_field_stats_schema
+                },
+                "obsidian": obsidian_settings_schema,
+                "styleGuide": style_guide_schema
+            },
+            "additionalProperties": false
+        });
+        let daemon_status_schema = json!({
+            "type": "object",
+            "description": "Snapshot of Arrowhead daemon activity.",
+            "required": ["updatedAt", "indexedNotes", "errorNotes"],
+            "properties": {
+                "updatedAt": date_time_schema("Timestamp when the daemon status snapshot was recorded."),
+                "indexedNotes": {
+                    "type": "integer",
+                    "description": "Total number of notes indexed by the daemon."
+                },
+                "errorNotes": {
+                    "type": "integer",
+                    "description": "Number of notes currently in an error state."
+                },
+                "activity": {
+                    "type": "string",
+                    "description": "Optional description of the daemon's current activity."
+                },
+                "queuedJobs": {
+                    "type": "integer",
+                    "description": "Number of queued jobs if the daemon is busy."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Human-readable summary of daemon activity."
+                }
+            },
+            "additionalProperties": false
         });
 
         let mut tools = vec![
             ToolDescriptor {
                 name: "graph_get_context".to_string(),
                 title: Some("Graph: Context".to_string()),
-                description: Some("Return backlinks and forward links for a note.".to_string()),
+                description: Some(
+                    "Return backlinks and forward links for a note to understand its neighbourhood."
+                        .to_string(),
+                ),
                 input_schema: note_id_schema.clone(),
-                output_schema: None,
+                output_schema: Some(graph_context_output_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.graph.get_context" })),
             },
             ToolDescriptor {
                 name: "graph_get_backlinks".to_string(),
                 title: Some("Graph: Backlinks".to_string()),
-                description: Some("Return backlinks for a note.".to_string()),
+                description: Some(
+                    "Return inbound WikiLinks pointing to the requested note.".to_string(),
+                ),
                 input_schema: note_id_schema.clone(),
-                output_schema: None,
+                output_schema: Some(graph_links_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.graph.get_backlinks" })),
             },
             ToolDescriptor {
                 name: "graph_get_forward_links".to_string(),
                 title: Some("Graph: Forward Links".to_string()),
-                description: Some("Return forward links for a note.".to_string()),
+                description: Some(
+                    "Return outbound WikiLinks originating from the requested note.".to_string(),
+                ),
                 input_schema: note_id_schema.clone(),
-                output_schema: None,
+                output_schema: Some(graph_links_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.graph.get_forward_links" })),
             },
             ToolDescriptor {
@@ -759,7 +1383,7 @@ impl HandlerRegistry {
                     "List notes that are not referenced anywhere in the vault.".to_string(),
                 ),
                 input_schema: empty_schema(),
-                output_schema: None,
+                output_schema: Some(graph_orphans_payload_schema),
                 annotations: Some(json!({ "method": "mcp.graph.find_orphans" })),
             },
             ToolDescriptor {
@@ -769,95 +1393,136 @@ impl HandlerRegistry {
                     "List links that could not be resolved to an existing note.".to_string(),
                 ),
                 input_schema: empty_schema(),
-                output_schema: None,
+                output_schema: Some(graph_unresolved_payload_schema),
                 annotations: Some(json!({ "method": "mcp.graph.find_unresolved" })),
             },
             ToolDescriptor {
                 name: "search_fts".to_string(),
                 title: Some("Search: Full Text".to_string()),
-                description: Some("Full-text search across all notes.".to_string()),
+                description: Some(
+                    "Full-text search across all notes using SQLite FTS5. Defaults to 10 results."
+                        .to_string(),
+                ),
                 input_schema: search_schema.clone(),
-                output_schema: None,
+                output_schema: Some(search_results_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.search.fts" })),
             },
             ToolDescriptor {
                 name: "search_semantic".to_string(),
                 title: Some("Search: Semantic".to_string()),
-                description: Some("Semantic similarity search using embeddings.".to_string()),
+                description: Some(
+                    "Semantic similarity search using embeddings. Returns ranked results with scores."
+                        .to_string(),
+                ),
                 input_schema: search_schema.clone(),
-                output_schema: None,
+                output_schema: Some(search_results_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.search.semantic" })),
             },
             ToolDescriptor {
                 name: "search_hybrid".to_string(),
                 title: Some("Search: Hybrid".to_string()),
-                description: Some("Combine semantic and keyword search results.".to_string()),
+                description: Some(
+                    "Combine semantic and keyword search results for balanced relevance.".to_string(),
+                ),
                 input_schema: search_schema,
-                output_schema: None,
+                output_schema: Some(search_results_payload_schema),
                 annotations: Some(json!({ "method": "mcp.search.hybrid" })),
             },
             ToolDescriptor {
                 name: "vault_status".to_string(),
                 title: Some("Vault: Status".to_string()),
-                description: Some("Summarise daemon activity and queue status.".to_string()),
+                description: Some(
+                    "Summarise daemon activity, indexed counts, and queue status.".to_string(),
+                ),
                 input_schema: empty_schema(),
-                output_schema: None,
+                output_schema: Some(daemon_status_schema),
                 annotations: Some(json!({ "method": "mcp.vault.status" })),
             },
             ToolDescriptor {
                 name: "notes_read".to_string(),
                 title: Some("Notes: Read".to_string()),
-                description: Some("Read a note's metadata and content.".to_string()),
+                description: Some(
+                    "Read a note's metadata and full Markdown content (including frontmatter)."
+                        .to_string(),
+                ),
                 input_schema: note_id_schema.clone(),
-                output_schema: None,
+                output_schema: Some(note_content_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.notes.read" })),
             },
             ToolDescriptor {
                 name: "notes_list".to_string(),
                 title: Some("Notes: List".to_string()),
-                description: Some("List notes from the vault.".to_string()),
+                description: Some(
+                    "List notes from the vault, optionally limiting results or returning IDs only."
+                        .to_string(),
+                ),
                 input_schema: notes_list_schema,
-                output_schema: None,
+                output_schema: Some(json!({
+                    "type": "object",
+                    "description": "Collection of note summaries.",
+                    "required": ["notes"],
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "items": note_list_item_schema.clone()
+                        }
+                    },
+                    "additionalProperties": false
+                })),
                 annotations: Some(json!({ "method": "mcp.notes.list" })),
             },
             ToolDescriptor {
                 name: "notes_metadata".to_string(),
                 title: Some("Notes: Metadata".to_string()),
-                description: Some("Fetch metadata for a specific note.".to_string()),
+                description: Some(
+                    "Fetch metadata for a specific note without loading the Markdown body."
+                        .to_string(),
+                ),
                 input_schema: note_id_schema.clone(),
-                output_schema: None,
+                output_schema: Some(note_metadata_payload_schema),
                 annotations: Some(json!({ "method": "mcp.notes.metadata" })),
             },
             ToolDescriptor {
                 name: "notes_create".to_string(),
                 title: Some("Notes: Create".to_string()),
-                description: Some("Create a new note.".to_string()),
+                description: Some(
+                    "Create a new note; the request fails if the noteId already exists.".to_string(),
+                ),
                 input_schema: note_create_schema,
-                output_schema: None,
+                output_schema: Some(note_content_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.notes.create" })),
             },
             ToolDescriptor {
                 name: "notes_update".to_string(),
                 title: Some("Notes: Update".to_string()),
-                description: Some("Update an existing note.".to_string()),
+                description: Some(
+                    "Update an existing note. Supply only the fields that should change."
+                        .to_string(),
+                ),
                 input_schema: note_update_schema,
-                output_schema: None,
+                output_schema: Some(note_content_payload_schema),
                 annotations: Some(json!({ "method": "mcp.notes.update" })),
             },
             ToolDescriptor {
                 name: "notes_delete".to_string(),
                 title: Some("Notes: Delete".to_string()),
-                description: Some("Delete a note (requires confirm = true).".to_string()),
+                description: Some(
+                    "Delete a note. To proceed, set confirm=true; the response reports pruned paths."
+                        .to_string(),
+                ),
                 input_schema: note_delete_schema,
-                output_schema: None,
+                output_schema: Some(note_delete_payload_schema),
                 annotations: Some(json!({ "method": "mcp.notes.delete" })),
             },
             ToolDescriptor {
                 name: "discovery_get_related_notes".to_string(),
                 title: Some("Discovery: Related Notes".to_string()),
-                description: Some("Return notes related to a query or anchor note.".to_string()),
+                description: Some(
+                    "Return notes related to either an anchor note or a natural-language query."
+                        .to_string(),
+                ),
                 input_schema: related_notes_schema,
-                output_schema: None,
+                output_schema: Some(related_notes_payload_schema),
                 annotations: Some(json!({ "method": "mcp.discovery.get_related_notes" })),
             },
             ToolDescriptor {
@@ -865,7 +1530,7 @@ impl HandlerRegistry {
                 title: Some("Discovery: Vault Stats".to_string()),
                 description: Some("Summarise vault statistics.".to_string()),
                 input_schema: empty_schema(),
-                output_schema: None,
+                output_schema: Some(vault_stats_payload_schema),
                 annotations: Some(json!({ "method": "mcp.discovery.get_vault_stats" })),
             },
             ToolDescriptor {
@@ -875,7 +1540,7 @@ impl HandlerRegistry {
                     "Summarise naming patterns, metadata usage, and conventions.".to_string(),
                 ),
                 input_schema: empty_schema(),
-                output_schema: None,
+                output_schema: Some(vault_conventions_payload_schema),
                 annotations: Some(json!({ "method": "mcp.discovery.get_vault_conventions" })),
             },
         ];
