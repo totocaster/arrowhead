@@ -524,19 +524,23 @@ impl HandlerRegistry {
             capabilities: _client_capabilities,
             client_info,
         } = request.params.deserialize()?;
-        let mut tool_capabilities = ToolCapabilityPayload::default();
-        tool_capabilities.list_changed = Some(false);
+        let tool_capabilities = ToolCapabilityPayload {
+            list_changed: Some(false),
+        };
 
-        let mut capabilities = ServerCapabilitiesPayload::default();
-        capabilities.tools = Some(tool_capabilities);
-        if self.runtime.semantic_search_enabled() {
-            let experimental = json!({
+        let experimental = self.runtime.semantic_search_enabled().then(|| {
+            json!({
                 "arrowhead": {
                     "semanticSearch": true
                 }
-            });
-            capabilities.experimental = Some(experimental);
-        }
+            })
+        });
+
+        let capabilities = ServerCapabilitiesPayload {
+            tools: Some(tool_capabilities),
+            experimental,
+            ..ServerCapabilitiesPayload::default()
+        };
 
         let negotiated_version = if requested_version == SUPPORTED_PROTOCOL_VERSION {
             requested_version
