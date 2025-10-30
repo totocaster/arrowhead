@@ -6,7 +6,7 @@
 - Prioritise maintainability, clear error handling, and strong test coverage using the provided fixture vault.
 
 ## Ground Rules
-1. **Toolchain:** Build against Rust 1.85 (2024 edition). Update `rust-toolchain.toml` if a later MSRV is required; call it out in reviews.
+1. **Toolchain:** Build against Rust 1.86 (2024 edition). Update `rust-toolchain.toml` if a later MSRV is required; call it out in reviews.
 2. **Features:** Semantic search ships by default using sqlite-vec; keep embeddings healthy and avoid regressing the always-on pipeline.
 3. **Style:** Follow idiomatic Rust (clippy clean, `cargo fmt`). Prefer explicit structs/enums over loose maps; document non-obvious flows with concise comments.
 4. **Error Handling:** Use `anyhow`/`thiserror` as scoped in the spec. Return actionable errors instead of panicking.
