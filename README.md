@@ -133,6 +133,13 @@ arrowhead/
 └── tests/                  # Integration harness and fixture vaults
 ```
 
+### Library Surface
+
+- `arrowhead-core` exposes vault discovery, indexing, embeddings, search, and graph primitives (`Vault`, `Indexer`, `SearchService`, `GraphService`, etc.).
+- `arrowhead-mcp` implements the stdio and HTTP transports plus shared tool handlers.
+- `arrowhead-cli` wraps the runtime with `clap` commands under `crates/arrowhead-cli/src/commands/`.
+- All public crates use `anyhow::Result<T>` for fallible operations and share data types via `arrowhead_core::types`.
+
 ## Technology Stack
 
 - **Language**: Rust 1.86 (2024 edition) with `anyhow`/`thiserror` for rich errors.
@@ -216,6 +223,34 @@ arrowhead --mcp-server --generate-token
 ```
 
 Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available. Graph listings pick up the same pipe-friendly `--format ids` option for backlinks, forward-links, orphans, and unresolved link reports.
+
+## CLI Reference
+
+- `arrowhead init` — bootstrap a vault, seed configuration, and enable auto-start when requested.
+- `arrowhead vault <subcommand>` — manage daemon lifecycle (`start`, `status`, `stop`, `cleanup`, `autostart` helpers).
+- `arrowhead search` — execute FTS, semantic, or hybrid searches with pipe-friendly output formats.
+- `arrowhead notes` — perform note CRUD operations and metadata inspection.
+- `arrowhead graph` — inspect backlinks, forward links, orphans, unresolved links, or combined context views (`--json` emits machine-readable payloads).
+- `arrowhead --mcp[(-server)]` — launch the stdio or HTTP MCP transport with shared handlers, token auth, CIDR filtering, and `/health` readiness probes.
+
+### MCP transport options
+
+- `--bind <ADDR>` overrides the default bind address (`127.0.0.1:3911`); `ARROWHEAD_MCP_BIND` mirrors the flag.
+- `--auth-mode <bearer|link-token>` switches between header-based and path-embedded tokens.
+- `--token`, `--token-file`, `--token-hash` supply raw or hashed credentials; `ARROWHEAD_MCP_TOKEN` adds a raw token from the environment.
+- `--allow` / `--allow-file` append CIDR ranges to the default localhost allowlist.
+- `--generate-token` mints a random token, persists its digest, prints usage snippets, then exits.
+
+## MCP Tool Surface
+
+- Graph: `mcp.graph.get_context`, `mcp.graph.get_backlinks`, `mcp.graph.get_forward_links`, `mcp.graph.find_orphans`, `mcp.graph.find_unresolved`
+- Search: `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid`
+- Notes: `mcp.notes.list`, `mcp.notes.read`, `mcp.notes.metadata`, `mcp.notes.create`, `mcp.notes.update`, `mcp.notes.delete`
+- Discovery: `mcp.discovery.get_related_notes`, `mcp.discovery.get_vault_stats`, `mcp.discovery.get_vault_conventions`
+- Vault: `mcp.vault.status`
+- Protocol: `mcp.protocol.initialize`, `mcp.protocol.tools/list`
+
+Semantic and hybrid tools require embeddings; discovery fallbacks lean on graph heuristics when embeddings are disabled.
 
 ## Roadmap
 

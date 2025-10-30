@@ -122,7 +122,7 @@
 5. **Documentation & Rollout**
    - Update `docs/predev_synapse_rust_rewrite.md` with the deamon architecture,
      auto-start strategy, control interface, and CLI behavioural changes.
-   - Amend `docs/api.md` and CLI help text to describe the new `vault` subcommands and
+   - Amend `README.md#cli-reference` and CLI help text to describe the new `vault` subcommands and
      the expectation that the deamon owns indexing duties (FTS + vectors).
    - Refresh `docs/dev_status.md` after implementation to capture the milestone and
      note outstanding follow-ups (e.g., Windows support, additional auto-start targets).

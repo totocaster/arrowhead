@@ -62,6 +62,6 @@
 ## Tracking
 
 - Specification: `docs/predev_synapse_rust_rewrite.md`
-- API notes: `docs/api.md`
+- API notes: `README.md#cli-reference`
 - MCP notes: `docs/mcp_protocol.md`
 - Integration test harness: `tests/integration/`

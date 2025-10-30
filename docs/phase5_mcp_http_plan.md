@@ -145,7 +145,7 @@ record the raw value when it is generated.
    offline.
 2. Expand unit tests in `auth.rs` and `http.rs` to cover edge cases (batch
    requests, malformed JSON, token rotation, rate limiting).
-3. Refresh documentation: CLI help text, `docs/api.md`, `docs/mcp_protocol.md`,
+3. Refresh documentation: CLI help text, `README.md#cli-reference`, `docs/mcp_protocol.md`,
    `docs/dev_status.md`, and add examples for reverse proxy deployment.
 4. Wire new tests into CI and ensure `cargo fmt`, `cargo clippy`, and
    workspace checks remain clean.
@@ -185,7 +185,7 @@ record the raw value when it is generated.
   latency/backpressure metrics.
 
 ## Documentation & Developer Experience
-- Update CLI reference (`docs/api.md`) with new flags, environment variables,
+- Update CLI reference (`README.md#cli-reference`) with new flags, environment variables,
   and usage examples (curl + Claude Desktop over HTTP).
 - Expand `docs/mcp_protocol.md` transport section to include HTTP wire format,
   auth headers, error examples, and operational notes.

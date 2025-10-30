@@ -18,7 +18,7 @@ This document specifies a complete rewrite of Synapse from Swift to Rust as **Ar
 - Workspace standardised on Rust 1.86 / edition 2024 (pinned via `rust-toolchain.toml`).
 - Core, CLI, and MCP crates now implement the background deamon workflow end-to-end, returning actionable errors instead of panicking.
 - CLI commands (`init`, `search`, `notes`, `graph`, `vault`) delegate indexing to `arrowheadd`, manage auto-start manifests, and persist config updates.
-- Documentation refreshed (`docs/api.md`, `docs/mcp_protocol.md`) and tests directory bootstrapped (`tests/integration/`).
+- Documentation refreshed (`README.md#cli-reference`, `docs/mcp_protocol.md`) and tests directory bootstrapped (`tests/integration/`).
 - Vector storage integration relies on sqlite-vec embedded in the SQLite index so semantic search is always available once embeddings are generated.
 
 ### Key Changes from Original
