@@ -56,17 +56,9 @@ jobs:
         run: cargo test --all-targets -- --nocapture
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Build macOS binaries
     needs: verify
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-12
-            target: x86_64-apple-darwin
-          - os: macos-14
-            target: aarch64-apple-darwin
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -78,6 +70,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
           override: true
+
+      - name: Add compilation targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -93,12 +88,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
+          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-macos
           restore-keys: |
-            ${{ runner.os }}-target-${{ matrix.target }}
+            ${{ runner.os }}-target-
 
-      - name: Build release binary
-        run: cargo build --release --package arrowhead-cli --bin ${{ env.BIN_NAME }}
+      - name: Build release binaries
+        run: |
+          set -euo pipefail
+          cargo build --release --package arrowhead-cli --bin ${{ env.BIN_NAME }} --target aarch64-apple-darwin
+          cargo build --release --package arrowhead-cli --bin ${{ env.BIN_NAME }} --target x86_64-apple-darwin
 
       - name: Prepare dist artifacts
         id: package
@@ -111,31 +109,35 @@ jobs:
             exit 1
           fi
 
-          ARCHIVE_NAME="${BIN_NAME}-${VERSION}-${{ matrix.target }}"
-          DIST_ROOT="dist/${ARCHIVE_NAME}"
-          mkdir -p "${DIST_ROOT}/bin"
+          mkdir -p dist
 
-          cp "target/release/${BIN_NAME}" "${DIST_ROOT}/bin/"
-          chmod 755 "${DIST_ROOT}/bin/${BIN_NAME}"
-          cp README.md "${DIST_ROOT}/"
-          if compgen -G "LICENSE*" >/dev/null; then
-            cp LICENSE* "${DIST_ROOT}/"
-          fi
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            ARCHIVE_NAME="${BIN_NAME}-${VERSION}-${target}"
+            DIST_ROOT="dist/${ARCHIVE_NAME}"
+            mkdir -p "${DIST_ROOT}/bin"
 
-          tar -czf "dist/${ARCHIVE_NAME}.tar.gz" -C dist "${ARCHIVE_NAME}"
-          shasum -a 256 "dist/${ARCHIVE_NAME}.tar.gz" | awk '{print $1}' > "dist/${ARCHIVE_NAME}.sha256"
+            cp "target/${target}/release/${BIN_NAME}" "${DIST_ROOT}/bin/"
+            chmod 755 "${DIST_ROOT}/bin/${BIN_NAME}"
+            cp README.md "${DIST_ROOT}/"
+            if compgen -G "LICENSE*" >/dev/null; then
+              cp LICENSE* "${DIST_ROOT}/"
+            fi
 
-          rm -rf "${DIST_ROOT}"
+            tar -czf "dist/${ARCHIVE_NAME}.tar.gz" -C dist "${ARCHIVE_NAME}"
+            shasum -a 256 "dist/${ARCHIVE_NAME}.tar.gz" | awk '{print $1}' > "dist/${ARCHIVE_NAME}.sha256"
 
-          echo "archive_name=${ARCHIVE_NAME}" >> "${GITHUB_OUTPUT}"
+            rm -rf "${DIST_ROOT}"
+          done
+
+          echo "archive_prefix=${BIN_NAME}-${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.archive_name }}
+          name: ${{ steps.package.outputs.archive_prefix }}
           path: |
-            dist/${{ steps.package.outputs.archive_name }}.tar.gz
-            dist/${{ steps.package.outputs.archive_name }}.sha256
+            dist/*.tar.gz
+            dist/*.sha256
           if-no-files-found: error
 
   release:
