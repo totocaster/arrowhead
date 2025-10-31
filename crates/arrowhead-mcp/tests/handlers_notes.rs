@@ -335,6 +335,44 @@ async fn discovery_vault_conventions_returns_patterns() {
 
     assert!(structured.get("namingPatterns").is_some());
     assert!(structured.get("metadataFields").is_some());
+    let style = structured
+        .get("styleGuide")
+        .and_then(Value::as_object)
+        .expect("style guide present");
+    let relative_path = style
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .expect("style guide relative path");
+    assert!(
+        relative_path.ends_with("ARROWHEAD.md"),
+        "expected Arrowhead guide path, got {relative_path}"
+    );
+    let content = style
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("style guide content");
+    assert!(
+        content.contains("Arrowhead Guide"),
+        "expected Arrowhead guide content"
+    );
+
+    let agents = structured
+        .get("agentsPlaybook")
+        .and_then(Value::as_object)
+        .expect("agents playbook present");
+    let agents_path = agents
+        .get("relativePath")
+        .and_then(Value::as_str)
+        .expect("agents playbook path");
+    assert_eq!(agents_path, "AGENTS.md");
+    let agents_content = agents
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("agents playbook content");
+    assert!(
+        agents_content.contains("Arrowhead Coding Agent Playbook"),
+        "expected agents playbook content"
+    );
 }
 
 #[tokio::test]

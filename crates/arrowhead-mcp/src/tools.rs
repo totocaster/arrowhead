@@ -508,13 +508,23 @@ pub struct MetadataFieldStats {
     pub common_values: Vec<MetadataCommonValue>,
 }
 
-/// User-provided style guide surfaced via MCP.
+/// User-provided Arrowhead guide surfaced via MCP.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StyleGuidePayload {
     /// Vault-relative path to the style guide document.
     pub relative_path: PathBuf,
     /// Raw Markdown content of the style guide.
+    pub content: String,
+}
+
+/// Agent playbook bundled with Arrowhead distributions.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentsPlaybookPayload {
+    /// Repository-relative path to the agent playbook document.
+    pub relative_path: PathBuf,
+    /// Raw Markdown content of the playbook.
     pub content: String,
 }
 
@@ -550,6 +560,9 @@ pub struct VaultConventionsPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional user-authored style guide surfaced to agents.
     pub style_guide: Option<StyleGuidePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Arrowhead agent operating manual bundled with the CLI.
+    pub agents_playbook: Option<AgentsPlaybookPayload>,
 }
 
 /// Parameters supplied to the MCP `initialize` handshake.

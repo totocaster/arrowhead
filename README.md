@@ -252,7 +252,7 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 - Vault: `mcp.vault.status`
 - Protocol: `mcp.protocol.initialize`, `mcp.protocol.tools/list`
 
-Semantic and hybrid tools require embeddings; discovery fallbacks lean on graph heuristics when embeddings are disabled.
+Semantic and hybrid tools require embeddings; discovery fallbacks lean on graph heuristics when embeddings are disabled. Place vault-level guidance in `ARROWHEAD.md` at the root—the conventions tool returns its contents alongside the bundled `AGENTS.md` playbook so Claude/Codex agents inherit both global instructions and vault-specific preferences.
 
 ## MCP Protocol Details
 

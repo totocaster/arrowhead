@@ -26,13 +26,16 @@ use tokio::{sync::RwLock, task};
 use tracing::warn;
 
 use crate::tools::{
-    MetadataCommonValue, MetadataFieldStats, MetadataValueKind, NamingPatternSummary, NoteListItem,
-    ObsidianSettingsPayload, RelatedNotePayload, RelatedNotesPayload, RelatedNotesStrategy,
-    StyleGuidePayload, VaultConventionsPayload, VaultStatsPayload,
+    AgentsPlaybookPayload, MetadataCommonValue, MetadataFieldStats, MetadataValueKind,
+    NamingPatternSummary, NoteListItem, ObsidianSettingsPayload, RelatedNotePayload,
+    RelatedNotesPayload, RelatedNotesStrategy, StyleGuidePayload, VaultConventionsPayload,
+    VaultStatsPayload,
 };
 
 use arrowhead_core::SearchResult;
 use arrowhead_core::embeddings::EmbeddingPipeline;
+
+const AGENTS_PLAYBOOK_CONTENT: &str = include_str!("../../../AGENTS.md");
 
 /// Configuration options used to bootstrap the MCP runtime.
 #[derive(Debug, Clone)]
@@ -337,12 +340,12 @@ impl McpRuntime {
         })
     }
 
-    /// Load the optional style guide stored under `.arrowhead/STYLE_GUIDE.md`.
+    /// Load the optional Arrowhead guide stored at `ARROWHEAD.md`.
     pub async fn load_style_guide(&self) -> Result<Option<StyleGuidePayload>> {
         let vault = Arc::clone(&self.vault);
         task::spawn_blocking(move || -> Result<Option<StyleGuidePayload>> {
             let paths: VaultPaths = vault.paths().clone();
-            let style_path = paths.arrowhead_dir.join("STYLE_GUIDE.md");
+            let style_path = paths.root.join("ARROWHEAD.md");
             if !style_path.exists() {
                 return Ok(None);
             }
@@ -381,6 +384,7 @@ impl McpRuntime {
             metadata_fields,
             obsidian,
             style_guide,
+            agents_playbook: Some(load_agents_playbook()),
         })
     }
 
@@ -799,6 +803,13 @@ fn aggregate_metadata_fields(
             .then_with(|| a.field.cmp(&b.field))
     });
     summaries
+}
+
+fn load_agents_playbook() -> AgentsPlaybookPayload {
+    AgentsPlaybookPayload {
+        relative_path: PathBuf::from("AGENTS.md"),
+        content: AGENTS_PLAYBOOK_CONTENT.to_string(),
+    }
 }
 
 fn classify_value_kind(value: &Value) -> MetadataValueKind {
