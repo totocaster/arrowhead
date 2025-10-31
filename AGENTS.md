@@ -10,8 +10,8 @@
 2. **Features:** Semantic search ships by default using sqlite-vec; keep embeddings healthy and avoid regressing the always-on pipeline.
 3. **Style:** Follow idiomatic Rust (clippy clean, `cargo fmt`). Prefer explicit structs/enums over loose maps; document non-obvious flows with concise comments.
 4. **Error Handling:** Use `anyhow`/`thiserror` as scoped in the spec. Return actionable errors instead of panicking.
-5. **Testing:** Add unit tests alongside code (`#[cfg(test)]`) and integration tests under `tests/integration/`. Use `tests/fixtures/test-vault` as read-only input; write indexes to temp dirs.
-6. **Docs:** Update specs/design docs when behaviour or architecture shifts. Keep `docs/roadmap.md` fresh after major milestones.
+5. **Testing:** Add unit tests alongside code (`#[cfg(test)]`). Integration tests under `tests/integration/` will land later; plan your APIs so those paths stay testable. Use `tests/fixtures/test-vault` as read-only input; write indexes to temp dirs.
+6. **Docs:** Update specs/design docs when behaviour or architecture shifts so the expectations stay current.
 
 ## Workflow Expectations
 - Start complex tasks with a brief plan (2–5 steps max) and keep it up to date.
@@ -37,7 +37,6 @@
 ## Quick Reference
 - Spec: `README.md`
 - Feature guide: `docs/feature_development_guide.md`
-- Roadmap: `docs/roadmap.md`
 - API overview: `README.md#cli-reference`
 - MCP notes: `README.md#mcp-protocol-details`
 - CLI commands: `crates/arrowhead-cli/src/commands/`

@@ -16,5 +16,5 @@ pub mod tools;
 pub mod transport;
 
 // Re-export commonly used types
-// pub use protocol::*;  // TODO: Uncomment when protocol types are implemented
+pub use protocol::*;
 pub use runtime::{DaemonClient, McpRuntime, RuntimeOptions};

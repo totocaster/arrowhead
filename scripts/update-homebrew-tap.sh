@@ -22,7 +22,7 @@ class Arrowhead < Formula
   desc "Fast Obsidian search and discovery CLI"
   homepage "https://github.com/totocaster/arrowhead"
   version "${VERSION}"
-  license any_of: ["Apache-2.0", "MIT"]
+  license "MIT"
 
   on_macos do
     on_arm do

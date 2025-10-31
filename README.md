@@ -322,16 +322,11 @@ Keep the Arrowhead allowlist scoped to loopback so all external traffic is funne
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Distributed under the MIT License. See [`LICENSE`](LICENSE) for details.
 
 ## Contributing
 
-We welcome issues and pull requests once the Phase 1 foundation is fully stabilized. Start by reading this README, the [feature development guide](docs/feature_development_guide.md), and the living [roadmap](docs/roadmap.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
+We welcome issues and pull requests once the Phase 1 foundation is fully stabilized. Start by reading this README and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
 
 ## Acknowledgments
 
