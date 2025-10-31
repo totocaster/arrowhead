@@ -362,7 +362,7 @@ fn requires_quotes(value: &str) -> bool {
 
     trimmed
         .chars()
-        .any(|ch| matches!(ch, '[' | ']' | '(' | ')' | '"' | '*'))
+        .any(|ch| matches!(ch, '[' | ']' | '(' | ')' | '"' | '*' | '.'))
         || trimmed.starts_with('-')
         || trimmed.contains(" AND ")
         || trimmed.contains(" OR ")
@@ -912,6 +912,15 @@ mod tests {
         assert_eq!(
             parsed.fts.unwrap(),
             "{content metadata} : alpha AND {content metadata} : beta OR {content metadata} : gamma"
+        );
+    }
+
+    #[test]
+    fn dots_are_quoted_for_fts() {
+        let parsed = parse("plaintextcommons.org");
+        assert_eq!(
+            parsed.fts.unwrap(),
+            "{content metadata} : \"plaintextcommons.org\""
         );
     }
 
