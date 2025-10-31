@@ -8,7 +8,7 @@ use clap::Args;
 use arrowhead_core::{Vault, VaultConfig, embeddings::EmbeddingPreset};
 use tracing::info;
 
-use crate::commands::vault::{VaultAction, VaultCommand, VaultInitArgs};
+use crate::commands::index::{self, InitOptions};
 
 use super::CommandContext;
 
@@ -76,15 +76,15 @@ pub async fn run(ctx: &mut CommandContext, command: &InitCommand) -> Result<()> 
         info!(model = model.as_str(), "set default embedding model");
     }
 
-    let init_command = VaultCommand {
-        action: VaultAction::Init(VaultInitArgs {
+    index::initialise_vault(
+        ctx,
+        InitOptions {
             force: command.force,
             no_start: command.no_start,
             fts_only: command.fts_only,
-        }),
-    };
-
-    super::vault::run(ctx, &init_command).await?;
+        },
+    )
+    .await?;
 
     info!("initialisation complete");
 

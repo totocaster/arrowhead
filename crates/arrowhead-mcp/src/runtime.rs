@@ -951,7 +951,7 @@ impl DaemonClient {
             }
             Ok(ControlResponse::ShutdownAck) => {
                 bail!(
-                    "arrowhead deamon acknowledged shutdown; restart it with `arrowhead vault start`."
+                    "arrowhead deamon acknowledged shutdown; restart it with `arrowhead index start`."
                 );
             }
             Err(err) => {
@@ -976,7 +976,7 @@ impl DaemonClient {
                     Ok(status)
                 } else {
                     Err(anyhow!(
-                        "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead vault start` and retry.",
+                        "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead index start` and retry.",
                         self.socket_path.display(),
                         err
                     ))

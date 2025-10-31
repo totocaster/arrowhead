@@ -13,7 +13,7 @@ mod config;
 mod logging;
 
 use commands::mcp::McpServerCliArgs;
-use commands::{CommandContext, graph, init, mcp, notes, search, status, vault};
+use commands::{CommandContext, graph, index, init, mcp, notes, search, vault};
 use config::AppConfig;
 
 /// Arrowhead command-line interface options.
@@ -55,8 +55,8 @@ enum Commands {
     Notes(notes::NotesCommand),
     /// Inspect the WikiLink graph.
     Graph(graph::GraphCommand),
-    /// Stream live daemon status updates.
-    Status(status::StatusCommand),
+    /// Manage the background indexer lifecycle.
+    Index(index::IndexCommand),
     /// Vault utility commands.
     Vault(vault::VaultCommand),
 }
@@ -111,8 +111,8 @@ async fn main() -> Result<()> {
         Commands::Graph(command) => {
             graph::run(&ctx, &command).await?;
         }
-        Commands::Status(command) => {
-            status::run(&ctx, &command).await?;
+        Commands::Index(command) => {
+            index::run(&mut ctx, &command).await?;
         }
         Commands::Vault(command) => {
             vault::run(&mut ctx, &command).await?;

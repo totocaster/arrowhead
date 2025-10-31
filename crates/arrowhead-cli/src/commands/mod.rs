@@ -7,11 +7,11 @@ use anyhow::Result;
 use crate::config::AppConfig;
 
 pub mod graph;
+pub mod index;
 pub mod init;
 pub mod mcp;
 pub mod notes;
 pub mod search;
-pub mod status;
 pub mod vault;
 
 /// Shared context passed to command implementations.

@@ -118,7 +118,7 @@ fn ensure_note_indexed(database: &IndexDatabase, note_id: &str) -> Result<()> {
     if database.note_state(note_id)?.is_some() {
         Ok(())
     } else {
-        bail!("note {note_id} is not indexed. Run `arrowhead vault start` to refresh the index.");
+        bail!("note {note_id} is not indexed. Run `arrowhead index start` to refresh the index.");
     }
 }
 

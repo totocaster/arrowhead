@@ -166,7 +166,7 @@ async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<Deam
             bail!("arrowhead deamon reported an error: {message}")
         }
         Ok(ControlResponse::ShutdownAck) => {
-            bail!("arrowhead deamon acknowledged shutdown; restart it with `arrowhead vault start`")
+            bail!("arrowhead deamon acknowledged shutdown; restart it with `arrowhead index start`")
         }
         Err(err) => {
             let default_status = vault.paths().arrowhead_dir.join("deamon/status.json");
@@ -178,12 +178,12 @@ async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<Deam
                 .unwrap_or(default_status);
             if let Some(status) = DeamonStatus::load_from_path(&status_path)? {
                 Err(anyhow!(
-                    "arrowhead deamon appears offline (last update {}). Start it with `arrowhead vault start` and retry.",
+                    "arrowhead deamon appears offline (last update {}). Start it with `arrowhead index start` and retry.",
                     status.updated_at.to_rfc3339()
                 ))
             } else {
                 Err(anyhow!(
-                    "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead vault start` and retry.",
+                    "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead index start` and retry.",
                     socket_path.display(),
                     err
                 ))

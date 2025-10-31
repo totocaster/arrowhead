@@ -1575,7 +1575,7 @@ impl HandlerRegistry {
             Ok(())
         } else {
             Err(ProtocolError::invalid_params(format!(
-                "note {note_id} is not indexed. Run `arrowhead vault start` to refresh the index."
+                "note {note_id} is not indexed. Run `arrowhead index start` to refresh the index."
             )))
         }
     }

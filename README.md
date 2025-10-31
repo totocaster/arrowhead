@@ -69,7 +69,7 @@ brew install arrowhead
 arrowhead init
 ```
 
-This command launches and registers the daemon, which watches your files and keeps the index ready to use. Initial indexing might take some time depending on your vault size; run `arrowhead vault status` to monitor progress.
+This command launches and registers the indexer, which watches your files and keeps the index ready to use. Initial indexing might take some time depending on your vault size; run `arrowhead index status` to monitor progress.
 
 #### 3. Start using Arrowhead.
 
@@ -115,7 +115,7 @@ If you only need full-text indexing or want a lighter runtime, disable embedding
 arrowhead init --fts-only
 
 # Or launch manually with embeddings disabled
-ARROWHEAD_EMBEDDING_MODEL=none arrowhead vault start
+ARROWHEAD_EMBEDDING_MODEL=none arrowhead index start
 ```
 
 This keeps FTS indexing and search working while skipping the model downloads and heap allocations that normally dominate the daemon's memory footprint.
@@ -175,14 +175,14 @@ cargo test
 arrowhead init --vault /path/to/vault [--embeddings fast|good|better|none] [--fts-only]
 # (Subsequent commands reuse the stored vault path.)
 
-# Launch or check the background daemon
-arrowhead vault start
-arrowhead vault status
+# Launch or check the background indexer
+arrowhead index start
+arrowhead index status
 
 # Manage auto-start registration (per-user launchd/systemd)
-arrowhead vault autostart enable
-arrowhead vault autostart status
-arrowhead vault autostart disable
+arrowhead index autostart enable
+arrowhead index autostart status
+arrowhead index autostart disable
 
 # Search (FTS, semantic, or hybrid)
 arrowhead search fts "project roadmap"
@@ -207,9 +207,9 @@ arrowhead graph context "Project Hub"
 tail -f /path/to/vault/.arrowhead/logs/cli.log
 tail -f /path/to/vault/.arrowhead/logs/daemon.log
 
-# Stop the daemon or clean up Arrowhead artifacts
-arrowhead vault stop
-arrowhead vault cleanup
+# Stop the indexer or clean up Arrowhead artifacts
+arrowhead index stop
+arrowhead vault reset
 
 # Run the MCP stdio server for Claude or other clients
 arrowhead --mcp
@@ -228,8 +228,9 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 
 ## CLI Reference
 
-- `arrowhead init` — bootstrap a vault, seed configuration, and enable auto-start when requested.
-- `arrowhead vault <subcommand>` — manage daemon lifecycle (`start`, `status`, `stop`, `cleanup`, `autostart` helpers).
+- `arrowhead init` — bootstrap a vault, seed configuration, and offer auto-start registration when requested.
+- `arrowhead index <subcommand>` — manage the background indexer (`start`, `stop`, `restart`, `status`, `autostart`).
+- `arrowhead vault <subcommand>` — inspect filesystem state or reset Arrowhead caches (`status`, `reset`).
 - `arrowhead search` — execute FTS, semantic, or hybrid searches with pipe-friendly output formats.
 - `arrowhead notes` — perform note CRUD operations and metadata inspection.
 - `arrowhead graph` — inspect backlinks, forward links, orphans, unresolved links, or combined context views (`--json` emits machine-readable payloads).
