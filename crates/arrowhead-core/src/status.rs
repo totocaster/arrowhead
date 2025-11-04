@@ -1,4 +1,4 @@
-//! Shared status structures for the Arrowhead deamon.
+//! Shared status structures for the Arrowhead daemon.
 
 use std::{
     fs,
@@ -11,21 +11,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Version number stored in status files for forward compatibility.
-pub const DEAMON_STATUS_VERSION: u32 = 1;
+pub const DAEMON_STATUS_VERSION: u32 = 1;
 
-/// Live status frame emitted whenever the deamon state changes.
+/// Live status frame emitted whenever the daemon state changes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatusFrame {
     /// Timestamp capturing when the frame was emitted.
     pub emitted_at: DateTime<Utc>,
     /// Complete status snapshot associated with the frame.
-    pub status: DeamonStatus,
+    pub status: DaemonStatus,
 }
 
 impl StatusFrame {
     /// Construct a new frame from the supplied status snapshot.
     #[must_use]
-    pub fn new(status: DeamonStatus) -> Self {
+    pub fn new(status: DaemonStatus) -> Self {
         Self {
             emitted_at: Utc::now(),
             status,
@@ -33,9 +33,9 @@ impl StatusFrame {
     }
 }
 
-/// Persisted snapshot of the deamon's health and recent activity.
+/// Persisted snapshot of the daemon's health and recent activity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeamonStatus {
+pub struct DaemonStatus {
     /// Schema version recorded in the status file.
     #[serde(default = "status_version")]
     pub version: u32,
@@ -45,7 +45,7 @@ pub struct DeamonStatus {
     pub indexed_notes: u64,
     /// Number of notes that encountered errors during the latest runs.
     pub error_notes: u64,
-    /// Current activity being performed by the deamon.
+    /// Current activity being performed by the daemon.
     pub activity: ActivityStatus,
     /// Progress of any long-running downloads (e.g., embedding models).
     #[serde(default)]
@@ -53,15 +53,15 @@ pub struct DeamonStatus {
     /// Outstanding issues that require user attention.
     #[serde(default)]
     pub issues: Vec<StatusIssue>,
-    /// Filesystem path to the deamon log file for further inspection.
+    /// Filesystem path to the daemon log file for further inspection.
     pub log_path: PathBuf,
 }
 
-impl DeamonStatus {
+impl DaemonStatus {
     /// Construct a new status snapshot with default values and the supplied log path.
     pub fn new<P: Into<PathBuf>>(log_path: P) -> Self {
         Self {
-            version: DEAMON_STATUS_VERSION,
+            version: DAEMON_STATUS_VERSION,
             updated_at: Utc::now(),
             indexed_notes: 0,
             error_notes: 0,
@@ -82,7 +82,7 @@ impl DeamonStatus {
         }
 
         let payload =
-            serde_json::to_vec_pretty(self).context("failed to serialise deamon status")?;
+            serde_json::to_vec_pretty(self).context("failed to serialise daemon status")?;
 
         let mut tmp_path = path.to_path_buf();
         tmp_path.set_extension("tmp");
@@ -108,11 +108,11 @@ impl DeamonStatus {
 
         let bytes = fs::read(path)
             .with_context(|| format!("failed to read status file {}", path.display()))?;
-        let mut status: DeamonStatus = serde_json::from_slice(&bytes)
+        let mut status: DaemonStatus = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse status file {}", path.display()))?;
 
-        if status.version != DEAMON_STATUS_VERSION {
-            status.version = DEAMON_STATUS_VERSION;
+        if status.version != DAEMON_STATUS_VERSION {
+            status.version = DAEMON_STATUS_VERSION;
         }
 
         Ok(Some(status))
@@ -124,7 +124,7 @@ impl DeamonStatus {
     }
 }
 
-/// High-level description of what the deamon is doing right now.
+/// High-level description of what the daemon is doing right now.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActivityStatus {
     /// Overall activity state.
@@ -141,7 +141,7 @@ pub struct ActivityStatus {
 }
 
 impl ActivityStatus {
-    /// Construct an activity status representing an idle deamon.
+    /// Construct an activity status representing an idle daemon.
     pub fn idle() -> Self {
         Self {
             state: ActivityState::Idle,
@@ -162,7 +162,7 @@ impl ActivityStatus {
     }
 }
 
-/// Enumerates high-level activity states for the deamon.
+/// Enumerates high-level activity states for the daemon.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityState {
@@ -172,9 +172,9 @@ pub enum ActivityState {
     Indexing,
     /// Removal of stale records is in progress.
     Removing,
-    /// The deamon is downloading assets (e.g., embedding models).
+    /// The daemon is downloading assets (e.g., embedding models).
     Downloading,
-    /// The deamon encountered an unrecoverable error but remains running.
+    /// The daemon encountered an unrecoverable error but remains running.
     Faulted,
 }
 
@@ -223,7 +223,7 @@ pub enum DownloadState {
     Failed,
 }
 
-/// Captures issues surfaced by the deamon that require user visibility.
+/// Captures issues surfaced by the daemon that require user visibility.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusIssue {
     /// Machine-oriented identifier for the issue.
@@ -269,7 +269,7 @@ pub enum IssueSeverity {
 }
 
 fn status_version() -> u32 {
-    DEAMON_STATUS_VERSION
+    DAEMON_STATUS_VERSION
 }
 
 #[cfg(test)]
@@ -282,7 +282,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let status_path = dir.path().join("status.json");
 
-        let mut status = DeamonStatus::new("/tmp/daemon.log");
+        let mut status = DaemonStatus::new("/tmp/daemon.log");
         status.indexed_notes = 42;
         status.error_notes = 2;
         status.activity =
@@ -296,11 +296,11 @@ mod tests {
 
         status.save_to_path(&status_path).expect("save status");
 
-        let loaded = DeamonStatus::load_from_path(&status_path)
+        let loaded = DaemonStatus::load_from_path(&status_path)
             .expect("load status")
             .expect("status exists");
 
-        assert_eq!(loaded.version, DEAMON_STATUS_VERSION);
+        assert_eq!(loaded.version, DAEMON_STATUS_VERSION);
         assert_eq!(loaded.indexed_notes, 42);
         assert_eq!(loaded.error_notes, 2);
         assert_eq!(loaded.activity.state, ActivityState::Indexing);
@@ -312,7 +312,7 @@ mod tests {
     fn load_missing_status_returns_none() {
         let dir = TempDir::new().expect("tempdir");
         let status_path = dir.path().join("does-not-exist.json");
-        let loaded = DeamonStatus::load_from_path(&status_path).expect("load should succeed");
+        let loaded = DaemonStatus::load_from_path(&status_path).expect("load should succeed");
         assert!(loaded.is_none());
     }
 }

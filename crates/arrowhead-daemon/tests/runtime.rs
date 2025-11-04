@@ -9,10 +9,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrowhead_core::{
-    ActivityState, DeamonStatus, StatusFrame,
+    ActivityState, DaemonStatus, StatusFrame,
     sqlite::{IndexDatabase, NoteIndexState},
 };
-use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy, status_stream};
+use arrowhead_daemon::{DaemonRuntimeBuilder, WatcherStrategy, status_stream};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
@@ -28,7 +28,7 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
     let _log_guard = TEST_LOG_MUTEX.lock().await;
     let (temp_dir, vault_root) = prepare_vault()?;
 
-    let handle = DeamonRuntimeBuilder::new(&vault_root)
+    let handle = DaemonRuntimeBuilder::new(&vault_root)
         .disable_embeddings()
         .watcher_strategy(WatcherStrategy::Poll {
             interval: Duration::from_millis(50),
@@ -93,7 +93,7 @@ async fn control_socket_status_and_shutdown() -> Result<()> {
     let _log_guard = TEST_LOG_MUTEX.lock().await;
     let (temp_dir, vault_root) = prepare_vault()?;
 
-    let handle = DeamonRuntimeBuilder::new(&vault_root)
+    let handle = DaemonRuntimeBuilder::new(&vault_root)
         .disable_embeddings()
         .watcher_strategy(WatcherStrategy::Poll {
             interval: Duration::from_millis(50),
@@ -129,7 +129,7 @@ async fn status_stream_emits_frames() -> Result<()> {
     let _log_guard = TEST_LOG_MUTEX.lock().await;
     let (temp_dir, vault_root) = prepare_vault()?;
 
-    let handle = DeamonRuntimeBuilder::new(&vault_root)
+    let handle = DaemonRuntimeBuilder::new(&vault_root)
         .disable_embeddings()
         .watcher_strategy(WatcherStrategy::Poll {
             interval: Duration::from_millis(50),
@@ -204,7 +204,7 @@ async fn status_stream_emits_frames() -> Result<()> {
 }
 
 async fn expect_status_frame<F>(
-    stream: &mut arrowhead_deamon::StatusStream,
+    stream: &mut arrowhead_daemon::StatusStream,
     stage: &'static str,
     timeout: Duration,
     mut predicate: F,
@@ -306,11 +306,11 @@ async fn query_note_state(
         .context("failed to query note state")
 }
 
-fn load_status(path: &Path) -> Result<Option<DeamonStatus>> {
-    DeamonStatus::load_from_path(path)
+fn load_status(path: &Path) -> Result<Option<DaemonStatus>> {
+    DaemonStatus::load_from_path(path)
 }
 
-async fn wait_for_status_update(path: &Path, previous: DateTime<Utc>) -> Result<DeamonStatus> {
+async fn wait_for_status_update(path: &Path, previous: DateTime<Utc>) -> Result<DaemonStatus> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match load_status(path)? {

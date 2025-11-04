@@ -1,7 +1,7 @@
 //! Shared runtime state for the MCP server.
 //!
 //! Responsible for initialising vault handles, database connections, search
-//! services, and deamon health checks.
+//! services, and daemon health checks.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -16,9 +16,9 @@ use arrowhead_core::{
     GraphService, InventorySnapshot, MetadataMap, NoteRecord, SearchConfig, SearchService, Vault,
     VaultConfig, VaultPaths,
     sqlite::IndexDatabase,
-    status::{DeamonStatus, IssueSeverity, StatusIssue},
+    status::{DaemonStatus, IssueSeverity, StatusIssue},
 };
-use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
+use arrowhead_daemon::{ControlRequest, ControlResponse, send_control_request};
 use chrono::Utc;
 use regex::Regex;
 use serde_json::Value;
@@ -44,9 +44,9 @@ pub struct RuntimeOptions {
     pub vault_path: PathBuf,
     /// Identifier of the embedding model to initialise (if supported).
     pub embedding_model: Option<String>,
-    /// Optional override for the deamon control socket path.
+    /// Optional override for the daemon control socket path.
     pub daemon_socket: Option<PathBuf>,
-    /// Optional override for the deamon status file.
+    /// Optional override for the daemon status file.
     pub daemon_status: Option<PathBuf>,
 }
 
@@ -68,14 +68,14 @@ impl RuntimeOptions {
         self
     }
 
-    /// Override the deamon control socket path.
+    /// Override the daemon control socket path.
     #[must_use]
     pub fn with_daemon_socket(mut self, path: Option<PathBuf>) -> Self {
         self.daemon_socket = path;
         self
     }
 
-    /// Override the deamon status file path.
+    /// Override the daemon status file path.
     #[must_use]
     pub fn with_daemon_status(mut self, path: Option<PathBuf>) -> Self {
         self.daemon_status = path;
@@ -92,7 +92,7 @@ pub struct McpRuntime {
     search: SearchService,
     daemon: DaemonClient,
     semantic_enabled: bool,
-    daemon_status_cache: Arc<RwLock<Option<DeamonStatus>>>,
+    daemon_status_cache: Arc<RwLock<Option<DaemonStatus>>>,
 }
 
 impl McpRuntime {
@@ -135,10 +135,10 @@ impl McpRuntime {
         let vault_paths = vault.paths().clone();
         let socket_path = options
             .daemon_socket
-            .unwrap_or_else(|| vault_paths.arrowhead_dir.join("deamon/control.sock"));
+            .unwrap_or_else(|| vault_paths.arrowhead_dir.join("daemon/control.sock"));
         let status_path = options
             .daemon_status
-            .unwrap_or_else(|| vault_paths.arrowhead_dir.join("deamon/status.json"));
+            .unwrap_or_else(|| vault_paths.arrowhead_dir.join("daemon/status.json"));
 
         let daemon = DaemonClient::new(socket_path, status_path);
 
@@ -177,7 +177,7 @@ impl McpRuntime {
         &self.search
     }
 
-    /// Access the deamon client.
+    /// Access the daemon client.
     #[must_use]
     pub fn daemon(&self) -> &DaemonClient {
         &self.daemon
@@ -207,7 +207,7 @@ impl McpRuntime {
     }
 
     /// Retrieve the most recently cached daemon status, refreshing it if required.
-    pub async fn cached_daemon_status(&self) -> Option<DeamonStatus> {
+    pub async fn cached_daemon_status(&self) -> Option<DaemonStatus> {
         if let Some(status) = self.daemon_status_cache.read().await.clone() {
             return Some(status);
         }
@@ -226,7 +226,7 @@ impl McpRuntime {
     }
 
     /// Force a daemon status refresh and update the cache.
-    pub async fn refresh_daemon_status(&self) -> Result<DeamonStatus> {
+    pub async fn refresh_daemon_status(&self) -> Result<DaemonStatus> {
         let status = self.daemon.status().await?;
         let mut cache = self.daemon_status_cache.write().await;
         *cache = Some(status.clone());
@@ -920,7 +920,7 @@ fn build_related_from_search_results(
     related
 }
 
-/// Helper that communicates with the Arrowhead deamon.
+/// Helper that communicates with the Arrowhead daemon.
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     socket_path: PathBuf,
@@ -942,22 +942,22 @@ impl DaemonClient {
         &self.socket_path
     }
 
-    /// Fetch the latest deamon status, falling back to the cached status file.
-    pub async fn status(&self) -> Result<DeamonStatus> {
+    /// Fetch the latest daemon status, falling back to the cached status file.
+    pub async fn status(&self) -> Result<DaemonStatus> {
         match send_control_request(&self.socket_path, ControlRequest::StatusSnapshot).await {
             Ok(ControlResponse::Status { status }) => Ok(status),
             Ok(ControlResponse::Error { message }) => {
-                bail!("arrowhead deamon reported an error: {message}");
+                bail!("arrowhead daemon reported an error: {message}");
             }
             Ok(ControlResponse::ShutdownAck) => {
                 bail!(
-                    "arrowhead deamon acknowledged shutdown; restart it with `arrowhead index start`."
+                    "arrowhead daemon acknowledged shutdown; restart it with `arrowhead index start`."
                 );
             }
             Err(err) => {
                 let status_path = self.status_path.clone();
                 let fallback =
-                    task::spawn_blocking(move || DeamonStatus::load_from_path(&status_path))
+                    task::spawn_blocking(move || DaemonStatus::load_from_path(&status_path))
                         .await
                         .context("status fallback task aborted")??;
 
@@ -976,7 +976,7 @@ impl DaemonClient {
                     Ok(status)
                 } else {
                     Err(anyhow!(
-                        "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead index start` and retry.",
+                        "arrowhead daemon is not running (socket {} unreachable: {}). Start it with `arrowhead index start` and retry.",
                         self.socket_path.display(),
                         err
                     ))

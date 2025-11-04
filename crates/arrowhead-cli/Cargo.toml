@@ -16,7 +16,7 @@ path = "src/main.rs"
 # Core libraries
 arrowhead-core = { path = "../arrowhead-core" }
 arrowhead-mcp = { path = "../arrowhead-mcp" }
-arrowhead-deamon = { path = "../arrowhead-deamon" }
+arrowhead-daemon = { path = "../arrowhead-daemon" }
 
 # Error handling
 anyhow.workspace = true

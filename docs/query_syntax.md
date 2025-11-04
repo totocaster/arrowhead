@@ -111,7 +111,7 @@ Parser and converter unit tests must exhaustively exercise:
 - Quoted phrases with escaped quotes, hyphenated tokens, URLs that must bypass escaping.
 - Failure cases (unmatched parentheses, malformed ranges, unknown comparison tokens) yielding descriptive errors.
 
-Integration tests should verify that the parser output drives FTS queries and SQL filters correctly once implementation lands, especially for combined boolean/date expressions.
+Integration tests should verify that the parser output drives FTS queries and SQL filters correctly once that suite is in place, especially for combined boolean/date expressions.
 
 ## Open Decisions
 

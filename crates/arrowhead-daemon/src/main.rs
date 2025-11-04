@@ -1,6 +1,6 @@
-//! Arrowhead deamon binary entrypoint.
+//! Arrowhead daemon binary entrypoint.
 use anyhow::Result;
-use arrowhead_deamon::cli_main;
+use arrowhead_daemon::cli_main;
 
 #[tokio::main]
 async fn main() -> Result<()> {

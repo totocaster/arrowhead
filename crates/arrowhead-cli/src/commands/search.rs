@@ -9,9 +9,9 @@ use tracing::info;
 
 use arrowhead_core::{
     SearchConfig, SearchResult, SearchService, Vault, VaultConfig, embeddings::EmbeddingPipeline,
-    sqlite::IndexDatabase, status::DeamonStatus,
+    sqlite::IndexDatabase, status::DaemonStatus,
 };
-use arrowhead_deamon::{ControlRequest, ControlResponse, send_control_request};
+use arrowhead_daemon::{ControlRequest, ControlResponse, send_control_request};
 
 use crate::logging;
 
@@ -94,14 +94,14 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         }
     };
 
-    let status = ensure_deamon_ready(ctx, vault.as_ref()).await?;
+    let status = ensure_daemon_ready(ctx, vault.as_ref()).await?;
     if status.indexed_notes == 0 {
-        info!("deamon status reports zero indexed notes; search results may be incomplete");
+        info!("daemon status reports zero indexed notes; search results may be incomplete");
     }
     if status.error_notes > 0 {
         info!(
             errors = status.error_notes,
-            "latest deamon run reported indexing errors"
+            "latest daemon run reported indexing errors"
         );
     }
 
@@ -151,11 +151,11 @@ async fn execute_fts_search(
         .context("failed to execute FTS search")
 }
 
-async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<DeamonStatus> {
-    let default_socket = vault.paths().arrowhead_dir.join("deamon/control.sock");
+async fn ensure_daemon_ready(ctx: &CommandContext, vault: &Vault) -> Result<DaemonStatus> {
+    let default_socket = vault.paths().arrowhead_dir.join("daemon/control.sock");
     let socket_path = ctx
         .config
-        .deamon
+        .daemon
         .socket_path
         .clone()
         .unwrap_or(default_socket);
@@ -163,27 +163,27 @@ async fn ensure_deamon_ready(ctx: &CommandContext, vault: &Vault) -> Result<Deam
     match send_control_request(&socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { status }) => Ok(status),
         Ok(ControlResponse::Error { message }) => {
-            bail!("arrowhead deamon reported an error: {message}")
+            bail!("arrowhead daemon reported an error: {message}")
         }
         Ok(ControlResponse::ShutdownAck) => {
-            bail!("arrowhead deamon acknowledged shutdown; restart it with `arrowhead index start`")
+            bail!("arrowhead daemon acknowledged shutdown; restart it with `arrowhead index start`")
         }
         Err(err) => {
-            let default_status = vault.paths().arrowhead_dir.join("deamon/status.json");
+            let default_status = vault.paths().arrowhead_dir.join("daemon/status.json");
             let status_path = ctx
                 .config
-                .deamon
+                .daemon
                 .status_path
                 .clone()
                 .unwrap_or(default_status);
-            if let Some(status) = DeamonStatus::load_from_path(&status_path)? {
+            if let Some(status) = DaemonStatus::load_from_path(&status_path)? {
                 Err(anyhow!(
-                    "arrowhead deamon appears offline (last update {}). Start it with `arrowhead index start` and retry.",
+                    "arrowhead daemon appears offline (last update {}). Start it with `arrowhead index start` and retry.",
                     status.updated_at.to_rfc3339()
                 ))
             } else {
                 Err(anyhow!(
-                    "arrowhead deamon is not running (socket {} unreachable: {}). Start it with `arrowhead index start` and retry.",
+                    "arrowhead daemon is not running (socket {} unreachable: {}). Start it with `arrowhead index start` and retry.",
                     socket_path.display(),
                     err
                 ))
@@ -301,7 +301,7 @@ mod tests {
     use std::{fs, time::Duration};
 
     use arrowhead_core::ActivityState;
-    use arrowhead_deamon::{DeamonRuntimeBuilder, WatcherStrategy};
+    use arrowhead_daemon::{DaemonRuntimeBuilder, WatcherStrategy};
     use tempfile::TempDir;
 
     use crate::commands::CommandContext;
@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_errors_when_deamon_missing() {
+    async fn search_errors_when_daemon_missing() {
         let vault_dir = TempDir::new().expect("vault");
         let note_path = vault_dir.path().join("Sample.md");
         write_note(&note_path);
@@ -341,27 +341,27 @@ mod tests {
 
         let err = run(&ctx, &command).await.expect_err("search should fail");
         assert!(
-            err.to_string().contains("arrowhead deamon"),
+            err.to_string().contains("arrowhead daemon"),
             "unexpected error: {err}"
         );
     }
 
     #[tokio::test]
-    async fn fts_search_with_running_deamon() {
+    async fn fts_search_with_running_daemon() {
         let vault_dir = TempDir::new().expect("vault");
         let note_path = vault_dir.path().join("Sample.md");
         write_note(&note_path);
 
-        let handle = DeamonRuntimeBuilder::new(vault_dir.path())
+        let handle = DaemonRuntimeBuilder::new(vault_dir.path())
             .disable_embeddings()
             .watcher_strategy(WatcherStrategy::Poll {
                 interval: Duration::from_millis(50),
             })
             .spawn()
             .await
-            .expect("spawn deamon");
+            .expect("spawn daemon");
 
-        let socket_path = vault_dir.path().join(".arrowhead/deamon/control.sock");
+        let socket_path = vault_dir.path().join(".arrowhead/daemon/control.sock");
         let mut wait_attempts = 0;
         while !socket_path.exists() {
             wait_attempts += 1;
@@ -380,7 +380,7 @@ mod tests {
             }
             attempts += 1;
             if attempts > 100 {
-                panic!("deamon failed to finish initial indexing in time");
+                panic!("daemon failed to finish initial indexing in time");
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

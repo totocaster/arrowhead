@@ -16,9 +16,9 @@ pub struct AppConfig {
     pub vault: Option<PathBuf>,
     /// Default embedding model identifier.
     pub embedding_model: Option<String>,
-    /// Deamon configuration and cached status.
-    #[serde(default, skip_serializing_if = "DeamonConfig::is_empty")]
-    pub deamon: DeamonConfig,
+    /// Daemon configuration and cached status.
+    #[serde(default, skip_serializing_if = "DaemonConfig::is_empty")]
+    pub daemon: DaemonConfig,
     /// MCP HTTP server configuration.
     #[serde(default, skip_serializing_if = "McpHttpConfig::is_empty")]
     pub mcp: McpHttpConfig,
@@ -29,7 +29,7 @@ impl Default for AppConfig {
         Self {
             vault: None,
             embedding_model: Some("fast".to_string()),
-            deamon: DeamonConfig::default(),
+            daemon: DaemonConfig::default(),
             mcp: McpHttpConfig::default(),
         }
     }
@@ -71,9 +71,9 @@ impl AppConfig {
     }
 }
 
-/// Configuration persisted for the Arrowhead deamon.
+/// Configuration persisted for the Arrowhead daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct DeamonConfig {
+pub struct DaemonConfig {
     /// Optional override for the control socket path.
     #[serde(default)]
     pub socket_path: Option<PathBuf>,
@@ -83,12 +83,12 @@ pub struct DeamonConfig {
     /// Whether auto-start was approved by the user (None = unspecified).
     #[serde(default)]
     pub auto_start_enabled: Option<bool>,
-    /// Last known summary of the deamon status.
+    /// Last known summary of the daemon status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_status: Option<DeamonStatusSummary>,
+    pub last_status: Option<DaemonStatusSummary>,
 }
 
-impl DeamonConfig {
+impl DaemonConfig {
     /// Determine whether the configuration holds any user-provided values.
     pub fn is_empty(&self) -> bool {
         self.socket_path.is_none()
@@ -146,9 +146,9 @@ impl McpHttpConfig {
     }
 }
 
-/// Lightweight cache of the most recently observed deamon status.
+/// Lightweight cache of the most recently observed daemon status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeamonStatusSummary {
+pub struct DaemonStatusSummary {
     /// When the status snapshot was recorded.
     pub updated_at: DateTime<Utc>,
     /// Activity state at that time.
@@ -172,17 +172,17 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn default_config_omits_empty_deamon_section() {
+    fn default_config_omits_empty_daemon_section() {
         let config = AppConfig::default();
         let toml = toml::to_string(&config).expect("serialize config");
-        assert!(!toml.contains("deamon"));
+        assert!(!toml.contains("daemon"));
     }
 
     #[test]
-    fn populated_deamon_config_serialises_fields() {
+    fn populated_daemon_config_serialises_fields() {
         let mut config = AppConfig::default();
-        config.deamon.socket_path = Some(PathBuf::from("/tmp/arrowhead.sock"));
-        config.deamon.auto_start_enabled = Some(true);
+        config.daemon.socket_path = Some(PathBuf::from("/tmp/arrowhead.sock"));
+        config.daemon.auto_start_enabled = Some(true);
         let toml = toml::to_string(&config).expect("serialize config");
         assert!(toml.contains("socket_path"));
         assert!(toml.contains("auto_start_enabled"));

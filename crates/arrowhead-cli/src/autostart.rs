@@ -1,4 +1,4 @@
-//! Auto-start integration for the Arrowhead deamon.
+//! Auto-start integration for the Arrowhead daemon.
 //!
 //! This module hides the platform-specific details for registering Arrowhead
 //! with user-level service managers (launchd on macOS, systemd --user on
@@ -19,12 +19,12 @@ use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Relative directory under `.arrowhead/deamon/` where metadata is stored.
+/// Relative directory under `.arrowhead/daemon/` where metadata is stored.
 pub const AUTOSTART_DIR: &str = "autostart";
 /// File name used for the auto-start manifest.
 pub const MANIFEST_FILE: &str = "manifest.json";
 
-/// High-level service manager that can supervise the Arrowhead deamon.
+/// High-level service manager that can supervise the Arrowhead daemon.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoStartProvider {
@@ -150,15 +150,15 @@ impl AutoStartManager {
     pub fn install(
         &self,
         vault_path: &Path,
-        deamon_binary: &Path,
+        daemon_binary: &Path,
         embedding_model: Option<&str>,
     ) -> Result<AutoStartManifest> {
         match self.provider {
             AutoStartProvider::Launchd => {
-                self.install_launchd(vault_path, deamon_binary, embedding_model)
+                self.install_launchd(vault_path, daemon_binary, embedding_model)
             }
             AutoStartProvider::SystemdUser => {
-                self.install_systemd(vault_path, deamon_binary, embedding_model)
+                self.install_systemd(vault_path, daemon_binary, embedding_model)
             }
         }
     }
@@ -191,7 +191,7 @@ impl AutoStartManager {
     fn install_launchd(
         &self,
         vault_path: &Path,
-        deamon_binary: &Path,
+        daemon_binary: &Path,
         embedding_model: Option<&str>,
     ) -> Result<AutoStartManifest> {
         let home = UserDirs::new()
@@ -205,10 +205,10 @@ impl AutoStartManager {
             )
         })?;
 
-        let label = format!("com.arrowhead.deamon.{}", vault_slug(vault_path)?);
+        let label = format!("com.arrowhead.daemon.{}", vault_slug(vault_path)?);
         let plist_path = agents_dir.join(format!("{label}.plist"));
 
-        let plist = render_launchd_plist(&label, deamon_binary, vault_path, embedding_model);
+        let plist = render_launchd_plist(&label, daemon_binary, vault_path, embedding_model);
         fs::write(&plist_path, plist)
             .with_context(|| format!("failed to write launchd plist {}", plist_path.display()))?;
 
@@ -336,7 +336,7 @@ impl AutoStartManager {
     fn install_systemd(
         &self,
         vault_path: &Path,
-        deamon_binary: &Path,
+        daemon_binary: &Path,
         embedding_model: Option<&str>,
     ) -> Result<AutoStartManifest> {
         let home = UserDirs::new()
@@ -353,7 +353,7 @@ impl AutoStartManager {
         let unit_name = format!("arrowheadd-{}.service", vault_slug(vault_path)?);
         let unit_path = units_dir.join(&unit_name);
 
-        let unit = render_systemd_unit(deamon_binary, vault_path, embedding_model);
+        let unit = render_systemd_unit(daemon_binary, vault_path, embedding_model);
         fs::write(&unit_path, unit)
             .with_context(|| format!("failed to write systemd unit {}", unit_path.display()))?;
 
@@ -575,7 +575,7 @@ fn render_systemd_unit(binary: &Path, vault: &Path, embedding_model: Option<&str
     let embedding = embedding_model.unwrap_or("none");
     format!(
         r#"[Unit]
-Description=Arrowhead deamon for {vault_path}
+Description=Arrowhead daemon for {vault_path}
 After=network.target
 
 [Service]

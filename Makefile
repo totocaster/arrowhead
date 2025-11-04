@@ -7,7 +7,7 @@ FORCE ?= 0
 
 WORKSPACE_ROOT := $(abspath .)
 CLI_PATH := $(WORKSPACE_ROOT)/crates/arrowhead-cli
-DEAMON_PATH := $(WORKSPACE_ROOT)/crates/arrowhead-deamon
+DAEMON_PATH := $(WORKSPACE_ROOT)/crates/arrowhead-daemon
 BIN_DIR := $(PREFIX)/bin
 
 CARGO_LOCKED := $(if $(filter 0,$(LOCKED)),,--locked)
@@ -26,7 +26,7 @@ install:
 	fi; \
 	RUNNING=0; \
 	if [ -n "$$ARROWHEAD_BIN" ]; then \
-		echo "Ensuring no active Arrowhead deamon before install"; \
+		echo "Ensuring no active Arrowhead daemon before install"; \
 		set +e; \
 		stop_output=$$("$${ARROWHEAD_BIN}" index stop 2>&1); \
 		stop_status=$$?; \
@@ -35,28 +35,28 @@ install:
 		if [ $$stop_status -eq 0 ] && printf "%s" "$$stop_output" | grep -q "shutdown signal sent to arrowhead indexer"; then \
 			RUNNING=1; \
 		elif [ $$stop_status -ne 0 ]; then \
-			echo "Warning: failed to contact Arrowhead deamon (exit $$stop_status)" >&2; \
+			echo "Warning: failed to contact Arrowhead daemon (exit $$stop_status)" >&2; \
 		fi; \
 	else \
-		echo "Arrowhead CLI not found; skipping deamon shutdown check."; \
+		echo "Arrowhead CLI not found; skipping daemon shutdown check."; \
 	fi; \
 	mkdir -p "$$BIN_DIR"; \
 	"$(CARGO)" install --path "$(CLI_PATH)" --root "$(PREFIX)" $(CARGO_LOCKED) $(CARGO_FORCE); \
-	echo "Installing Arrowhead deamon (arrowheadd) to $$BIN_DIR"; \
-	"$(CARGO)" install --path "$(DEAMON_PATH)" --root "$(PREFIX)" $(CARGO_LOCKED) $(CARGO_FORCE); \
+	echo "Installing Arrowhead daemon (arrowheadd) to $$BIN_DIR"; \
+	"$(CARGO)" install --path "$(DAEMON_PATH)" --root "$(PREFIX)" $(CARGO_LOCKED) $(CARGO_FORCE); \
 	if [ $$RUNNING -eq 1 ] && [ -x "$$BIN_DIR/arrowhead" ]; then \
-		echo "Restarting Arrowhead deamon"; \
+		echo "Restarting Arrowhead daemon"; \
 		if "$$BIN_DIR/arrowhead" index start; then \
-			echo "Arrowhead deamon restarted successfully"; \
+			echo "Arrowhead daemon restarted successfully"; \
 		else \
-			echo "Warning: failed to restart Arrowhead deamon" >&2; \
+			echo "Warning: failed to restart Arrowhead daemon" >&2; \
 		fi; \
 	elif [ $$RUNNING -eq 1 ]; then \
-		echo "Warning: Arrowhead CLI missing after install; unable to restart deamon" >&2; \
+		echo "Warning: Arrowhead CLI missing after install; unable to restart daemon" >&2; \
 	elif [ -n "$$ARROWHEAD_BIN" ]; then \
-		echo "Arrowhead deamon was not running prior to install"; \
+		echo "Arrowhead daemon was not running prior to install"; \
 	fi; \
-	printf '\nArrowhead CLI and deamon installed to: %s\nEnsure "%s" is on your PATH so both `arrowhead` and `arrowheadd` are runnable.\n' "$$BIN_DIR" "$$BIN_DIR"
+	printf '\nArrowhead CLI and daemon installed to: %s\nEnsure "%s" is on your PATH so both `arrowhead` and `arrowheadd` are runnable.\n' "$$BIN_DIR" "$$BIN_DIR"
 
 clean:
 	@echo "Cleaning workspace"

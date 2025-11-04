@@ -25,10 +25,8 @@
 - Keep the summary ≤72 characters and pick the closest conventional type (`docs`, `feat`, `fix`, `refactor`, etc.).
 - Group related changes into one commit; avoid mixing unrelated work.
 
-## Code Priorities
-- **Phase 1:** Implement vault I/O, metadata extraction, and SQLite schema.
-- **Phase 2:** Build indexer, search pipeline, and harden the sqlite-vec vector store.
-- **Phase 3+:** Complete graph services, MCP transports, and polish.
+## Project Priorities
+- Track current roadmap work in the README’s Roadmap section.
 
 ## Communication
 - Ask for clarification when specs conflict or edge cases appear (e.g., concurrent vault access expectations).

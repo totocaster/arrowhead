@@ -11,7 +11,7 @@ homepage.workspace = true
 [dependencies]
 # Core library
 arrowhead-core = { path = "../arrowhead-core" }
-arrowhead-deamon = { path = "../arrowhead-deamon" }
+arrowhead-daemon = { path = "../arrowhead-daemon" }
 
 # Error handling
 anyhow.workspace = true

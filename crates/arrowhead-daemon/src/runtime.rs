@@ -13,7 +13,7 @@ use arrowhead_core::embeddings::EmbeddingPipeline;
 use arrowhead_core::indexer::{Indexer, IndexerConfig};
 use arrowhead_core::sqlite::IndexDatabase;
 use arrowhead_core::{
-    ActivityState, ActivityStatus, DeamonStatus, DownloadState, DownloadStatus, IssueSeverity,
+    ActivityState, ActivityStatus, DaemonStatus, DownloadState, DownloadStatus, IssueSeverity,
     StatusFrame, StatusIssue, Vault, VaultConfig,
 };
 use fastembed::{EmbeddingModel, ModelTrait};
@@ -29,7 +29,7 @@ use crate::control::{ControlRequest, ControlResponse, run_control_server, send_c
 use crate::watcher::{WatcherHandle, WatcherStrategy, start_watcher};
 
 /// Runtime configuration produced by the builder.
-pub struct DeamonConfig {
+pub struct DaemonConfig {
     pub(crate) vault: Arc<Vault>,
     pub(crate) database: Arc<IndexDatabase>,
     pub(crate) indexer_config: IndexerConfig,
@@ -41,8 +41,8 @@ pub struct DeamonConfig {
     pub(crate) watcher_strategy: WatcherStrategy,
 }
 
-/// Builder used to construct and launch the deamon runtime.
-pub struct DeamonRuntimeBuilder {
+/// Builder used to construct and launch the daemon runtime.
+pub struct DaemonRuntimeBuilder {
     vault_root: PathBuf,
     watcher_strategy: WatcherStrategy,
     event_buffer: usize,
@@ -50,7 +50,7 @@ pub struct DeamonRuntimeBuilder {
     embedding_model: Option<String>,
 }
 
-impl DeamonRuntimeBuilder {
+impl DaemonRuntimeBuilder {
     /// Construct a builder targeting the supplied vault root.
     pub fn new<P: Into<PathBuf>>(vault_root: P) -> Self {
         Self {
@@ -94,7 +94,7 @@ impl DeamonRuntimeBuilder {
         self
     }
 
-    fn prepare(self) -> Result<DeamonConfig> {
+    fn prepare(self) -> Result<DaemonConfig> {
         let vault_config = VaultConfig::new(self.vault_root.clone());
         let vault = Arc::new(Vault::new(vault_config)?);
         vault.ensure_arrowhead_dirs()?;
@@ -104,22 +104,22 @@ impl DeamonRuntimeBuilder {
             format!("failed to ensure arrowhead dir {}", arrowhead_dir.display())
         })?;
 
-        let deamon_dir = arrowhead_dir.join("deamon");
-        std::fs::create_dir_all(&deamon_dir)
-            .with_context(|| format!("failed to ensure deamon dir {}", deamon_dir.display()))?;
+        let daemon_dir = arrowhead_dir.join("daemon");
+        std::fs::create_dir_all(&daemon_dir)
+            .with_context(|| format!("failed to ensure daemon dir {}", daemon_dir.display()))?;
 
         let logs_dir = vault.paths().logs_dir();
         std::fs::create_dir_all(&logs_dir)
             .with_context(|| format!("failed to ensure logs dir {}", logs_dir.display()))?;
 
-        let status_path = deamon_dir.join("status.json");
-        let socket_path = deamon_dir.join("control.sock");
+        let status_path = daemon_dir.join("status.json");
+        let socket_path = daemon_dir.join("control.sock");
         let log_path = logs_dir.join("daemon.log");
 
         let db_path = arrowhead_dir.join("index.db");
         let database = Arc::new(IndexDatabase::open(db_path)?);
 
-        Ok(DeamonConfig {
+        Ok(DaemonConfig {
             vault,
             database,
             indexer_config: self.indexer_config,
@@ -133,19 +133,19 @@ impl DeamonRuntimeBuilder {
     }
 
     /// Build the runtime configuration without launching it.
-    pub fn build(self) -> Result<DeamonConfig> {
+    pub fn build(self) -> Result<DaemonConfig> {
         self.prepare()
     }
 
-    /// Spawn the deamon runtime using this builder.
-    pub async fn spawn(self) -> Result<DeamonHandle> {
+    /// Spawn the daemon runtime using this builder.
+    pub async fn spawn(self) -> Result<DaemonHandle> {
         let config = self.prepare()?;
-        DeamonRuntime::spawn(config).await
+        DaemonRuntime::spawn(config).await
     }
 }
 
 /// Handle returned from a spawned runtime.
-pub struct DeamonHandle {
+pub struct DaemonHandle {
     shutdown_tx: broadcast::Sender<()>,
     task: JoinHandle<Result<()>>,
     status_path: PathBuf,
@@ -153,7 +153,7 @@ pub struct DeamonHandle {
     database: Arc<IndexDatabase>,
 }
 
-impl DeamonHandle {
+impl DaemonHandle {
     /// Path to the persisted status snapshot.
     pub fn status_path(&self) -> &Path {
         &self.status_path
@@ -170,7 +170,7 @@ impl DeamonHandle {
     }
 
     /// Query the runtime over the control socket.
-    pub async fn request_status(&self) -> Result<DeamonStatus> {
+    pub async fn request_status(&self) -> Result<DaemonStatus> {
         match send_control_request(&self.socket_path, ControlRequest::StatusSnapshot).await? {
             ControlResponse::Status { status } => Ok(status),
             ControlResponse::Error { message } => Err(anyhow!(message)),
@@ -182,7 +182,7 @@ impl DeamonHandle {
     pub async fn join(self) -> Result<()> {
         match self.task.await {
             Ok(result) => result,
-            Err(err) => Err(anyhow!("deamon task aborted: {err}")),
+            Err(err) => Err(anyhow!("daemon task aborted: {err}")),
         }
     }
 
@@ -214,10 +214,10 @@ impl DeamonHandle {
 }
 
 /// Main runtime structure wiring watchers, event queue, and control server.
-struct DeamonRuntime {
-    config: DeamonConfig,
+struct DaemonRuntime {
+    config: DaemonConfig,
     indexer: Option<Arc<Indexer>>,
-    status: Arc<Mutex<DeamonStatus>>,
+    status: Arc<Mutex<DaemonStatus>>,
     frame_tx: broadcast::Sender<StatusFrame>,
     _watcher: WatcherHandle,
     event_rx: mpsc::Receiver<Vec<PathBuf>>,
@@ -225,8 +225,8 @@ struct DeamonRuntime {
     _logging_guard: LoggingGuard,
 }
 
-impl DeamonRuntime {
-    async fn new(config: DeamonConfig) -> Result<Self> {
+impl DaemonRuntime {
+    async fn new(config: DaemonConfig) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(config.event_buffer);
         let watcher_root = config.vault.paths().root.clone();
         let watcher = start_watcher(
@@ -237,7 +237,7 @@ impl DeamonRuntime {
 
         let logging_guard = crate::logging::init_logging(&config.log_path)?;
 
-        let status_snapshot = DeamonStatus::new(config.log_path.clone());
+        let status_snapshot = DaemonStatus::new(config.log_path.clone());
         status_snapshot.save_to_path(&config.status_path)?;
         let status = Arc::new(Mutex::new(status_snapshot.clone()));
         let (frame_tx, _) = broadcast::channel(256);
@@ -256,15 +256,15 @@ impl DeamonRuntime {
         })
     }
 
-    async fn spawn(config: DeamonConfig) -> Result<DeamonHandle> {
-        let runtime = DeamonRuntime::new(config).await?;
+    async fn spawn(config: DaemonConfig) -> Result<DaemonHandle> {
+        let runtime = DaemonRuntime::new(config).await?;
         let shutdown_tx = runtime.shutdown_tx.clone();
         let status_path = runtime.config.status_path.clone();
         let socket_path = runtime.config.socket_path.clone();
         let database = Arc::clone(&runtime.config.database);
         let task = tokio::spawn(async move { runtime.run().await });
 
-        Ok(DeamonHandle {
+        Ok(DaemonHandle {
             shutdown_tx,
             task,
             status_path,
@@ -528,7 +528,7 @@ impl DeamonRuntime {
 
     async fn persist_status<F>(&self, update: F) -> Result<()>
     where
-        F: FnMut(&mut DeamonStatus),
+        F: FnMut(&mut DaemonStatus),
     {
         persist_status_to_path(
             &self.status,
@@ -541,8 +541,8 @@ impl DeamonRuntime {
 }
 
 async fn prepare_embeddings(
-    config: &DeamonConfig,
-    status: Arc<Mutex<DeamonStatus>>,
+    config: &DaemonConfig,
+    status: Arc<Mutex<DaemonStatus>>,
     frame_tx: broadcast::Sender<StatusFrame>,
 ) -> Result<Option<Arc<EmbeddingPipeline>>> {
     use tokio::sync::mpsc::unbounded_channel;
@@ -871,7 +871,7 @@ fn download_embedding_assets(
 
 async fn consume_download_events(
     descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
-    status: Arc<Mutex<DeamonStatus>>,
+    status: Arc<Mutex<DaemonStatus>>,
     status_path: PathBuf,
     frame_tx: broadcast::Sender<StatusFrame>,
     mut rx: UnboundedReceiver<DownloadEvent>,
@@ -964,7 +964,7 @@ async fn consume_download_events(
     Ok(failed)
 }
 
-fn ensure_download_entry<'a>(status: &'a mut DeamonStatus, item: &str) -> &'a mut DownloadStatus {
+fn ensure_download_entry<'a>(status: &'a mut DaemonStatus, item: &str) -> &'a mut DownloadStatus {
     if let Some(index) = status.downloads.iter().position(|entry| entry.item == item) {
         &mut status.downloads[index]
     } else {
@@ -979,7 +979,7 @@ fn ensure_download_entry<'a>(status: &'a mut DeamonStatus, item: &str) -> &'a mu
 }
 
 async fn record_embedding_failure(
-    status: &Arc<Mutex<DeamonStatus>>,
+    status: &Arc<Mutex<DaemonStatus>>,
     status_path: &Path,
     descriptor: &arrowhead_core::embeddings::EmbeddingDescriptor,
     frame_tx: &broadcast::Sender<StatusFrame>,
@@ -1013,20 +1013,20 @@ async fn record_embedding_failure(
 }
 
 async fn persist_status_to_path<F>(
-    status: &Arc<Mutex<DeamonStatus>>,
+    status: &Arc<Mutex<DaemonStatus>>,
     path: &Path,
     frame_tx: Option<&broadcast::Sender<StatusFrame>>,
     mut update: F,
 ) -> Result<()>
 where
-    F: FnMut(&mut DeamonStatus),
+    F: FnMut(&mut DaemonStatus),
 {
     let mut guard = status.lock().await;
     update(&mut guard);
     guard.touch();
     guard
         .save_to_path(path)
-        .context("failed to persist deamon status")?;
+        .context("failed to persist daemon status")?;
     let snapshot = guard.clone();
     drop(guard);
     if let Some(tx) = frame_tx {
@@ -1039,7 +1039,7 @@ const INDEX_ERROR_CODE: &str = "index_errors";
 const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
 const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
 
-fn update_index_error_issue(status: &mut DeamonStatus, errors: u64) {
+fn update_index_error_issue(status: &mut DaemonStatus, errors: u64) {
     status.error_notes = errors;
     status.issues.retain(|issue| issue.code != INDEX_ERROR_CODE);
 
@@ -1082,16 +1082,16 @@ pub async fn cli_main() -> Result<()> {
         Err(_) => Some("fast".to_string()),
     };
 
-    let handle = DeamonRuntimeBuilder::new(root)
+    let handle = DaemonRuntimeBuilder::new(root)
         .embedding_model(embedding_model)
         .spawn()
         .await?;
-    info!("arrowhead deamon started; waiting for shutdown signal");
+    info!("arrowhead daemon started; waiting for shutdown signal");
 
     tokio::signal::ctrl_c()
         .await
         .context("failed to listen for ctrl-c")?;
 
-    info!("shutdown signal received; stopping deamon");
+    info!("shutdown signal received; stopping daemon");
     handle.shutdown().await
 }

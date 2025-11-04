@@ -59,13 +59,13 @@ fn handle_status(ctx: &CommandContext) -> Result<()> {
         println!("Index size: {} bytes", db_size);
     }
 
-    if let Some(auto) = ctx.config.deamon.auto_start_enabled {
+    if let Some(auto) = ctx.config.daemon.auto_start_enabled {
         println!("Auto-start configured: {}", if auto { "yes" } else { "no" });
     } else {
         println!("Auto-start configured: unknown");
     }
 
-    if let Some(last) = &ctx.config.deamon.last_status {
+    if let Some(last) = &ctx.config.daemon.last_status {
         println!(
             "Last recorded index snapshot: {}",
             last.updated_at.to_rfc3339()

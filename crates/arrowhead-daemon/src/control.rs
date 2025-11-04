@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use arrowhead_core::{DeamonStatus, StatusFrame};
+use arrowhead_core::{DaemonStatus, StatusFrame};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
@@ -12,7 +12,7 @@ use tokio::{
 };
 use tracing::{error, info};
 
-/// Control plane request supported by the deamon.
+/// Control plane request supported by the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
@@ -29,7 +29,7 @@ pub enum ControlRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlResponse {
     /// Successful status response.
-    Status { status: DeamonStatus },
+    Status { status: DaemonStatus },
     /// Acknowledge shutdown request.
     ShutdownAck,
     /// Error handling the command.
@@ -39,7 +39,7 @@ pub enum ControlResponse {
 #[cfg(unix)]
 pub async fn run_control_server(
     socket_path: PathBuf,
-    status: Arc<Mutex<DeamonStatus>>,
+    status: Arc<Mutex<DaemonStatus>>,
     frames: broadcast::Sender<StatusFrame>,
     shutdown_tx: broadcast::Sender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -64,7 +64,7 @@ pub async fn run_control_server(
         .with_context(|| format!("failed to bind control socket {}", socket_path.display()))?;
     info!(
         socket = %socket_path.display(),
-        "deamon control socket ready"
+        "daemon control socket ready"
     );
 
     loop {
@@ -109,7 +109,7 @@ pub async fn run_control_server(
 #[cfg(unix)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
-    status: Arc<Mutex<DeamonStatus>>,
+    status: Arc<Mutex<DaemonStatus>>,
     frames: broadcast::Sender<StatusFrame>,
     shutdown_tx: broadcast::Sender<()>,
 ) -> Result<()> {
@@ -172,7 +172,7 @@ where
 
 async fn stream_status(
     mut writer: BufWriter<tokio::net::unix::OwnedWriteHalf>,
-    status: Arc<Mutex<DeamonStatus>>,
+    status: Arc<Mutex<DaemonStatus>>,
     frames: broadcast::Sender<StatusFrame>,
 ) -> Result<()> {
     let initial = {
@@ -200,7 +200,7 @@ async fn stream_status(
 #[cfg(not(unix))]
 pub async fn run_control_server(
     _socket_path: PathBuf,
-    _status: Arc<Mutex<DeamonStatus>>,
+    _status: Arc<Mutex<DaemonStatus>>,
     _frames: broadcast::Sender<StatusFrame>,
     _shutdown_tx: broadcast::Sender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,

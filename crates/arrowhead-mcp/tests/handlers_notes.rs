@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use arrowhead_core::status::DeamonStatus;
+use arrowhead_core::status::DaemonStatus;
 use arrowhead_mcp::{
     handlers::HandlerRegistry,
     protocol::{Params, ProtocolError, Request},
@@ -134,7 +134,7 @@ async fn notes_read_returns_expected_fields() {
 async fn vault_status_returns_cached_status_when_daemon_unreachable() {
     let temp_dir = copy_fixture();
     let status_path = temp_dir.path().join("status.json");
-    let mut status = DeamonStatus::new(temp_dir.path().join("daemon.log"));
+    let mut status = DaemonStatus::new(temp_dir.path().join("daemon.log"));
     status.indexed_notes = 42;
     status.error_notes = 1;
     status

@@ -25,8 +25,8 @@ specification.
 - Unit tests co-located with the code (`#[cfg(test)]`). Use the fixture vault in
   `tests/fixtures/test-vault` for vault/indexer scenarios; never mutate it.
 - Stub embeddings in tests (e.g. set `with_embedding_model(None)` or `disable_embeddings()`) to avoid downloading models; semantic behaviour should be validated via fixtures and sqlite-vec tables.
-- Integration tests will ship in a follow-up milestone. When designing new
-  features, keep them testable via integration harnesses that can live under
+- Integration harness progress is tracked on the project roadmap. When
+  designing new features, keep them testable via suites under
   `tests/integration/` using ephemeral temp directories for side effects.
 - Cover behavioural regressions before introducing new logic; add regression
   tests when fixing bugs.

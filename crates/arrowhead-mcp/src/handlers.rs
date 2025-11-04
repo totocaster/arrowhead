@@ -17,7 +17,7 @@ use tracing::debug;
 
 use arrowhead_core::{
     MetadataMap, NoteRecord, Vault,
-    status::{ActivityState, ActivityStatus, DeamonStatus},
+    status::{ActivityState, ActivityStatus, DaemonStatus},
 };
 
 use crate::{
@@ -1584,7 +1584,7 @@ impl HandlerRegistry {
         Ok(())
     }
 
-    async fn daemon_status(&self) -> Result<DeamonStatus, ProtocolError> {
+    async fn daemon_status(&self) -> Result<DaemonStatus, ProtocolError> {
         self.runtime.daemon().status().await.map_err(|err| {
             ProtocolError::custom(ErrorCode::ServiceUnavailable, err.to_string(), None)
         })
@@ -1903,7 +1903,7 @@ fn prune_empty_directories(
     Ok(pruned)
 }
 
-fn build_daemon_status_payload(status: DeamonStatus) -> DaemonStatusPayload {
+fn build_daemon_status_payload(status: DaemonStatus) -> DaemonStatusPayload {
     let activity = summarise_activity(&status.activity);
     let queued_jobs = (status.activity.queued_jobs > 0).then_some(status.activity.queued_jobs);
 

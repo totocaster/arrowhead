@@ -126,7 +126,7 @@ This keeps FTS indexing and search working while skipping the model downloads an
 arrowhead/
 ├── crates/
 │   ├── arrowhead-core/     # Vault I/O, indexer engine, search & graph primitives
-│   ├── arrowhead-deamon/   # Background runtime (watcher, queue, control socket, binary)
+│   ├── arrowhead-daemon/   # Background runtime (watcher, queue, control socket, binary)
 │   ├── arrowhead-mcp/      # MCP protocol (stdio runtime, handlers, tooling)
 │   └── arrowhead-cli/      # CLI (clap commands, config, runtime bootstrap)
 ├── docs/                   # Specs, protocol references, development guides
@@ -308,11 +308,13 @@ Keep the Arrowhead allowlist scoped to loopback so all external traffic is funne
 
 ## Roadmap
 
-- MCP observability: metrics/structured tracing for the HTTP transport plus TLS/reverse-proxy guidance.
-- Graph diagnostics: directional summaries, back-pressure metrics, large vault profiling.
-- Search hardening: semantic snippet tuning, sqlite-vec regression fixtures, hybrid scoring tweaks.
-- Model management UX: preset documentation, cache overrides, richer download progress.
-- Vector dependency review and MSRV tracking for sqlite-vec releases.
+Active roadmap items are tracked on GitHub and currently include:
+
+- Adding MCP transport metrics with TLS/reverse-proxy guidance.
+- Expanding graph diagnostics for large vaults.
+- Hardening semantic and hybrid search scoring.
+- Improving embedding model management UX.
+- Tracking sqlite-vec dependency health and minimum supported Rust version updates.
 
 ## Release Process
 
@@ -328,7 +330,7 @@ Distributed under the MIT License. See [`LICENSE`](LICENSE) for details.
 
 ## Contributing
 
-We welcome issues and pull requests once the Phase 1 foundation is fully stabilized. Start by reading this README and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
+We welcome issues and pull requests once the Arrowhead foundation is fully stabilized. Start by reading this README and the [feature development guide](docs/feature_development_guide.md). Make sure `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` pass before submitting changes.
 
 ## Acknowledgments
 

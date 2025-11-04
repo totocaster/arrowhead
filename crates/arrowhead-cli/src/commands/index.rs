@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use arrowhead_core::{
-    ActivityState, DeamonStatus, DownloadState, IssueSeverity, StatusFrame, Vault, VaultConfig,
+    ActivityState, DaemonStatus, DownloadState, IssueSeverity, StatusFrame, Vault, VaultConfig,
 };
-use arrowhead_deamon::{
+use arrowhead_daemon::{
     ControlRequest, ControlResponse, StatusStream, send_control_request, status_stream,
 };
 use clap::{Args, Subcommand};
@@ -28,7 +28,7 @@ use crate::autostart::{
     AUTOSTART_DIR, AutoStartManager, AutoStartProvider, AutoStartStatus, MANIFEST_FILE,
     prompt_yes_no,
 };
-use crate::config::{DeamonConfig, DeamonStatusSummary};
+use crate::config::{DaemonConfig, DaemonStatusSummary};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -161,7 +161,7 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
         None => None,
     };
 
-    let mut auto_start_preference = ctx.config.deamon.auto_start_enabled;
+    let mut auto_start_preference = ctx.config.daemon.auto_start_enabled;
 
     if options.no_start {
         if manifest.is_some() {
@@ -170,7 +170,7 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
             auto_start_preference = Some(false);
         }
 
-        ctx.config.deamon = DeamonConfig {
+        ctx.config.daemon = DaemonConfig {
             socket_path: Some(paths.socket_path.clone()),
             status_path: Some(paths.status_path.clone()),
             auto_start_enabled: auto_start_preference,
@@ -191,7 +191,7 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
         } else if auto_start_preference.is_none() {
             auto_start_preference = Some(false);
         }
-        ctx.config.deamon.auto_start_enabled = auto_start_preference;
+        ctx.config.daemon.auto_start_enabled = auto_start_preference;
         update_config_with_status(ctx, &paths, None)?;
         return Ok(());
     }
@@ -208,7 +208,7 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
             };
 
             if enable {
-                let binary = find_deamon_binary()?;
+                let binary = find_daemon_binary()?;
                 manifest = Some(
                     manager
                         .install(&vault_path, &binary, ctx.config.embedding_model.as_deref())
@@ -229,7 +229,7 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
         auto_start_preference = Some(true);
     }
 
-    ctx.config.deamon.auto_start_enabled = auto_start_preference;
+    ctx.config.daemon.auto_start_enabled = auto_start_preference;
 
     let mut pid: Option<u32> = None;
     if let (Some(manager), Some(manifest)) = (&manager, manifest.as_ref()) {
@@ -247,10 +247,10 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
 
     if pid.is_none() {
         let spawned_pid =
-            launch_deamon_process(&vault_path, ctx.config.embedding_model.as_deref())?;
+            launch_daemon_process(&vault_path, ctx.config.embedding_model.as_deref())?;
         pid = Some(spawned_pid);
-        if ctx.config.deamon.auto_start_enabled.is_none() {
-            ctx.config.deamon.auto_start_enabled = Some(false);
+        if ctx.config.daemon.auto_start_enabled.is_none() {
+            ctx.config.daemon.auto_start_enabled = Some(false);
         }
     }
 
@@ -302,7 +302,7 @@ async fn handle_start(ctx: &mut CommandContext, args: &IndexStartArgs) -> Result
             match manager.start_unit(&manifest) {
                 Ok(reported_pid) => {
                     pid = reported_pid;
-                    ctx.config.deamon.auto_start_enabled = Some(true);
+                    ctx.config.daemon.auto_start_enabled = Some(true);
                 }
                 Err(err) => {
                     println!(
@@ -315,10 +315,10 @@ async fn handle_start(ctx: &mut CommandContext, args: &IndexStartArgs) -> Result
 
     if pid.is_none() {
         let spawned_pid =
-            launch_deamon_process(&vault_path, ctx.config.embedding_model.as_deref())?;
+            launch_daemon_process(&vault_path, ctx.config.embedding_model.as_deref())?;
         pid = Some(spawned_pid);
-        if ctx.config.deamon.auto_start_enabled.is_none() {
-            ctx.config.deamon.auto_start_enabled = Some(false);
+        if ctx.config.daemon.auto_start_enabled.is_none() {
+            ctx.config.daemon.auto_start_enabled = Some(false);
         }
     }
 
@@ -397,8 +397,8 @@ async fn handle_status(ctx: &CommandContext, args: &IndexStatusArgs) -> Result<(
     vault.ensure_arrowhead_dirs()?;
 
     let paths = vault.paths();
-    let socket_path = paths.arrowhead_dir.join("deamon/control.sock");
-    let status_path = paths.arrowhead_dir.join("deamon/status.json");
+    let socket_path = paths.arrowhead_dir.join("daemon/control.sock");
+    let status_path = paths.arrowhead_dir.join("daemon/status.json");
     let stdout_is_tty = io::stdout().is_terminal();
 
     match status_stream(&socket_path).await {
@@ -412,7 +412,7 @@ async fn handle_status(ctx: &CommandContext, args: &IndexStatusArgs) -> Result<(
             stream_frames(&mut stream, args.json, stdout_is_tty).await
         }
         Err(err) => {
-            let snapshot = DeamonStatus::load_from_path(&status_path)?;
+            let snapshot = DaemonStatus::load_from_path(&status_path)?;
             if let Some(status) = snapshot {
                 if args.json {
                     let frame = StatusFrame::new(status);
@@ -445,13 +445,13 @@ async fn handle_autostart(ctx: &mut CommandContext, command: &IndexAutostartComm
                 Some(manager) => manager,
                 None => {
                     println!("Auto-start is not supported on this platform.");
-                    ctx.config.deamon.auto_start_enabled = Some(false);
+                    ctx.config.daemon.auto_start_enabled = Some(false);
                     ctx.persist()?;
                     return Ok(());
                 }
             };
 
-            let binary = find_deamon_binary()?;
+            let binary = find_daemon_binary()?;
             let embedding_model = ctx.config.embedding_model.as_deref();
             let manifest = manager.load_manifest()?;
 
@@ -481,7 +481,7 @@ async fn handle_autostart(ctx: &mut CommandContext, command: &IndexAutostartComm
                 );
             }
 
-            ctx.config.deamon.auto_start_enabled = Some(true);
+            ctx.config.daemon.auto_start_enabled = Some(true);
             update_config_with_status(ctx, &paths, None)?;
             ctx.persist()?;
         }
@@ -490,7 +490,7 @@ async fn handle_autostart(ctx: &mut CommandContext, command: &IndexAutostartComm
                 Some(manager) => manager,
                 None => {
                     println!("Auto-start is not supported on this platform.");
-                    ctx.config.deamon.auto_start_enabled = Some(false);
+                    ctx.config.daemon.auto_start_enabled = Some(false);
                     ctx.persist()?;
                     return Ok(());
                 }
@@ -507,7 +507,7 @@ async fn handle_autostart(ctx: &mut CommandContext, command: &IndexAutostartComm
                 println!("Auto-start is already disabled for this vault.");
             }
 
-            ctx.config.deamon.auto_start_enabled = Some(false);
+            ctx.config.daemon.auto_start_enabled = Some(false);
             update_config_with_status(ctx, &paths, None)?;
             ctx.persist()?;
         }
@@ -556,7 +556,7 @@ pub(crate) async fn handle_reset(ctx: &mut CommandContext) -> Result<()> {
     cleanup_auto_start(&paths)?;
     cleanup_arrowhead_dirs(&paths)?;
 
-    ctx.config.deamon = DeamonConfig::default();
+    ctx.config.daemon = DaemonConfig::default();
     ctx.persist()?;
 
     println!(
@@ -574,19 +574,19 @@ pub(crate) fn resolve_vault_path(ctx: &CommandContext) -> Result<PathBuf> {
         .context("no vault configured. Provide --vault or run `arrowhead init` first")
 }
 
-pub(crate) fn load_vault_environment(vault_path: &Path) -> Result<(Vault, DeamonPaths)> {
+pub(crate) fn load_vault_environment(vault_path: &Path) -> Result<(Vault, DaemonPaths)> {
     let vault = Vault::new(VaultConfig::new(vault_path.to_path_buf()))?;
     let vault_paths = vault.paths().clone();
-    let deamon_dir = vault_paths.arrowhead_dir.join("deamon");
-    let autostart_dir = deamon_dir.join(AUTOSTART_DIR);
-    let paths = DeamonPaths {
+    let daemon_dir = vault_paths.arrowhead_dir.join("daemon");
+    let autostart_dir = daemon_dir.join(AUTOSTART_DIR);
+    let paths = DaemonPaths {
         arrowhead_dir: vault_paths.arrowhead_dir.clone(),
-        deamon_dir,
+        daemon_dir,
         autostart_dir: autostart_dir.clone(),
         autostart_manifest_path: autostart_dir.join(MANIFEST_FILE),
-        status_path: vault_paths.arrowhead_dir.join("deamon/status.json"),
-        socket_path: vault_paths.arrowhead_dir.join("deamon/control.sock"),
-        pid_path: vault_paths.arrowhead_dir.join("deamon/deamon.pid"),
+        status_path: vault_paths.arrowhead_dir.join("daemon/status.json"),
+        socket_path: vault_paths.arrowhead_dir.join("daemon/control.sock"),
+        pid_path: vault_paths.arrowhead_dir.join("daemon/daemon.pid"),
         log_path: vault_paths.logs_dir().join("daemon.log"),
     };
 
@@ -594,9 +594,9 @@ pub(crate) fn load_vault_environment(vault_path: &Path) -> Result<(Vault, Deamon
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DeamonPaths {
+pub(crate) struct DaemonPaths {
     pub arrowhead_dir: PathBuf,
-    pub deamon_dir: PathBuf,
+    pub daemon_dir: PathBuf,
     pub autostart_dir: PathBuf,
     pub autostart_manifest_path: PathBuf,
     pub status_path: PathBuf,
@@ -606,13 +606,13 @@ pub(crate) struct DeamonPaths {
 }
 
 #[cfg(test)]
-async fn fetch_status(paths: &DeamonPaths) -> Result<Option<DeamonStatus>> {
+async fn fetch_status(paths: &DaemonPaths) -> Result<Option<DaemonStatus>> {
     match send_control_request(&paths.socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { status }) => Ok(Some(status)),
         Ok(ControlResponse::Error { message }) => bail!(message),
         Ok(ControlResponse::ShutdownAck) => Ok(None),
         Err(err) => {
-            if let Some(status) = DeamonStatus::load_from_path(&paths.status_path)? {
+            if let Some(status) = DaemonStatus::load_from_path(&paths.status_path)? {
                 return Ok(Some(status));
             }
             if paths.socket_path.exists() {
@@ -623,7 +623,7 @@ async fn fetch_status(paths: &DeamonPaths) -> Result<Option<DeamonStatus>> {
     }
 }
 
-async fn is_socket_alive(paths: &DeamonPaths) -> Result<bool> {
+async fn is_socket_alive(paths: &DaemonPaths) -> Result<bool> {
     match send_control_request(&paths.socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { .. }) => Ok(true),
         Ok(ControlResponse::Error { .. }) => Ok(true),
@@ -632,7 +632,7 @@ async fn is_socket_alive(paths: &DeamonPaths) -> Result<bool> {
     }
 }
 
-fn auto_start_status(paths: &DeamonPaths) -> Result<AutoStartStatus> {
+fn auto_start_status(paths: &DaemonPaths) -> Result<AutoStartStatus> {
     if let Some(manager) = AutoStartManager::detect(paths.autostart_manifest_path.clone()) {
         if let Some(manifest) = manager.load_manifest()? {
             manager.query_status(&manifest)
@@ -675,12 +675,12 @@ fn print_autostart_status(status: &AutoStartStatus) {
     }
 }
 
-fn ensure_runtime_dirs(vault: &Vault, paths: &DeamonPaths) -> Result<()> {
+fn ensure_runtime_dirs(vault: &Vault, paths: &DaemonPaths) -> Result<()> {
     vault.ensure_arrowhead_dirs()?;
-    fs::create_dir_all(&paths.deamon_dir).with_context(|| {
+    fs::create_dir_all(&paths.daemon_dir).with_context(|| {
         format!(
             "failed to create indexer directory {}",
-            paths.deamon_dir.display()
+            paths.daemon_dir.display()
         )
     })?;
     fs::create_dir_all(&paths.autostart_dir).with_context(|| {
@@ -696,7 +696,7 @@ fn ensure_runtime_dirs(vault: &Vault, paths: &DeamonPaths) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_auto_start(paths: &DeamonPaths) -> Result<()> {
+fn cleanup_auto_start(paths: &DaemonPaths) -> Result<()> {
     if let Some(manager) = AutoStartManager::detect(paths.autostart_manifest_path.clone()) {
         if let Some(manifest) = manager.load_manifest()? {
             manager.uninstall(&manifest)?;
@@ -706,7 +706,7 @@ fn cleanup_auto_start(paths: &DeamonPaths) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_arrowhead_dirs(paths: &DeamonPaths) -> Result<()> {
+fn cleanup_arrowhead_dirs(paths: &DaemonPaths) -> Result<()> {
     if paths.arrowhead_dir.exists() {
         fs::remove_dir_all(&paths.arrowhead_dir)
             .with_context(|| format!("failed to remove {}", paths.arrowhead_dir.display()))?
@@ -716,12 +716,12 @@ fn cleanup_arrowhead_dirs(paths: &DeamonPaths) -> Result<()> {
 
 fn update_config_with_status(
     ctx: &mut CommandContext,
-    paths: &DeamonPaths,
-    status: Option<DeamonStatus>,
+    paths: &DaemonPaths,
+    status: Option<DaemonStatus>,
 ) -> Result<()> {
-    ctx.config.deamon.socket_path = Some(paths.socket_path.clone());
-    ctx.config.deamon.status_path = Some(paths.status_path.clone());
-    ctx.config.deamon.last_status = status.map(|value| DeamonStatusSummary {
+    ctx.config.daemon.socket_path = Some(paths.socket_path.clone());
+    ctx.config.daemon.status_path = Some(paths.status_path.clone());
+    ctx.config.daemon.last_status = status.map(|value| DaemonStatusSummary {
         updated_at: value.updated_at,
         state: value.activity.state,
         indexed_notes: value.indexed_notes,
@@ -730,8 +730,8 @@ fn update_config_with_status(
     ctx.persist()
 }
 
-fn launch_deamon_process(vault_path: &Path, embedding_model: Option<&str>) -> Result<u32> {
-    let binary = find_deamon_binary()?;
+fn launch_daemon_process(vault_path: &Path, embedding_model: Option<&str>) -> Result<u32> {
+    let binary = find_daemon_binary()?;
 
     let mut command = Command::new(binary);
     command.arg("--vault").arg(vault_path);
@@ -750,16 +750,16 @@ fn launch_deamon_process(vault_path: &Path, embedding_model: Option<&str>) -> Re
     Ok(child.id())
 }
 
-fn find_deamon_binary() -> Result<PathBuf> {
+fn find_daemon_binary() -> Result<PathBuf> {
     if let Some(path) =
-        env::var_os("ARROWHEAD_DEAMON_PATH").or_else(|| env::var_os("ARROWHEADD_PATH"))
+        env::var_os("ARROWHEAD_DAEMON_PATH").or_else(|| env::var_os("ARROWHEADD_PATH"))
     {
         return Ok(PathBuf::from(path));
     }
 
     let candidate_names = [
         format!("arrowheadd{}", std::env::consts::EXE_SUFFIX),
-        format!("arrowhead-deamon{}", std::env::consts::EXE_SUFFIX),
+        format!("arrowhead-daemon{}", std::env::consts::EXE_SUFFIX),
     ];
 
     if let Ok(current) = env::current_exe() {
@@ -782,7 +782,7 @@ fn find_deamon_binary() -> Result<PathBuf> {
         }
     }
 
-    bail!("unable to locate arrowheadd binary (set ARROWHEAD_DEAMON_PATH)")
+    bail!("unable to locate arrowheadd binary (set ARROWHEAD_DAEMON_PATH)")
 }
 
 fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
@@ -876,7 +876,7 @@ fn render_frame(frame: &StatusFrame, tty: bool) -> Result<()> {
     Ok(())
 }
 
-fn render_snapshot(status: &DeamonStatus, tty: bool) {
+fn render_snapshot(status: &DaemonStatus, tty: bool) {
     if !tty {
         println!("Updated: {}", status.updated_at.to_rfc3339());
     } else {
@@ -973,7 +973,7 @@ fn describe_issue_severity(severity: IssueSeverity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, DeamonConfig as CliDeamonConfig};
+    use crate::config::{AppConfig, DaemonConfig as CliDaemonConfig};
     use arrowhead_core::status::ActivityStatus;
     use chrono::Utc;
     use tempfile::TempDir;
@@ -986,9 +986,9 @@ mod tests {
 
         let (vault, paths) = load_vault_environment(&vault_path).expect("env");
         vault.ensure_arrowhead_dirs().expect("dirs");
-        fs::create_dir_all(&paths.deamon_dir).expect("deamon dir");
+        fs::create_dir_all(&paths.daemon_dir).expect("daemon dir");
 
-        let mut status = DeamonStatus::new(paths.log_path.clone());
+        let mut status = DaemonStatus::new(paths.log_path.clone());
         status.updated_at = Utc::now();
         status.indexed_notes = 5;
         status.activity = ActivityStatus::idle();
@@ -1010,15 +1010,15 @@ mod tests {
         let arrowhead_dir = vault_path.join(".arrowhead");
         let config_path = dir.path().join("config.toml");
 
-        fs::create_dir_all(arrowhead_dir.join("deamon")).expect("create deamon dir");
+        fs::create_dir_all(arrowhead_dir.join("daemon")).expect("create daemon dir");
         fs::create_dir_all(arrowhead_dir.join("logs")).expect("create logs dir");
         fs::write(arrowhead_dir.join("index.db"), b"test").expect("write index");
 
         let app_config = AppConfig {
             vault: Some(vault_path.clone()),
-            deamon: CliDeamonConfig {
-                socket_path: Some(arrowhead_dir.join("deamon/control.sock")),
-                status_path: Some(arrowhead_dir.join("deamon/status.json")),
+            daemon: CliDaemonConfig {
+                socket_path: Some(arrowhead_dir.join("daemon/control.sock")),
+                status_path: Some(arrowhead_dir.join("daemon/status.json")),
                 auto_start_enabled: Some(true),
                 last_status: None,
             },
@@ -1035,7 +1035,7 @@ mod tests {
             !arrowhead_dir.exists(),
             "Arrowhead directory should be removed during reset"
         );
-        assert!(ctx.config.deamon.is_empty());
+        assert!(ctx.config.daemon.is_empty());
     }
 
     #[tokio::test]
@@ -1070,8 +1070,8 @@ mod tests {
             arrowhead_dir.exists(),
             "Arrowhead directory should exist after init"
         );
-        assert!(ctx.config.deamon.socket_path.is_some());
-        assert!(ctx.config.deamon.status_path.is_some());
-        assert_eq!(ctx.config.deamon.auto_start_enabled, Some(false));
+        assert!(ctx.config.daemon.socket_path.is_some());
+        assert!(ctx.config.daemon.status_path.is_some());
+        assert_eq!(ctx.config.daemon.auto_start_enabled, Some(false));
     }
 }

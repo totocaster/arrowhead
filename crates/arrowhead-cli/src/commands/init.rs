@@ -24,10 +24,10 @@ pub struct InitCommand {
     /// Overwrite existing configuration and directories if present.
     #[arg(long)]
     pub force: bool,
-    /// Prepare the vault without starting the deamon (used for advanced setups).
+    /// Prepare the vault without starting the daemon (used for advanced setups).
     #[arg(long)]
     pub no_start: bool,
-    /// Disable semantic indexing and configure the deamon for FTS-only operation.
+    /// Disable semantic indexing and configure the daemon for FTS-only operation.
     #[arg(long)]
     pub fts_only: bool,
 }

@@ -28,7 +28,7 @@ pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolution
 pub use indexer::IndexProgressEvent;
 pub use search::{SearchConfig, SearchResult, SearchService};
 pub use status::{
-    ActivityState, ActivityStatus, DEAMON_STATUS_VERSION, DeamonStatus, DownloadState,
+    ActivityState, ActivityStatus, DAEMON_STATUS_VERSION, DaemonStatus, DownloadState,
     DownloadStatus, IssueSeverity, StatusFrame, StatusIssue,
 };
 pub use types::{IndexingStats, MetadataMap, NoteId, NoteRecord, VaultPaths};

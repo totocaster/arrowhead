@@ -1,5 +1,5 @@
 [package]
-name = "arrowhead-deamon"
+name = "arrowhead-daemon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -14,7 +14,7 @@ tests/
 │       ├── Attachments/     # Attachment directory
 │       ├── *.md             # 20 test notes
 │       └── .gitignore       # Ignores .arrowhead/ directory
-└── integration/             # Integration tests (to be created)
+└── integration/             # Integration tests (tracked on the roadmap)
 ```
 
 ## Test Vault

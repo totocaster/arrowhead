@@ -20,7 +20,7 @@ Thank you for your interest in improving Arrowhead! We aim to keep the project a
    cargo test
    ```
 
-3. Add unit tests next to the code they cover. Integration tests will be added in a future milestone—design new APIs so they remain testable when that harness arrives.
+3. Add unit tests next to the code they cover. Integration harness work is tracked on the project roadmap; design new APIs so they remain testable when that suite lands.
 4. Make sure new behaviour is documented. Update relevant sections in `README.md` or `docs/` when the user experience changes.
 
 ## Commit & PR Guidelines

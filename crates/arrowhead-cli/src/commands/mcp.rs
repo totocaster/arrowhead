@@ -367,6 +367,6 @@ fn vault_path(ctx: &CommandContext) -> Result<PathBuf> {
 fn build_runtime_options(ctx: &CommandContext, vault_path: PathBuf) -> RuntimeOptions {
     RuntimeOptions::new(vault_path)
         .with_embedding_model(ctx.config.embedding_model.clone())
-        .with_daemon_socket(ctx.config.deamon.socket_path.clone())
-        .with_daemon_status(ctx.config.deamon.status_path.clone())
+        .with_daemon_socket(ctx.config.daemon.socket_path.clone())
+        .with_daemon_status(ctx.config.daemon.status_path.clone())
 }
