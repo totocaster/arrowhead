@@ -15,6 +15,7 @@
 
 ## Workflow Expectations
 - Start complex tasks with a brief plan (2–5 steps max) and keep it up to date.
+- For MCP tooling, call `mcp.discovery.get_vault_conventions` right after initialize and before any note creation, update, or deletion so agents respect vault naming rules.
 - Stage work incrementally; validate with `cargo fmt`, `cargo check`, `cargo clippy --all-targets -- -D warnings`, and relevant tests before surfacing results or pushing.
 - Summaries must highlight behavioural changes, tests executed, and next steps. Flag known gaps or follow-up items.
 - If external dependencies require network or MSRV bumps, pause and confirm with the designer before proceeding.

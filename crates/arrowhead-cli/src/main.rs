@@ -19,7 +19,12 @@ use config::AppConfig;
 /// Arrowhead command-line interface options.
 #[derive(Debug, Parser)]
 #[command(name = "arrowhead")]
-#[command(about = "Obsidian vault search and MCP integration")]
+#[command(
+    about = "Obsidian vault search and MCP integration",
+    long_about = "Obsidian vault search and MCP integration. When exposing MCP transports, \
+                  call mcp.discovery.get_vault_conventions before any note creation, update, \
+                  or deletion so agents respect local naming rules."
+)]
 struct Cli {
     /// Path to the vault that should be used for this invocation.
     #[arg(long, value_name = "PATH", global = true)]

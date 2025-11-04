@@ -246,6 +246,7 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 
 ## MCP Tool Surface
 
+- After initialization, call `mcp.discovery.get_vault_conventions` so agents load vault naming rules, metadata expectations, and the bundled playbook before mutating notes.
 - Graph: `mcp.graph.get_context`, `mcp.graph.get_backlinks`, `mcp.graph.get_forward_links`, `mcp.graph.find_orphans`, `mcp.graph.find_unresolved`
 - Search: `mcp.search.fts`, `mcp.search.semantic`, `mcp.search.hybrid`
 - Notes: `mcp.notes.list`, `mcp.notes.read`, `mcp.notes.metadata`, `mcp.notes.create`, `mcp.notes.update`, `mcp.notes.delete`

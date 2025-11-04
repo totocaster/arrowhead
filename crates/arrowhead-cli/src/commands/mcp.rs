@@ -142,6 +142,9 @@ pub async fn run_server(ctx: &mut CommandContext, cli: &McpServerCliArgs) -> Res
             );
         }
     }
+    println!(
+        "Reminder: run mcp.discovery.get_vault_conventions before creating, updating, or deleting notes."
+    );
 
     let shutdown = async {
         if let Err(err) = signal::ctrl_c().await {

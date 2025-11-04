@@ -528,13 +528,17 @@ impl HandlerRegistry {
             list_changed: Some(false),
         };
 
-        let experimental = self.runtime.semantic_search_enabled().then(|| {
-            json!({
-                "arrowhead": {
-                    "semanticSearch": true
-                }
-            })
+        let mut arrowhead_caps = json!({
+            "requiresVaultConventions": true
         });
+        if self.runtime.semantic_search_enabled() {
+            if let Some(object) = arrowhead_caps.as_object_mut() {
+                object.insert("semanticSearch".to_string(), Value::Bool(true));
+            }
+        }
+        let experimental = Some(json!({
+            "arrowhead": arrowhead_caps
+        }));
 
         let capabilities = ServerCapabilitiesPayload {
             tools: Some(tool_capabilities),
@@ -565,9 +569,10 @@ impl HandlerRegistry {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             instructions: Some(format!(
-                "Arrowhead indexes your Obsidian vault. Use tools/list to discover search, graph, \
-                 and note-management tools. Ensure the arrowhead daemon is running for up-to-date \
-                 data. Client: {client_label}."
+                "Arrowhead indexes your Obsidian vault. Call mcp.discovery.get_vault_conventions \
+                 before creating or editing notes so agents honour local naming rules. Use \
+                 tools/list to discover search, graph, and note-management tools. Ensure the \
+                 arrowhead daemon is running for up-to-date data. Client: {client_label}."
             )),
             daemon_status,
         };
@@ -1490,33 +1495,43 @@ impl HandlerRegistry {
                 name: "notes_create".to_string(),
                 title: Some("Notes: Create".to_string()),
                 description: Some(
-                    "Create a new note; the request fails if the noteId already exists.".to_string(),
+                    "Create a new note; run Discovery: Vault Conventions first so naming and metadata match vault rules."
+                        .to_string(),
                 ),
                 input_schema: note_create_schema,
                 output_schema: Some(note_content_payload_schema.clone()),
-                annotations: Some(json!({ "method": "mcp.notes.create" })),
+                annotations: Some(json!({
+                    "method": "mcp.notes.create",
+                    "requiresVaultConventions": true
+                })),
             },
             ToolDescriptor {
                 name: "notes_update".to_string(),
                 title: Some("Notes: Update".to_string()),
                 description: Some(
-                    "Update an existing note. Supply only the fields that should change."
+                    "Update an existing note. Call Discovery: Vault Conventions first to honour vault naming and metadata expectations."
                         .to_string(),
                 ),
                 input_schema: note_update_schema,
                 output_schema: Some(note_content_payload_schema),
-                annotations: Some(json!({ "method": "mcp.notes.update" })),
+                annotations: Some(json!({
+                    "method": "mcp.notes.update",
+                    "requiresVaultConventions": true
+                })),
             },
             ToolDescriptor {
                 name: "notes_delete".to_string(),
                 title: Some("Notes: Delete".to_string()),
                 description: Some(
-                    "Delete a note. To proceed, set confirm=true; the response reports pruned paths."
+                    "Delete a note. Call Discovery: Vault Conventions first to confirm removal aligns with vault policies. To proceed, set confirm=true; the response reports pruned paths."
                         .to_string(),
                 ),
                 input_schema: note_delete_schema,
                 output_schema: Some(note_delete_payload_schema),
-                annotations: Some(json!({ "method": "mcp.notes.delete" })),
+                annotations: Some(json!({
+                    "method": "mcp.notes.delete",
+                    "requiresVaultConventions": true
+                })),
             },
             ToolDescriptor {
                 name: "discovery_get_related_notes".to_string(),
@@ -1541,14 +1556,26 @@ impl HandlerRegistry {
                 name: "discovery_get_vault_conventions".to_string(),
                 title: Some("Discovery: Vault Conventions".to_string()),
                 description: Some(
-                    "Summarise naming patterns, metadata usage, and conventions.".to_string(),
+                    "Summarise naming patterns, metadata usage, and conventions. Run this before creating, updating, or deleting notes."
+                        .to_string(),
                 ),
                 input_schema: empty_schema(),
                 output_schema: Some(vault_conventions_payload_schema),
                 annotations: Some(json!({ "method": "mcp.discovery.get_vault_conventions" })),
             },
         ];
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools.sort_by(|a, b| {
+            let priority = |name: &str| {
+                if name == "discovery_get_vault_conventions" {
+                    0
+                } else {
+                    1
+                }
+            };
+            priority(&a.name)
+                .cmp(&priority(&b.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         tools
     }
 
