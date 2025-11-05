@@ -9,6 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 1.86.0
   BIN_NAME: arrowhead
+  DAEMON_BIN_NAME: arrowheadd
 
 jobs:
   verify:
@@ -95,8 +96,9 @@ jobs:
       - name: Build release binaries
         run: |
           set -euo pipefail
-          cargo build --release --package arrowhead-cli --bin ${{ env.BIN_NAME }} --target aarch64-apple-darwin
-          cargo build --release --package arrowhead-cli --bin ${{ env.BIN_NAME }} --target x86_64-apple-darwin
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "${target}" -p arrowhead-cli -p arrowhead-daemon
+          done
 
       - name: Prepare dist artifacts
         id: package
@@ -118,6 +120,9 @@ jobs:
 
             cp "target/${target}/release/${BIN_NAME}" "${DIST_ROOT}/bin/"
             chmod 755 "${DIST_ROOT}/bin/${BIN_NAME}"
+
+            cp "target/${target}/release/${DAEMON_BIN_NAME}" "${DIST_ROOT}/bin/"
+            chmod 755 "${DIST_ROOT}/bin/${DAEMON_BIN_NAME}"
             cp README.md "${DIST_ROOT}/"
             if compgen -G "LICENSE*" >/dev/null; then
               cp LICENSE* "${DIST_ROOT}/"

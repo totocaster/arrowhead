@@ -60,7 +60,8 @@ The Arrowhead Core runtime watches your vault, streams changes into a bounded wr
 #### 1. Install Arrowhead.
 
 ```bash
-brew install arrowhead
+brew tap totocaster/tap
+brew install totocaster/tap/arrowhead
 ```
 
 #### 2. Navigate to your Obsidian vault and initialize Arrowhead.
