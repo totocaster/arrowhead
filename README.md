@@ -231,7 +231,7 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 
 - Preferred install: download the latest `arrowhead-search-<version>.alfredworkflow` from the [GitHub Releases](https://github.com/totocaster/arrowhead/releases) page and double-click to import it into Alfred.
 - Source files live under `integrations/alfred-workflow/`. Run `make alfred-workflow` to regenerate `workflow/arrowhead-search.alfredworkflow`; the packaging script syncs the bundle version with the workspace version.
-- Script Filter: `/usr/bin/python3 src/search.py` invokes `arrowhead search <mode> "<query>" --json` (default limit 15) and maps the JSON payload (`note_id`, `relative_path`, `preview`, `reason`) into Alfred items. The CLI path is auto-discovered across common install locations (`~/.local/bin`, Homebrew, `/usr/local/bin`, etc.) before surfacing an error.
+- Script Filter: `/usr/bin/python3 src/search.py` invokes `arrowhead search <mode> "<query>" --json --include-paths` (default limit 15) and maps the JSON payload (`note_id`, `relative_path`, `absolute_path`, `preview`, `reason`) into Alfred items. The CLI path is auto-discovered across common install locations (`~/.local/bin`, Homebrew, `/usr/local/bin`, etc.) before surfacing an error.
 - Run Script: `/usr/bin/python3 src/open_note.py` opens results in Obsidian by default; holding ⌘ routes to the macOS default editor (or a custom command configured via workflow variables).
 - Ensure the Arrowhead daemon is running before triggering searches. The workflow shells out to `arrowhead search <mode> --json` and opens notes in Obsidian by default (hold ⌘ to switch to the macOS default editor).
 

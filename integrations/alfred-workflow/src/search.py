@@ -153,7 +153,11 @@ def build_item(
     title = select_title(result)
     subtitle = select_subtitle(result)
     relative_path = result.get("relative_path")
-    absolute_path = resolve_absolute_path(relative_path, note_id, vault_path)
+    absolute_path_field = result.get("absolute_path")
+    if isinstance(absolute_path_field, str) and absolute_path_field.strip():
+        absolute_path = absolute_path_field.strip()
+    else:
+        absolute_path = resolve_absolute_path(relative_path, note_id, vault_path)
     reason = result.get("reason")
     copy_text = absolute_path if absolute_path else relative_path or note_id
     preview = result.get("preview")
@@ -374,6 +378,7 @@ def run_arrowhead_search(query: str, config: WorkflowConfig) -> "SearchPayload |
         "--json",
         "--limit",
         str(config.result_limit),
+        "--include-paths",
     ]
 
     if config.vault_path and "--vault" not in cmd:
