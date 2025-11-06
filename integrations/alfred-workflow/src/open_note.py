@@ -159,11 +159,18 @@ def obsidian_uri(note_path: str, vault_path: Optional[Path]) -> Optional[str]:
     except OSError:
         return None
 
-    encoded = urllib.parse.quote(str(resolved))
-    if not encoded:
+    encoded_path = urllib.parse.quote(str(resolved), safe="/")
+    if not encoded_path:
         return None
 
-    return f"obsidian://open?path={encoded}"
+    parts = [f"path={encoded_path}"]
+
+    if vault_path:
+        vault_name = vault_path.name.strip()
+        if vault_name:
+            parts.append(f"vault={urllib.parse.quote(vault_name)}")
+
+    return "obsidian://open?" + "&".join(parts)
 
 
 if __name__ == "__main__":
