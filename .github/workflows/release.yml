@@ -136,12 +136,20 @@ jobs:
 
           echo "archive_prefix=${BIN_NAME}-${VERSION}" >> "${GITHUB_OUTPUT}"
 
+      - name: Package Alfred workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          make alfred-workflow
+          cp integrations/alfred-workflow/workflow/arrowhead-search.alfredworkflow dist/arrowhead-search-"${GITHUB_REF_NAME#v}".alfredworkflow
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.archive_prefix }}
           path: |
             dist/*.tar.gz
+            dist/*.alfredworkflow
             dist/*.sha256
           if-no-files-found: error
 
@@ -213,6 +221,7 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.alfredworkflow
             dist/*.sha256
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}

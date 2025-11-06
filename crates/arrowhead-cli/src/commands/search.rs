@@ -47,6 +47,9 @@ pub struct QueryArgs {
     /// Output JSON for machine consumption.
     #[arg(long)]
     pub json: bool,
+    /// Include absolute file paths in JSON payloads (requires --json).
+    #[arg(long = "include-paths")]
+    pub include_paths: bool,
     /// Select an output format optimised for different pipelines.
     #[arg(long, value_enum, default_value_t)]
     pub format: OutputFormat,
@@ -111,7 +114,13 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
         SearchMode::Fts(args) => {
             info!(query = args.query.as_str(), limit = ?args.limit, "executing FTS search");
             let results = execute_fts_search(&service, args).await?;
-            render_results(&results, args.json, args.format, vault.as_ref())?;
+            render_results(
+                &results,
+                args.json,
+                args.include_paths,
+                args.format,
+                vault.as_ref(),
+            )?;
             Ok(())
         }
         SearchMode::Semantic(args) => {
@@ -123,7 +132,13 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
                 .search_semantic(&args.query, args.limit)
                 .await
                 .context("failed to execute semantic search")?;
-            render_results(&results, args.json, args.format, vault.as_ref())?;
+            render_results(
+                &results,
+                args.json,
+                args.include_paths,
+                args.format,
+                vault.as_ref(),
+            )?;
             Ok(())
         }
         SearchMode::Hybrid(args) => {
@@ -135,7 +150,13 @@ pub async fn run(ctx: &CommandContext, command: &SearchCommand) -> Result<()> {
                 .search_hybrid(&args.query, args.limit)
                 .await
                 .context("failed to execute hybrid search")?;
-            render_results(&results, args.json, args.format, vault.as_ref())?;
+            render_results(
+                &results,
+                args.json,
+                args.include_paths,
+                args.format,
+                vault.as_ref(),
+            )?;
             Ok(())
         }
     }
@@ -211,14 +232,19 @@ impl Default for OutputFormat {
 fn render_results(
     results: &[SearchResult],
     json_output: bool,
+    include_paths: bool,
     format: OutputFormat,
     vault: &Vault,
 ) -> Result<()> {
+    if include_paths && !json_output {
+        bail!("--include-paths requires --json");
+    }
+
     if json_output {
         let payload: Vec<_> = results
             .iter()
             .map(|result| {
-                json!({
+                let mut object = json!({
                     "note_id": result.note_id,
                     "title": result.title,
                     "score": result.score,
@@ -227,7 +253,20 @@ fn render_results(
                     "preview": result.preview,
                     "reason": result.reason,
                     "metadata": result.metadata,
-                })
+                });
+
+                if include_paths {
+                    if let Some(path) = note_absolute_path(vault, result) {
+                        if let serde_json::Value::Object(ref mut map) = object {
+                            map.insert(
+                                "absolute_path".to_string(),
+                                json!(path.display().to_string()),
+                            );
+                        }
+                    }
+                }
+
+                object
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -335,6 +374,7 @@ mod tests {
                 query: "category:reference".to_string(),
                 limit: Some(5),
                 json: false,
+                include_paths: false,
                 format: OutputFormat::default(),
             }),
         };
@@ -399,6 +439,7 @@ mod tests {
                 query: "category:reference".to_string(),
                 limit: Some(5),
                 json: false,
+                include_paths: false,
                 format: OutputFormat::default(),
             }),
         };

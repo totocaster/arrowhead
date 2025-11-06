@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>bundleid</key>
+	<string>co.ttvl.arrowhead.alfred.workflow</string>
+	<key>category</key>
+	<string>Productivity</string>
+	<key>connections</key>
+	<dict>
+		<key>0D76F5B3-6B7A-4F25-9F1C-33AC09C4E970</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>D3C31A34-4DC6-4C3A-82B1-79D34ACF3411</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+	</dict>
+	<key>createdby</key>
+	<string>Toto Tvalavadze</string>
+	<key>description</key>
+	<string>Search Notes using Arrowhead and open them directly from Alfred.</string>
+	<key>disabled</key>
+	<false/>
+	<key>name</key>
+	<string>Arrowhead Search</string>
+	<key>objects</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>alfredfiltersresults</key>
+				<false/>
+				<key>alfredfiltersresultsmatchmode</key>
+				<integer>0</integer>
+				<key>argumenttreatemptyqueryasnil</key>
+				<false/>
+				<key>argumenttrimmode</key>
+				<integer>0</integer>
+				<key>argumenttype</key>
+				<integer>1</integer>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>keyword</key>
+				<string>n</string>
+				<key>queuedelaycustom</key>
+				<integer>3</integer>
+				<key>queuedelayimmediatelyinitially</key>
+				<true/>
+				<key>queuedelaymode</key>
+				<integer>0</integer>
+				<key>queuemode</key>
+				<integer>1</integer>
+				<key>runningsubtext</key>
+				<string>Searching Arrowhead...</string>
+				<key>script</key>
+				<string>/usr/bin/python3 src/search.py "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string>src/search.py</string>
+				<key>subtext</key>
+				<string>Hybrid Arrowhead search with Alfred results.</string>
+				<key>title</key>
+				<string>Arrowhead Notes</string>
+				<key>type</key>
+				<integer>5</integer>
+				<key>withspace</key>
+				<true/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.input.scriptfilter</string>
+			<key>uid</key>
+			<string>0D76F5B3-6B7A-4F25-9F1C-33AC09C4E970</string>
+			<key>version</key>
+			<integer>3</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>68</integer>
+				<key>script</key>
+				<string>/usr/bin/python3 src/open_note.py "$1"</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string>src/open_note.py</string>
+				<key>type</key>
+				<integer>5</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>D3C31A34-4DC6-4C3A-82B1-79D34ACF3411</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+	</array>
+	<key>readme</key>
+	<string>Type `n` followed by a query to execute Arrowhead CLI search and browse notes from Alfred. Use workflow configuration to switch search modes, adjust the result limit, and choose which editor opens on Return.</string>
+	<key>uidata</key>
+	<dict>
+		<key>0D76F5B3-6B7A-4F25-9F1C-33AC09C4E970</key>
+		<dict>
+			<key>xpos</key>
+			<real>30.0</real>
+			<key>ypos</key>
+			<real>190.0</real>
+		</dict>
+		<key>D3C31A34-4DC6-4C3A-82B1-79D34ACF3411</key>
+		<dict>
+			<key>xpos</key>
+			<real>230.0</real>
+			<key>ypos</key>
+			<real>190.0</real>
+		</dict>
+	</dict>
+	<key>userconfigurationconfig</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>hybrid</string>
+				<key>pairs</key>
+				<array>
+					<array>
+						<string>Hybrid (balanced)</string>
+						<string>hybrid</string>
+					</array>
+					<array>
+						<string>Full-text (fastest)</string>
+						<string>fts</string>
+					</array>
+					<array>
+						<string>Semantic (vector)</string>
+						<string>semantic</string>
+					</array>
+				</array>
+			</dict>
+			<key>description</key>
+			<string>Select which Arrowhead search strategy the Script Filter invokes.</string>
+			<key>label</key>
+			<string>Search mode</string>
+			<key>type</key>
+			<string>popupbutton</string>
+			<key>variable</key>
+			<string>SEARCH_MODE</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>15</string>
+				<key>placeholder</key>
+				<string>15</string>
+				<key>required</key>
+				<false/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>Maximum results requested from `arrowhead search`.</string>
+			<key>label</key>
+			<string>Result limit</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>RESULT_LIMIT</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>obsidian</string>
+				<key>pairs</key>
+				<array>
+					<array>
+						<string>Obsidian (default)</string>
+						<string>obsidian</string>
+					</array>
+					<array>
+						<string>System default editor</string>
+						<string>default</string>
+					</array>
+				</array>
+			</dict>
+			<key>description</key>
+			<string>Editor used when hitting Return on a result.</string>
+			<key>label</key>
+			<string>Primary editor</string>
+			<key>type</key>
+			<string>popupbutton</string>
+			<key>variable</key>
+			<string>PRIMARY_EDITOR</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string></string>
+				<key>placeholder</key>
+				<string>/path/to/vault</string>
+				<key>required</key>
+				<false/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>Optional override for the Arrowhead vault path. Leave blank to use the CLI config.</string>
+			<key>label</key>
+			<string>Vault path</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>VAULT_PATH</string>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>default</key>
+				<string>arrowhead</string>
+				<key>placeholder</key>
+				<string>arrowhead</string>
+				<key>required</key>
+				<false/>
+				<key>trim</key>
+				<true/>
+			</dict>
+			<key>description</key>
+			<string>Executable invoked for Arrowhead CLI searches.</string>
+			<key>label</key>
+			<string>Arrowhead CLI path</string>
+			<key>type</key>
+			<string>textfield</string>
+			<key>variable</key>
+			<string>ARROWHEAD_CLI_PATH</string>
+		</dict>
+	</array>
+	<key>variables</key>
+	<dict>
+		<key>ARROWHEAD_CLI_PATH</key>
+		<string>arrowhead</string>
+		<key>PRIMARY_EDITOR</key>
+		<string>obsidian</string>
+		<key>RESULT_LIMIT</key>
+		<string>15</string>
+		<key>SEARCH_MODE</key>
+		<string>hybrid</string>
+		<key>VAULT_PATH</key>
+		<string></string>
+	</dict>
+	<key>variablesdontexport</key>
+	<array/>
+	<key>version</key>
+	<string>0.1.0</string>
+	<key>webaddress</key>
+	<string>https://github.com/totocaster/arrowhead</string>
+</dict>
+</plist>
