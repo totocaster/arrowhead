@@ -14,6 +14,7 @@ import os
 import shlex
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -36,7 +37,11 @@ def main() -> None:
 
     editor = normalise_editor(os.environ.get("open_editor"))
     if editor == "obsidian":
-        command = ["open", "-b", "md.obsidian", note_path]
+        uri = obsidian_uri(note_path, vault_path)
+        if uri:
+            command = ["open", uri]
+        else:
+            command = ["open", "-b", "md.obsidian", note_path]
     elif editor == "default":
         command = ["open", note_path]
     else:
@@ -146,6 +151,19 @@ def normalise_editor(raw: Optional[str]) -> str:
     if editor in {"obsidian", "default"}:
         return editor
     return editor
+
+
+def obsidian_uri(note_path: str, vault_path: Optional[Path]) -> Optional[str]:
+    try:
+        resolved = Path(note_path).resolve(strict=False)
+    except OSError:
+        return None
+
+    encoded = urllib.parse.quote(str(resolved))
+    if not encoded:
+        return None
+
+    return f"obsidian://open?path={encoded}"
 
 
 if __name__ == "__main__":

@@ -89,6 +89,6 @@ Ready-to-install build: `workflow/arrowhead-search.alfredworkflow`. Double-click
 ## Implementation Notes
 
 - `src/search.py` shells out to `arrowhead search --json --include-paths`, enriches PATH with common install locations (`~/.local/bin`, Homebrew, etc.), and auto-detects the CLI path before surfacing errors.
-- `src/open_note.py` resolves absolute paths and opens notes in Obsidian by default (⌘ routes to the macOS default editor or custom command).
+- `src/open_note.py` resolves absolute paths and opens notes via `obsidian://open?path=…` (⌘ routes to the macOS default editor or custom command).
 - Workflow variables expose search mode, result limit, editor choice, vault override, and CLI override.
 - `make alfred-workflow` (via `scripts/package-alfred-workflow.sh`) regenerates `workflow/arrowhead-search.alfredworkflow` and syncs its version with the workspace package. The GitHub release workflow ships the bundle alongside macOS binaries.
