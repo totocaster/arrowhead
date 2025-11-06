@@ -13,7 +13,7 @@ BIN_DIR := $(PREFIX)/bin
 CARGO_LOCKED := $(if $(filter 0,$(LOCKED)),,--locked)
 CARGO_FORCE := $(if $(filter 1,$(FORCE)),--force,)
 
-.PHONY: install clean alfred-workflow
+.PHONY: install clean alfred-workflow raycast-extension
 install:
 	@set -euo pipefail; \
 	BIN_DIR="$(BIN_DIR)"; \
@@ -65,9 +65,13 @@ clean:
 alfred-workflow:
 	@bash scripts/package-alfred-workflow.sh
 
+raycast-extension:
+	@bash scripts/package-raycast-extension.sh
+
 .PHONY: help
 help:
 	@printf 'Available targets:\n'
 	@printf '  install    Build and install arrowhead-cli and arrowheadd (override PREFIX, LOCKED=0, FORCE=1 as needed)\n'
 	@printf '  clean      Remove target artifacts via cargo clean\n'
 	@printf '  alfred-workflow  Package integrations/alfred-workflow into workflow/arrowhead-search.alfredworkflow\n'
+	@printf '  raycast-extension  Package integrations/raycast-extension into dist/arrowhead-search.raycast\n'

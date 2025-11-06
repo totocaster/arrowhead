@@ -1,0 +1,104 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "arrowhead",
+  "title": "Arrowhead Search",
+  "description": "Query Arrowhead notes directly from Raycast and open them in Obsidian or your default editor.",
+  "version": "0.1.0",
+  "icon": "assets/icon.png",
+  "author": "Arrowhead",
+  "categories": [
+    "Productivity"
+  ],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "search",
+      "title": "Search Arrowhead Notes",
+      "description": "Run Arrowhead CLI searches from Raycast.",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "searchMode",
+      "type": "dropdown",
+      "title": "Search Mode",
+      "description": "Choose which Arrowhead search strategy to run.",
+      "required": true,
+      "default": "hybrid",
+      "data": [
+        {
+          "title": "Hybrid (balanced)",
+          "value": "hybrid"
+        },
+        {
+          "title": "Full-text (fastest)",
+          "value": "fts"
+        },
+        {
+          "title": "Semantic (vector)",
+          "value": "semantic"
+        }
+      ]
+    },
+    {
+      "name": "resultLimit",
+      "type": "textfield",
+      "title": "Result Limit",
+      "description": "Maximum number of results to request from Arrowhead.",
+      "placeholder": "15",
+      "required": false,
+      "default": "15"
+    },
+    {
+      "name": "primaryEditor",
+      "type": "dropdown",
+      "title": "Primary Editor",
+      "description": "Editor opened when hitting Return.",
+      "required": true,
+      "default": "obsidian",
+      "data": [
+        {
+          "title": "Obsidian",
+          "value": "obsidian"
+        },
+        {
+          "title": "System Default",
+          "value": "default"
+        }
+      ]
+    },
+    {
+      "name": "vaultPath",
+      "type": "textfield",
+      "title": "Vault Path Override",
+      "description": "Optional path to an Arrowhead-compatible vault. Leave blank to read Arrowhead config.",
+      "placeholder": "/Users/you/Documents/Notes",
+      "required": false
+    },
+    {
+      "name": "arrowheadCliPath",
+      "type": "textfield",
+      "title": "Arrowhead CLI Path",
+      "description": "Override path for the Arrowhead CLI if it is not on PATH.",
+      "placeholder": "/usr/local/bin/arrowhead",
+      "required": false
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.103.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.10",
+    "@types/react": "^17.0.43",
+    "@types/react-dom": "^17.0.20",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "typescript": "^4.3.5"
+  },
+  "scripts": {
+    "build": "ray build --environment dist --output build",
+    "lint": "ray lint",
+    "dev": "ray develop"
+  }
+}

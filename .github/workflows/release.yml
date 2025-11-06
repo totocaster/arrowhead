@@ -140,8 +140,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p dist
           make alfred-workflow
           cp integrations/alfred-workflow/workflow/arrowhead-search.alfredworkflow dist/arrowhead-search-"${GITHUB_REF_NAME#v}".alfredworkflow
+
+      - name: Package Raycast extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          make raycast-extension
+          cp integrations/raycast-extension/dist/arrowhead-search.raycast dist/arrowhead-search-"${GITHUB_REF_NAME#v}".raycast
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -150,6 +159,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.alfredworkflow
+            dist/*.raycast
             dist/*.sha256
           if-no-files-found: error
 
@@ -222,6 +232,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.alfredworkflow
+            dist/*.raycast
             dist/*.sha256
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}

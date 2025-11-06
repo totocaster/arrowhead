@@ -235,6 +235,13 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 - Run Script: `/usr/bin/python3 src/open_note.py` opens results in Obsidian by default; holding ⌘ routes to the macOS default editor (or a custom command configured via workflow variables).
 - Ensure the Arrowhead daemon is running before triggering searches. The workflow shells out to `arrowhead search <mode> --json` and opens notes in Obsidian by default (hold ⌘ to switch to the macOS default editor).
 
+## Raycast Extension Integration
+
+- Preferred install: download the latest `arrowhead-search-<version>.raycast` archive from [GitHub Releases](https://github.com/totocaster/arrowhead/releases) and import it via **Raycast → Extensions → Import Extension…**.
+- Source lives under `integrations/raycast-extension/`. Run `make raycast-extension` to regenerate `dist/arrowhead-search.raycast`; the script runs `npm ci`, executes `ray build --environment dist --output build`, and zips the build artifacts for distribution.
+- The `search` command shells out to `arrowhead search <mode> "<query>" --json --include-paths`, debounces input (300 ms), and renders results with Obsidian/default editor actions plus copy and “Reveal in Finder” shortcuts.
+- Vault detection mirrors the Alfred integration: honours `VAULT_PATH`/`ARROWHEAD_VAULT_PATH`, falls back to parsing `config.toml`, and resolves absolute note paths when the CLI payload omits them.
+
 ## CLI Reference
 
 - `arrowhead init` — bootstrap a vault, seed configuration, and offer auto-start registration when requested.
