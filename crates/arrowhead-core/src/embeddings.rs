@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    fmt, fs,
+    fmt, fs, mem,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
 };
@@ -650,6 +650,40 @@ impl EmbeddingStore {
         Ok(())
     }
 
+    /// Retrieve the stored embedding vector for a note, when available.
+    pub async fn vector_for_note(&self, note_id: &str) -> Result<Option<Vec<f32>>> {
+        let database = Arc::clone(&self.database);
+        let note_id = note_id.to_string();
+        let model_id = self.model_id.clone();
+        let dimension = self.dimension;
+
+        let blob = task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let conn = database
+                .connection()
+                .context("failed to open SQLite connection for embedding fetch")?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT vector FROM {EMBEDDING_TABLE_NAME} \
+                 WHERE note_id = ?1 AND model = ?2 \
+                 LIMIT 1"
+            ))?;
+            let blob: Option<Vec<u8>> = stmt
+                .query_row(params![&note_id, &model_id], |row| row.get(0))
+                .optional()?;
+            Ok(blob)
+        })
+        .await
+        .context("embedding fetch task aborted")??;
+
+        match blob {
+            Some(bytes) => {
+                let vector = blob_to_vector(&bytes, dimension)?;
+                ensure_dimension(&vector, dimension)?;
+                Ok(Some(vector))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Execute a cosine similarity search via sqlite-vec.
     pub async fn search(
         &self,
@@ -813,6 +847,26 @@ fn vector_to_blob(vector: &[f32]) -> Vec<u8> {
     vector.as_bytes().to_vec()
 }
 
+fn blob_to_vector(blob: &[u8], dimension: usize) -> Result<Vec<f32>> {
+    let expected = dimension * mem::size_of::<f32>();
+    if blob.len() != expected {
+        bail!(
+            "embedding blob size mismatch: expected {} bytes, got {}",
+            expected,
+            blob.len()
+        );
+    }
+
+    let mut vector = Vec::with_capacity(dimension);
+    for chunk in blob.chunks_exact(mem::size_of::<f32>()) {
+        let bytes: [u8; 4] = chunk
+            .try_into()
+            .map_err(|_| anyhow!("failed to decode embedding chunk"))?;
+        vector.push(f32::from_ne_bytes(bytes));
+    }
+    Ok(vector)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,6 +919,38 @@ mod tests {
             .await?;
         let after = store.search(&base_vector, 5, 0.3).await?;
         assert!(after.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vector_for_note_returns_stored_vector() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path)?);
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+
+        let timestamp = Utc::now();
+        let vector = unit_vector(descriptor.dimension(), 0.75);
+        let record = EmbeddingRecord {
+            note_id: "note-1".to_string(),
+            vector: vector.clone(),
+            indexed_at: timestamp,
+        };
+        store.upsert_embeddings(&[record]).await?;
+
+        let loaded = store
+            .vector_for_note("note-1")
+            .await?
+            .expect("vector present");
+        assert_eq!(loaded.len(), vector.len());
+        for (expected, actual) in vector.iter().zip(loaded.iter()) {
+            assert!((expected - actual).abs() <= f32::EPSILON);
+        }
+
+        let missing = store.vector_for_note("missing").await?;
+        assert!(missing.is_none());
+
         Ok(())
     }
 

@@ -203,6 +203,9 @@ arrowhead graph backlinks "Project Hub" --format ids
 # CRUD helpers + graph analytics
 arrowhead notes list --json
 arrowhead graph context "Project Hub"
+# Discovery helpers
+arrowhead notes similar "Photography Equipment"
+arrowhead notes surprise "Project Hub" --limit 3 --json
 
 # Tail structured logs
 tail -f /path/to/vault/.arrowhead/logs/cli.log
@@ -241,7 +244,7 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 - `arrowhead index <subcommand>` — manage the background indexer (`start`, `stop`, `restart`, `status`, `autostart`).
 - `arrowhead vault <subcommand>` — inspect filesystem state or reset Arrowhead caches (`status`, `reset`).
 - `arrowhead search` — execute FTS, semantic, or hybrid searches with pipe-friendly output formats.
-- `arrowhead notes` — perform note CRUD operations and metadata inspection.
+- `arrowhead notes` — perform note CRUD operations, metadata inspection, and semantic discovery (`notes similar` / `notes surprise`).
 - `arrowhead graph` — inspect backlinks, forward links, orphans, unresolved links, or combined context views (`--json` emits machine-readable payloads).
 - `arrowhead --mcp[(-server)]` — launch the stdio or HTTP MCP transport with shared handlers, token auth, CIDR filtering, and `/health` readiness probes.
 
