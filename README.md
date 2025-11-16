@@ -179,6 +179,7 @@ arrowhead init --vault /path/to/vault [--embeddings fast|good|better|none] [--ft
 # Launch or check the background indexer
 arrowhead index start
 arrowhead index status
+# Interactive TUI output; add --json for machine-readable frames.
 
 # Manage auto-start registration (per-user launchd/systemd)
 arrowhead index autostart enable

@@ -391,6 +391,8 @@ async fn handle_restart(ctx: &mut CommandContext, args: &IndexStartArgs) -> Resu
     handle_start(ctx, args).await
 }
 
+mod status_ui;
+
 async fn handle_status(ctx: &CommandContext, args: &IndexStatusArgs) -> Result<()> {
     let vault_path = resolve_vault_path(ctx)?;
     let vault = Vault::new(VaultConfig::new(vault_path.clone()))?;
@@ -400,29 +402,33 @@ async fn handle_status(ctx: &CommandContext, args: &IndexStatusArgs) -> Result<(
     let socket_path = paths.arrowhead_dir.join("daemon/control.sock");
     let status_path = paths.arrowhead_dir.join("daemon/status.json");
     let stdout_is_tty = io::stdout().is_terminal();
+    let snapshot = DaemonStatus::load_from_path(&status_path)?;
 
     match status_stream(&socket_path).await {
         Ok(mut stream) => {
-            if !args.json {
+            if !args.json && !stdout_is_tty {
                 println!(
                     "Streaming indexer status from {} (Ctrl+C to exit).\n",
                     socket_path.display()
                 );
             }
-            stream_frames(&mut stream, args.json, stdout_is_tty).await
+            stream_frames(&mut stream, args, stdout_is_tty, snapshot.clone()).await
         }
         Err(err) => {
-            let snapshot = DaemonStatus::load_from_path(&status_path)?;
             if let Some(status) = snapshot {
                 if args.json {
                     let frame = StatusFrame::new(status);
                     println!("{}", serde_json::to_string(&frame)?);
                 } else {
-                    println!(
-                        "Indexer stream unavailable ({}). Showing latest snapshot.\n",
-                        err
-                    );
-                    render_snapshot(&status, stdout_is_tty);
+                    if stdout_is_tty {
+                        status_ui::run_status_ui(None, Some(status)).await?;
+                    } else {
+                        println!(
+                            "Indexer stream unavailable ({}). Showing latest snapshot.\n",
+                            err
+                        );
+                        render_snapshot(&status, stdout_is_tty);
+                    }
                 }
                 Ok(())
             } else {
@@ -830,12 +836,21 @@ async fn wait_for_socket_removal(path: &Path, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-async fn stream_frames(stream: &mut StatusStream, json: bool, tty: bool) -> Result<()> {
+async fn stream_frames(
+    stream: &mut StatusStream,
+    args: &IndexStatusArgs,
+    tty: bool,
+    initial_status: Option<DaemonStatus>,
+) -> Result<()> {
+    if !args.json && tty {
+        return status_ui::run_status_ui(Some(stream), initial_status).await;
+    }
+
     loop {
         tokio::select! {
             biased;
             _ = signal::ctrl_c() => {
-                if !json {
+                if !args.json {
                     println!("\nReceived Ctrl+C. Stopping status stream.");
                 }
                 break;
@@ -843,14 +858,14 @@ async fn stream_frames(stream: &mut StatusStream, json: bool, tty: bool) -> Resu
             frame = stream.next() => {
                 match frame? {
                     Some(frame) => {
-                        if json {
+                        if args.json {
                             println!("{}", serde_json::to_string(&frame)?);
                         } else {
                             render_frame(&frame, tty)?;
                         }
                     }
                     None => {
-                        if !json {
+                        if !args.json {
                             println!("Indexer closed the status stream.");
                         }
                         break;
@@ -943,7 +958,7 @@ fn render_snapshot(status: &DaemonStatus, tty: bool) {
     println!();
 }
 
-fn describe_activity(state: ActivityState) -> &'static str {
+pub(super) fn describe_activity(state: ActivityState) -> &'static str {
     match state {
         ActivityState::Idle => "idle",
         ActivityState::Indexing => "indexing",
@@ -953,7 +968,7 @@ fn describe_activity(state: ActivityState) -> &'static str {
     }
 }
 
-fn describe_download_state(state: DownloadState) -> &'static str {
+pub(super) fn describe_download_state(state: DownloadState) -> &'static str {
     match state {
         DownloadState::Pending => "pending",
         DownloadState::InProgress => "in-progress",
@@ -962,7 +977,7 @@ fn describe_download_state(state: DownloadState) -> &'static str {
     }
 }
 
-fn describe_issue_severity(severity: IssueSeverity) -> &'static str {
+pub(super) fn describe_issue_severity(severity: IssueSeverity) -> &'static str {
     match severity {
         IssueSeverity::Info => "info",
         IssueSeverity::Warning => "warning",
