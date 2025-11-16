@@ -419,16 +419,14 @@ async fn handle_status(ctx: &CommandContext, args: &IndexStatusArgs) -> Result<(
                 if args.json {
                     let frame = StatusFrame::new(status);
                     println!("{}", serde_json::to_string(&frame)?);
+                } else if stdout_is_tty {
+                    status_ui::run_status_ui(None, Some(status)).await?;
                 } else {
-                    if stdout_is_tty {
-                        status_ui::run_status_ui(None, Some(status)).await?;
-                    } else {
-                        println!(
-                            "Indexer stream unavailable ({}). Showing latest snapshot.\n",
-                            err
-                        );
-                        render_snapshot(&status, stdout_is_tty);
-                    }
+                    println!(
+                        "Indexer stream unavailable ({}). Showing latest snapshot.\n",
+                        err
+                    );
+                    render_snapshot(&status, stdout_is_tty);
                 }
                 Ok(())
             } else {
