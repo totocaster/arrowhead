@@ -18,6 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     IndexingStats, NoteRecord, Vault,
+    blocking::BlockingPool,
     embeddings::{EmbeddingPipeline, EmbeddingRecord},
     graph::{LinkReason, LinkResolutionRecord, normalise_link_lookup},
     metadata::{MetadataExtraction, MetadataExtractor, WikiLink},
@@ -64,12 +65,17 @@ enum WriterResult {
 }
 
 /// Configuration options shared by the indexing pipeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct IndexerConfig {
     /// Whether to force reindexing every note regardless of modification time.
     pub force: bool,
     /// Number of worker tasks to spawn when parallelising indexing.
     pub parallelism: usize,
+    /// Optional bounded blocking pool for CPU-intensive work.
+    ///
+    /// When provided, the indexer uses this pool instead of `spawn_blocking`,
+    /// preventing unbounded thread growth during large indexing operations.
+    pub blocking_pool: Option<BlockingPool>,
 }
 
 impl Default for IndexerConfig {
@@ -77,7 +83,16 @@ impl Default for IndexerConfig {
         Self {
             force: false,
             parallelism: num_cpus::get().clamp(1, 16),
+            blocking_pool: None,
         }
+    }
+}
+
+impl IndexerConfig {
+    /// Set the blocking pool to use for CPU-intensive work.
+    pub fn with_blocking_pool(mut self, pool: BlockingPool) -> Self {
+        self.blocking_pool = Some(pool);
+        self
     }
 }
 
@@ -373,17 +388,29 @@ impl Indexer {
                                 .await
                         }
                         Ok(None) => {
+                            // Handle missing note - use blocking pool if available
                             let dispatcher =
                                 tracing::dispatcher::get_default(|current| current.clone());
                             let indexer_clone = indexer.clone();
                             let write_clone = write_sender.clone();
-                            tokio::task::spawn_blocking(move || {
-                                tracing::dispatcher::with_default(&dispatcher, || {
-                                    indexer_clone.handle_missing_note(note_id.clone(), write_clone)
+                            if let Some(pool) = &indexer.config.blocking_pool {
+                                pool.execute_result(move || {
+                                    tracing::dispatcher::with_default(&dispatcher, || {
+                                        indexer_clone
+                                            .handle_missing_note(note_id.clone(), write_clone)
+                                    })
                                 })
-                            })
-                            .await
-                            .map_err(|err| anyhow!("indexing task panicked: {err}"))?
+                                .await?
+                            } else {
+                                tokio::task::spawn_blocking(move || {
+                                    tracing::dispatcher::with_default(&dispatcher, || {
+                                        indexer_clone
+                                            .handle_missing_note(note_id.clone(), write_clone)
+                                    })
+                                })
+                                .await
+                                .map_err(|err| anyhow!("indexing task panicked: {err}"))?
+                            }
                         }
                         Err(err) => Err(err),
                     };
@@ -527,13 +554,25 @@ impl Indexer {
     ) -> Result<NoteProcessing> {
         let indexer = self.clone();
         let dispatch = tracing::dispatcher::get_default(|current| current.clone());
-        task::spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
-                indexer.process_note(&entry, &resolution, &index_states, &write_tx)
+
+        // Use the bounded blocking pool if available, otherwise fall back to spawn_blocking.
+        // The bounded pool prevents thread explosion during large indexing operations.
+        if let Some(pool) = &self.config.blocking_pool {
+            pool.execute_result(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    indexer.process_note(&entry, &resolution, &index_states, &write_tx)
+                })
             })
-        })
-        .await
-        .context("indexing task panicked")?
+            .await
+        } else {
+            task::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    indexer.process_note(&entry, &resolution, &index_states, &write_tx)
+                })
+            })
+            .await
+            .context("indexing task panicked")?
+        }
     }
 
     fn process_note(
@@ -717,8 +756,10 @@ async fn run_writer(
     let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
 
     while let Some(WriteJob { op, ack }) = rx.recv().await {
-        let db = Arc::clone(&database);
-        let blocking_result = tokio::task::spawn_blocking(move || -> Result<WriterResult> {
+        // Use block_in_place instead of spawn_blocking to avoid creating new threads
+        // for each write operation. Since this task is dedicated to writing, blocking
+        // here is acceptable and prevents thread pool growth.
+        let blocking_result = tokio::task::block_in_place(|| -> Result<WriterResult> {
             match op {
                 WriteOperation::Upsert(prepared) => {
                     let PreparedNote {
@@ -728,17 +769,15 @@ async fn run_writer(
                         indexed_at,
                         embedding,
                     } = prepared;
-                    db.upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
+                    database.upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
                     Ok(WriterResult::Upsert { embedding })
                 }
                 WriteOperation::Remove { note_id } => {
-                    let existed = db.remove_note(&note_id)?;
+                    let existed = database.remove_note(&note_id)?;
                     Ok(WriterResult::Remove { existed })
                 }
             }
-        })
-        .await
-        .map_err(|err| anyhow!("writer worker panicked: {err}"))?;
+        });
 
         match blocking_result {
             Ok(WriterResult::Upsert { embedding }) => {

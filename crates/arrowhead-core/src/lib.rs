@@ -12,6 +12,7 @@
 
 #![warn(missing_docs)]
 
+pub mod blocking;
 pub mod embeddings;
 pub mod graph;
 pub mod indexer;
@@ -24,6 +25,7 @@ pub mod types;
 pub mod vault;
 
 // Re-export commonly used types for convenience across crates.
+pub use blocking::BlockingPool;
 pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolutionRecord};
 pub use indexer::IndexProgressEvent;
 pub use search::{SearchConfig, SearchResult, SearchService};

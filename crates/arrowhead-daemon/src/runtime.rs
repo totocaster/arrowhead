@@ -8,6 +8,7 @@ use std::{
 
 use crate::logging::LoggingGuard;
 use anyhow::{Context, Result, anyhow};
+use arrowhead_core::BlockingPool;
 use arrowhead_core::embeddings::EmbeddingDescriptor;
 use arrowhead_core::embeddings::EmbeddingPipeline;
 use arrowhead_core::indexer::{Indexer, IndexerConfig};
@@ -217,6 +218,7 @@ impl DaemonHandle {
 struct DaemonRuntime {
     config: DaemonConfig,
     indexer: Option<Arc<Indexer>>,
+    blocking_pool: BlockingPool,
     status: Arc<Mutex<DaemonStatus>>,
     frame_tx: broadcast::Sender<StatusFrame>,
     _watcher: WatcherHandle,
@@ -237,6 +239,14 @@ impl DaemonRuntime {
 
         let logging_guard = crate::logging::init_logging(&config.log_path)?;
 
+        // Create a bounded blocking pool for CPU-intensive work.
+        // This prevents unbounded thread growth during indexing operations.
+        let blocking_pool = BlockingPool::new().context("failed to create blocking thread pool")?;
+        info!(
+            thread_count = blocking_pool.thread_count(),
+            "initialised bounded blocking pool for indexing"
+        );
+
         let status_snapshot = DaemonStatus::new(config.log_path.clone());
         status_snapshot.save_to_path(&config.status_path)?;
         let status = Arc::new(Mutex::new(status_snapshot.clone()));
@@ -247,6 +257,7 @@ impl DaemonRuntime {
         Ok(Self {
             config,
             indexer: None,
+            blocking_pool,
             status,
             frame_tx,
             _watcher: watcher,
@@ -439,10 +450,18 @@ impl DaemonRuntime {
             self.frame_tx.clone(),
         )
         .await?;
+
+        // Configure the indexer with the bounded blocking pool to prevent thread explosion
+        let indexer_config = self
+            .config
+            .indexer_config
+            .clone()
+            .with_blocking_pool(self.blocking_pool.clone());
+
         self.indexer = Some(Arc::new(Indexer::new(
             Arc::clone(&self.config.vault),
             Arc::clone(&self.config.database),
-            self.config.indexer_config.clone(),
+            indexer_config,
             embeddings,
         )));
         Ok(())
