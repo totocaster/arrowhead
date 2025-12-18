@@ -594,7 +594,9 @@ impl HandlerRegistry {
     }
 
     async fn handle_tools_call(&self, request: Request) -> Result<Value, ProtocolError> {
-        let CallToolParams { name, arguments } = request.params.deserialize()?;
+        let CallToolParams {
+            name, arguments, ..
+        } = request.params.deserialize()?;
         let method = resolve_tool_method(&name)
             .map(str::to_owned)
             .or_else(|| {
@@ -773,7 +775,7 @@ impl HandlerRegistry {
         });
         let note_create_schema = json!({
             "type": "object",
-            "description": "Parameters for creating a new note. Provide either noteId or title; the identifier becomes the filename.",
+            "description": "Parameters for creating a new note. Arrowhead requires either noteId or title, and falls back to title-based IDs when noteId is omitted.",
             "additionalProperties": false,
             "properties": {
                 "noteId": note_id_field_schema.clone(),
@@ -794,11 +796,7 @@ impl HandlerRegistry {
                     "examples": ["# Arrowhead CLI\n\n- [ ] Ship MCP tooling"]
                 },
                 "metadata": metadata_map_schema()
-            },
-            "anyOf": [
-                { "required": ["noteId"] },
-                { "required": ["title"] }
-            ]
+            }
         });
         let note_update_schema = json!({
             "type": "object",
@@ -837,7 +835,7 @@ impl HandlerRegistry {
         });
         let related_notes_schema = json!({
             "type": "object",
-            "description": "Return notes related to an anchor note or free-form query.",
+            "description": "Return notes related to an anchor note or free-form query. Provide either noteId or query; Arrowhead rejects requests that omit both.",
             "additionalProperties": false,
             "properties": {
                 "noteId": note_id_field_schema.clone(),
@@ -859,13 +857,6 @@ impl HandlerRegistry {
                     "default": "auto",
                     "description": "Strategy hint controlling which signals to prioritise."
                 }
-            },
-            "anyOf": [
-                { "required": ["noteId"] },
-                { "required": ["query"] }
-            ],
-            "not": {
-                "required": ["noteId", "query"]
             }
         });
 

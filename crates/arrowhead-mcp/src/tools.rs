@@ -723,6 +723,10 @@ pub struct CallToolParams {
     #[serde(default)]
     /// Arguments supplied to the tool invocation.
     pub arguments: serde_json::Map<String, Value>,
+    #[serde(default, rename = "_meta")]
+    #[allow(dead_code)]
+    /// Undocumented metadata field sent by some hosts; ignored for compatibility.
+    pub meta: Option<Value>,
 }
 
 /// Text content block returned from tool invocations.
