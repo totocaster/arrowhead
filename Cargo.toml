@@ -45,7 +45,8 @@ r2d2 = "0.8.10"
 r2d2_sqlite = "0.31.0"
 
 # Vector dependencies
-fastembed = "5.2.0"
+# Pin fastembed to 5.2.0 because newer releases pull image/zune-jpeg combos that fail on stable CI.
+fastembed = "=5.2.0"
 ndarray = "0.16.1"
 sqlite-vec = "0.1.6"
 zerocopy = "0.7"
