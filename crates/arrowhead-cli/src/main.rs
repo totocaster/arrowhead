@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
 mod autostart;
@@ -36,10 +36,10 @@ struct Cli {
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
     /// Start the MCP stdio server instead of running a CLI subcommand.
-    #[arg(long, conflicts_with = "command", conflicts_with = "mcp_server")]
+    #[arg(long, conflicts_with = "mcp_server")]
     mcp: bool,
     /// Start the MCP HTTP server.
-    #[arg(long, conflicts_with = "command", conflicts_with = "mcp")]
+    #[arg(long, conflicts_with = "mcp")]
     mcp_server: bool,
     /// Options controlling MCP HTTP server behaviour.
     #[command(flatten)]
@@ -70,11 +70,19 @@ fn init_tracing(verbosity: u8) {
     logging::init_base_tracing(verbosity);
 }
 
+fn validate_cli(cli: &Cli) -> Result<()> {
+    if (cli.mcp || cli.mcp_server) && cli.command.is_some() {
+        bail!("--mcp/--mcp-server cannot be used with subcommands");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     init_tracing(cli.verbose);
+    validate_cli(&cli)?;
 
     let mut config = AppConfig::load(cli.config.clone())?;
     if let Some(vault) = cli.vault.clone() {
@@ -125,4 +133,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn mcp_flags_conflict_with_subcommands() {
+        let cli = Cli::try_parse_from(["arrowhead", "--mcp", "index", "status"])
+            .expect("parse mcp + subcommand");
+        assert!(validate_cli(&cli).is_err());
+
+        let cli = Cli::try_parse_from(["arrowhead", "--mcp-server", "index", "status"])
+            .expect("parse mcp-server + subcommand");
+        assert!(validate_cli(&cli).is_err());
+    }
 }

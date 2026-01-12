@@ -37,7 +37,7 @@ pub enum NoteAction {
     /// Delete a note.
     Delete(DeleteArgs),
     /// Find semantically similar notes.
-    #[command(alias = "surprise", visible_alias = "surprise")]
+    #[command(visible_alias = "surprise")]
     Similar(SimilarArgs),
 }
 

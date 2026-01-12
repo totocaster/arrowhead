@@ -541,12 +541,17 @@ impl Vault {
             .with_context(|| format!("failed to read note {}", entry.absolute_path.display()))?;
 
         let (frontmatter_str, body) = split_frontmatter(&raw);
-        let metadata = parse_frontmatter(frontmatter_str).with_context(|| {
-            format!(
-                "invalid frontmatter in note {}",
-                entry.relative_path.display()
-            )
-        })?;
+        let (metadata, body) = match parse_frontmatter(frontmatter_str) {
+            Ok(metadata) => (metadata, body),
+            Err(err) => {
+                warn!(
+                    note = %entry.relative_path.display(),
+                    error = ?err,
+                    "invalid frontmatter detected; treating note as plain text"
+                );
+                (MetadataMap::default(), raw.as_str())
+            }
+        };
 
         let title = derive_title(&metadata, body);
 
@@ -708,6 +713,25 @@ mod tests {
             .inventory_entry_for_path(&missing)
             .expect("inventory entry lookup");
         assert!(entry.is_none());
+    }
+
+    #[test]
+    fn load_note_with_invalid_frontmatter_falls_back_to_plain_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let note_path = dir.path().join("Broken.md");
+        fs::write(
+            &note_path,
+            "---\nrelated: [[A]], [[B]]\n---\n\n# Title\nBody\n",
+        )
+        .expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let note = vault.load_note("Broken").expect("load note");
+
+        assert!(note.metadata.is_empty());
+        assert!(note.content.contains("related: [[A]], [[B]]"));
+        assert!(note.content.contains("# Title"));
     }
 
     #[test]
