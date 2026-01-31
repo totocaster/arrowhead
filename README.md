@@ -77,7 +77,7 @@ When you initialise a non-Obsidian workspace, Arrowhead writes `.arrowhead/works
 
 #### 3. Start using Arrowhead.
 
-* CLI: Use the CLI when working with coding agents that have terminal access (Claude Code, Codex CLI) for the best performance.
+* CLI: Use the CLI when working with coding agents that have terminal access (local Claude Code instances, OpenClaw, Codex CLI) for the best performance.
 * MCP: Use the MCP client for local or remote AI agent instances such as Claude.app. 
 
 To configure a local MCP client, add this snippet:
@@ -108,6 +108,10 @@ arrowhead --mcp-server --bind 0.0.0.0:3911 --allow 10.0.0.0/8 --token $ARROWHEAD
 The server enforces bearer headers by default. In link-token mode
 (`--auth-mode link-token`) clients without header support can call
 `POST /rpc/<token>`; combine with HTTPS via a reverse proxy for production.
+
+### Agent compatibility
+
+Arrowhead’s CLI and MCP transports integrate cleanly with [OpenClaw](https://openclaw.ai/), so you can point its workspace runner at your local vault and get semantic search plus graph tooling without extra glue code. Local Claude Code sessions benefit as well: launch `arrowhead init` inside the vault, keep the daemon running, and the agent inherits fast search + discovery commands out of the box.
 
 ## Workspace configuration
 
