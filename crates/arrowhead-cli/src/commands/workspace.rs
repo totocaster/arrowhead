@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use arrowhead_core::{
-    workspace::{load_workspace_file, write_workspace_file, WorkspaceFile, WORKSPACE_CONFIG_FILE},
     Vault, VaultConfig,
+    workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, load_workspace_file, write_workspace_file},
 };
 
 use super::{CommandContext, index};
@@ -103,9 +103,7 @@ fn handle_show(ctx: &CommandContext) -> Result<()> {
         Some(file) => {
             println!(
                 "Configured attachments directory: {}",
-                file.attachments_dir
-                    .as_deref()
-                    .unwrap_or("<not set>")
+                file.attachments_dir.as_deref().unwrap_or("<not set>")
             );
             if file.ignored_folders.is_empty() {
                 println!("Ignored folders: <none>");
@@ -125,7 +123,11 @@ fn handle_show(ctx: &CommandContext) -> Result<()> {
         }
         None => println!(
             "Workspace config: {} (missing)",
-            vault.paths().arrowhead_dir.join(WORKSPACE_CONFIG_FILE).display()
+            vault
+                .paths()
+                .arrowhead_dir
+                .join(WORKSPACE_CONFIG_FILE)
+                .display()
         ),
     }
 
@@ -134,13 +136,18 @@ fn handle_show(ctx: &CommandContext) -> Result<()> {
 
 fn handle_set(ctx: &CommandContext, command: &WorkspaceSetCommand) -> Result<()> {
     if !command.has_mutations() {
-        bail!("no workspace settings were provided; use --attachments-dir/--ignore/... to update values");
+        bail!(
+            "no workspace settings were provided; use --attachments-dir/--ignore/... to update values"
+        );
     }
 
     let vault_path = index::resolve_vault_path(ctx)?;
     let obsidian_dir = vault_path.join(".obsidian");
     if obsidian_dir.exists() {
-        bail!("Obsidian metadata detected at {}. Edit settings inside Obsidian instead of using `arrowhead workspace`.", obsidian_dir.display());
+        bail!(
+            "Obsidian metadata detected at {}. Edit settings inside Obsidian instead of using `arrowhead workspace`.",
+            obsidian_dir.display()
+        );
     }
 
     let arrowhead_dir = vault_path.join(".arrowhead");
@@ -238,11 +245,17 @@ mod tests {
             link_style: None,
             clear_link_style: false,
         };
-        assert!(!cmd.has_mutations(), "empty command should report no mutations");
+        assert!(
+            !cmd.has_mutations(),
+            "empty command should report no mutations"
+        );
 
         let mut mutated = cmd.clone();
         mutated.attachments_dir = Some(PathBuf::from("Assets"));
-        assert!(mutated.has_mutations(), "attachments dir counts as mutation");
+        assert!(
+            mutated.has_mutations(),
+            "attachments dir counts as mutation"
+        );
     }
 
     #[test]
@@ -266,10 +279,7 @@ mod tests {
             file.ignored_folders,
             vec!["Drafts".to_string(), "Private".to_string()]
         );
-        assert_eq!(
-            file.daily_note_format.as_deref(),
-            Some("YYYY-MM-DD")
-        );
+        assert_eq!(file.daily_note_format.as_deref(), Some("YYYY-MM-DD"));
         assert_eq!(file.link_style.as_deref(), Some("relative"));
     }
 
