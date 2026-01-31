@@ -22,6 +22,7 @@ pub mod sqlite;
 pub mod status;
 pub mod types;
 pub mod vault;
+pub mod workspace;
 
 // Re-export commonly used types for convenience across crates.
 pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolutionRecord};
@@ -33,3 +34,4 @@ pub use status::{
 };
 pub use types::{IndexingStats, MetadataMap, NoteId, NoteRecord, VaultPaths};
 pub use vault::{InventorySnapshot, Vault, VaultConfig, VaultSettings};
+pub use workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, WorkspaceKind, WorkspaceSource};

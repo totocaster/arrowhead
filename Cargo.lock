@@ -187,6 +187,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "toml 0.9.9+spec-1.0.0",
  "tracing",
  "zerocopy 0.7.35",
 ]

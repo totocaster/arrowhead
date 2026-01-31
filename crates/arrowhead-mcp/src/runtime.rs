@@ -17,6 +17,7 @@ use arrowhead_core::{
     VaultConfig, VaultPaths,
     sqlite::IndexDatabase,
     status::{DaemonStatus, IssueSeverity, StatusIssue},
+    workspace::WorkspaceKind,
 };
 use arrowhead_daemon::{ControlRequest, ControlResponse, send_control_request};
 use chrono::Utc;
@@ -29,7 +30,7 @@ use crate::tools::{
     AgentsPlaybookPayload, MetadataCommonValue, MetadataFieldStats, MetadataValueKind,
     NamingPatternSummary, NoteListItem, ObsidianSettingsPayload, RelatedNotePayload,
     RelatedNotesPayload, RelatedNotesStrategy, StyleGuidePayload, VaultConventionsPayload,
-    VaultStatsPayload,
+    VaultStatsPayload, WorkspaceSettingsPayload,
 };
 
 use arrowhead_core::SearchResult;
@@ -377,12 +378,14 @@ impl McpRuntime {
         let naming_patterns = detect_naming_patterns(&entries);
         let metadata_fields = aggregate_metadata_fields(&metadata_map);
         let style_guide = self.load_style_guide().await?;
-        let obsidian = build_obsidian_settings(self.vault.as_ref());
+        let workspace = build_workspace_settings(self.vault.as_ref());
+        let obsidian = build_obsidian_settings_legacy(self.vault.as_ref());
 
         Ok(VaultConventionsPayload {
             naming_patterns,
             metadata_fields,
             obsidian,
+            workspace,
             style_guide,
             agents_playbook: Some(load_agents_playbook()),
         })
@@ -838,20 +841,59 @@ fn sort_value_kinds(kinds: &mut [MetadataValueKind]) {
     kinds.sort_by_key(order);
 }
 
-fn build_obsidian_settings(vault: &Vault) -> Option<ObsidianSettingsPayload> {
+fn build_workspace_settings(vault: &Vault) -> Option<WorkspaceSettingsPayload> {
     let attachments = vault.settings().attachments_folder().map(PathBuf::from);
     let ignored = vault.settings().ignored_folders().to_vec();
+    let daily_note_format = vault.settings().daily_note_format().map(str::to_string);
+    let link_style = vault.settings().link_style().map(str::to_string);
 
-    if attachments.is_none() && ignored.is_empty() {
-        None
-    } else {
-        Some(ObsidianSettingsPayload {
-            attachments_folder: attachments,
-            ignored_folders: ignored,
-            daily_note_format: None,
-            link_style: None,
-        })
+    if attachments.is_none()
+        && ignored.is_empty()
+        && daily_note_format.is_none()
+        && link_style.is_none()
+    {
+        return None;
     }
+
+    let kind = match vault.workspace_kind() {
+        WorkspaceKind::Obsidian => "obsidian",
+        WorkspaceKind::Generic => "generic",
+    }
+    .to_string();
+
+    Some(WorkspaceSettingsPayload {
+        kind,
+        attachments_folder: attachments,
+        ignored_folders: ignored,
+        daily_note_format,
+        link_style,
+    })
+}
+
+fn build_obsidian_settings_legacy(vault: &Vault) -> Option<ObsidianSettingsPayload> {
+    if !matches!(vault.workspace_kind(), WorkspaceKind::Obsidian) {
+        return None;
+    }
+
+    let attachments = vault.settings().attachments_folder().map(PathBuf::from);
+    let ignored = vault.settings().ignored_folders().to_vec();
+    let daily_note_format = vault.settings().daily_note_format().map(str::to_string);
+    let link_style = vault.settings().link_style().map(str::to_string);
+
+    if attachments.is_none()
+        && ignored.is_empty()
+        && daily_note_format.is_none()
+        && link_style.is_none()
+    {
+        return None;
+    }
+
+    Some(ObsidianSettingsPayload {
+        attachments_folder: attachments,
+        ignored_folders: ignored,
+        daily_note_format,
+        link_style,
+    })
 }
 
 fn build_similarity_query(note: &NoteRecord) -> String {
