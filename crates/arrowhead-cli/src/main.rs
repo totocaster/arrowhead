@@ -13,7 +13,7 @@ mod config;
 mod logging;
 
 use commands::mcp::McpServerCliArgs;
-use commands::{CommandContext, graph, index, init, mcp, notes, search, vault};
+use commands::{CommandContext, graph, index, init, mcp, notes, search, vault, workspace};
 use config::AppConfig;
 
 /// Arrowhead command-line interface options.
@@ -64,6 +64,8 @@ enum Commands {
     Index(index::IndexCommand),
     /// Vault utility commands.
     Vault(vault::VaultCommand),
+    /// Manage Arrowhead workspace metadata for non-Obsidian directories.
+    Workspace(workspace::WorkspaceCommand),
 }
 
 fn init_tracing(verbosity: u8) {
@@ -129,6 +131,9 @@ async fn main() -> Result<()> {
         }
         Commands::Vault(command) => {
             vault::run(&mut ctx, &command).await?;
+        }
+        Commands::Workspace(command) => {
+            workspace::run(&mut ctx, &command).await?;
         }
     }
 

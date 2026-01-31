@@ -5,6 +5,7 @@ use std::{
 };
 
 use arrowhead_core::status::DaemonStatus;
+use arrowhead_core::workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, write_workspace_file};
 use arrowhead_mcp::{
     handlers::HandlerRegistry,
     protocol::{Params, ProtocolError, Request},
@@ -28,6 +29,25 @@ fn copy_fixture() -> TempDir {
     let target = temp_dir.path();
     let source = fixture_vault_dir();
     copy_dir_recursive(&source, target).expect("copy fixture vault");
+    temp_dir
+}
+
+fn copy_fixture_generic() -> TempDir {
+    let temp_dir = copy_fixture();
+    let obsidian_dir = temp_dir.path().join(".obsidian");
+    if obsidian_dir.exists() {
+        fs::remove_dir_all(&obsidian_dir).expect("remove obsidian metadata");
+    }
+    let arrowhead_dir = temp_dir.path().join(".arrowhead");
+    fs::create_dir_all(&arrowhead_dir).expect("create arrowhead dir");
+    let file = WorkspaceFile {
+        attachments_dir: Some("Attachments".to_string()),
+        ignored_folders: vec!["Drafts".to_string()],
+        daily_note_format: Some("YYYY-MM-DD".to_string()),
+        link_style: Some("relative".to_string()),
+    };
+    write_workspace_file(&arrowhead_dir.join(WORKSPACE_CONFIG_FILE), &file)
+        .expect("write workspace config");
     temp_dir
 }
 
@@ -373,6 +393,47 @@ async fn discovery_vault_conventions_returns_patterns() {
         agents_content.contains("Arrowhead Coding Agent Playbook"),
         "expected agents playbook content"
     );
+
+    let workspace = structured
+        .get("workspace")
+        .and_then(Value::as_object)
+        .expect("workspace payload present");
+    assert_eq!(
+        workspace.get("kind").and_then(Value::as_str),
+        Some("obsidian")
+    );
+    assert!(
+        structured.get("obsidian").is_some(),
+        "legacy obsidian payload should remain for compatibility"
+    );
+}
+
+#[tokio::test]
+async fn discovery_vault_conventions_reports_generic_workspace_metadata() {
+    let temp_dir = copy_fixture_generic();
+    let handler = build_handler(&temp_dir).await;
+
+    let structured =
+        call_tool_structured(&handler, "discovery_get_vault_conventions", json!({})).await;
+
+    assert!(
+        structured.get("obsidian").is_none(),
+        "generic workspaces should omit obsidian payload"
+    );
+    let workspace = structured
+        .get("workspace")
+        .and_then(Value::as_object)
+        .expect("workspace payload present");
+    assert_eq!(
+        workspace.get("kind").and_then(Value::as_str),
+        Some("generic")
+    );
+    let ignored = workspace
+        .get("ignoredFolders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(ignored.iter().any(|value| value == "Drafts"));
 }
 
 #[tokio::test]

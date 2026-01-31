@@ -40,6 +40,7 @@ specification.
 - Vault-aware features must respect detected Obsidian settings (e.g.
   `.obsidian/app.json` ignore filters, attachment directories) and surface them
   through the `VaultSettings` APIs.
+- Generic Markdown workspaces configure those same options via `.arrowhead/workspace.toml`; keep the schema updated if you add new vault-scoped settings, and expose any new knobs through `arrowhead workspace show/set` so non-Obsidian users stay unblocked.
 ## 5. Documentation & Communication
 - Update the specs/design docs in `docs/` after significant milestones or
   architecture shifts.

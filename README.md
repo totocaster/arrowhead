@@ -49,6 +49,7 @@ The Arrowhead Core runtime watches your vault, streams changes into a bounded wr
 
 - Background daemon with live filesystem watching and bounded persistence queue.
 - Vault-aware indexing that respects `.obsidian` settings, templates, and ignore lists.
+- Generic Markdown workspace support via `.arrowhead/workspace.toml`, with automatic fallbacks to Obsidian settings when present.
 - Full-text, semantic, and hybrid search with snippet generation and metadata filters.
 - Notes CRUD, graph analytics, and discovery helpers via CLI or MCP tool surface.
 - HTTP MCP transport with bearer/link-token authentication, CIDR allowlists, and `/health` readiness probes.
@@ -71,6 +72,8 @@ arrowhead init
 ```
 
 This command launches and registers the indexer, which watches your files and keeps the index ready to use. Initial indexing might take some time depending on your vault size; run `arrowhead index status` to monitor progress.
+
+When you initialise a non-Obsidian workspace, Arrowhead writes `.arrowhead/workspace.toml` to capture attachments, ignored folders, daily note format, and preferred link style. Use flags such as `--attachments-dir`, `--ignore`, `--daily-note-format`, and `--link-style` during `arrowhead init` to pre-populate those values; Obsidian vaults continue to pull the same data from `.obsidian`. You can inspect or tweak these settings later with `arrowhead workspace show` and `arrowhead workspace set`.
 
 #### 3. Start using Arrowhead.
 
@@ -105,6 +108,17 @@ arrowhead --mcp-server --bind 0.0.0.0:3911 --allow 10.0.0.0/8 --token $ARROWHEAD
 The server enforces bearer headers by default. In link-token mode
 (`--auth-mode link-token`) clients without header support can call
 `POST /rpc/<token>`; combine with HTTPS via a reverse proxy for production.
+
+## Workspace configuration
+
+Arrowhead still prefers `.obsidian` metadata when it exists, but any plain Markdown directory can be configured by editing `.arrowhead/workspace.toml`. The file stores the same levers we usually read from Obsidian:
+
+- `attachments_dir`: relative folder where binary assets live.
+- `ignored_folders`: directories that should be skipped during indexing.
+- `daily_note_format`: file-name template for daily notes (e.g., `YYYY-MM-DD`).
+- `link_style`: preferred link behaviour (e.g., `relative`, `absolute`, `shortest`).
+
+Running `arrowhead init --attachments-dir Assets --ignore Drafts --daily-note-format "YYYY-MM-DD"` populates these values automatically. Later adjustments don’t require a destructive re-initialisation—use `arrowhead workspace set --ignore Drafts --ignore Private` (and optional `--clear-*` flags) to update the TOML in place. If both `.obsidian` and `.arrowhead/workspace.toml` exist, Arrowhead logs a warning and sticks with the Obsidian settings so you always match what the editor expects.
 
 ### Memory footprint
 

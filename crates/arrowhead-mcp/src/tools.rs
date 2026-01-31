@@ -528,7 +528,27 @@ pub struct AgentsPlaybookPayload {
     pub content: String,
 }
 
-/// Subset of Obsidian settings relevant to conventions tooling.
+/// Workspace configuration surfaced to conventions tooling.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceSettingsPayload {
+    /// Workspace flavour (e.g., `obsidian` or `generic`).
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Attachments directory relative to the vault root.
+    pub attachments_folder: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// User-defined ignore list derived from Obsidian preferences.
+    pub ignored_folders: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Daily note file name template if configured.
+    pub daily_note_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Preferred internal link style (e.g., with or without file extension).
+    pub link_style: Option<String>,
+}
+
+/// Legacy Obsidian-specific payload retained for backward compatibility.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObsidianSettingsPayload {
@@ -555,8 +575,11 @@ pub struct VaultConventionsPayload {
     /// Aggregated metadata field statistics.
     pub metadata_fields: Vec<MetadataFieldStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Snapshot of Obsidian settings useful for reasoning about note structure.
+    /// Legacy Obsidian-specific payload retained for older clients.
     pub obsidian: Option<ObsidianSettingsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Snapshot of workspace settings useful for reasoning about note structure.
+    pub workspace: Option<WorkspaceSettingsPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional user-authored style guide surfaced to agents.
     pub style_guide: Option<StyleGuidePayload>,

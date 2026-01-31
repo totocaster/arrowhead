@@ -1272,9 +1272,35 @@ impl HandlerRegistry {
             },
             "additionalProperties": false
         });
+        let workspace_settings_schema = json!({
+            "type": "object",
+            "description": "Workspace configuration relevant to conventions analysis.",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "Workspace flavour (e.g., obsidian or generic)."
+                },
+                "attachmentsFolder": path_schema("Attachments directory relative to the vault root."),
+                "ignoredFolders": {
+                    "type": "array",
+                    "description": "User-defined ignore list derived from workspace preferences.",
+                    "items": path_schema("Folder ignored by workspace configuration."),
+                    "default": []
+                },
+                "dailyNoteFormat": {
+                    "type": "string",
+                    "description": "Daily note file name template if configured."
+                },
+                "linkStyle": {
+                    "type": "string",
+                    "description": "Preferred internal link style (e.g., with or without file extension)."
+                }
+            },
+            "additionalProperties": false
+        });
         let obsidian_settings_schema = json!({
             "type": "object",
-            "description": "Subset of Obsidian settings relevant to conventions analysis.",
+            "description": "Legacy Obsidian metadata retained for backward compatibility.",
             "properties": {
                 "attachmentsFolder": path_schema("Attachments directory relative to the vault root."),
                 "ignoredFolders": {
@@ -1310,6 +1336,7 @@ impl HandlerRegistry {
                     "items": metadata_field_stats_schema
                 },
                 "obsidian": obsidian_settings_schema,
+                "workspace": workspace_settings_schema,
                 "styleGuide": style_guide_schema
             },
             "additionalProperties": false

@@ -11,8 +11,10 @@ pub mod index;
 pub mod init;
 pub mod mcp;
 pub mod notes;
+pub mod paths;
 pub mod search;
 pub mod vault;
+pub mod workspace;
 
 /// Shared context passed to command implementations.
 #[derive(Debug, Clone)]

@@ -22,6 +22,9 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::types::VaultPaths;
+use crate::workspace::{
+    WORKSPACE_CONFIG_FILE, WorkspaceFile, WorkspaceKind, WorkspaceSource, load_workspace_file,
+};
 use crate::{MetadataMap, NoteId, NoteRecord};
 
 /// Lightweight description of a note discovered during vault inventory.
@@ -192,6 +195,8 @@ impl VaultConfig {
 pub struct VaultSettings {
     attachments_folder: Option<PathBuf>,
     ignored_folders: Vec<PathBuf>,
+    daily_note_format: Option<String>,
+    link_style: Option<String>,
 }
 
 impl VaultSettings {
@@ -204,6 +209,16 @@ impl VaultSettings {
     pub fn ignored_folders(&self) -> &[PathBuf] {
         &self.ignored_folders
     }
+
+    /// Daily note format if configured.
+    pub fn daily_note_format(&self) -> Option<&str> {
+        self.daily_note_format.as_deref()
+    }
+
+    /// Preferred link style if configured.
+    pub fn link_style(&self) -> Option<&str> {
+        self.link_style.as_deref()
+    }
 }
 
 /// Lightweight accessor for an Obsidian vault.
@@ -211,6 +226,8 @@ impl VaultSettings {
 pub struct Vault {
     paths: Arc<VaultPaths>,
     settings: Arc<VaultSettings>,
+    workspace_kind: WorkspaceKind,
+    workspace_source: WorkspaceSource,
 }
 
 impl Vault {
@@ -229,8 +246,37 @@ impl Vault {
 
         let arrowhead_dir = config.resolve_arrowhead_dir();
         let obsidian_dir = root.join(".obsidian");
+        let workspace_file_path = arrowhead_dir.join(WORKSPACE_CONFIG_FILE);
+        let obsidian_present = obsidian_dir.exists();
 
-        let mut settings = load_obsidian_settings(&obsidian_dir);
+        let arrowhead_settings = load_arrowhead_workspace_settings(&workspace_file_path)?;
+
+        let (workspace_kind, workspace_source, mut settings) = if obsidian_present {
+            if arrowhead_settings.is_some() {
+                warn!(
+                    obsidian = %obsidian_dir.display(),
+                    workspace = %workspace_file_path.display(),
+                    "found Obsidian metadata and Arrowhead workspace config; preferring Obsidian settings"
+                );
+            }
+            (
+                WorkspaceKind::Obsidian,
+                WorkspaceSource::Obsidian(obsidian_dir.clone()),
+                load_obsidian_settings(&obsidian_dir),
+            )
+        } else if let Some(file_settings) = arrowhead_settings {
+            (
+                WorkspaceKind::Generic,
+                WorkspaceSource::Arrowhead(workspace_file_path.clone()),
+                file_settings,
+            )
+        } else {
+            (
+                WorkspaceKind::Generic,
+                WorkspaceSource::Default,
+                VaultSettings::default(),
+            )
+        };
         if let Some(config_attachments) = &config.attachments_dir {
             if let Some(relative) = normalise_relative_path(config_attachments.as_path()) {
                 settings.attachments_folder = Some(relative);
@@ -261,6 +307,8 @@ impl Vault {
             arrowhead_dir = %arrowhead_dir.display(),
             attachments_dir = attachments_dir_display.as_str(),
             ignored_folders = ignored_summary.as_str(),
+            workspace_kind = ?workspace_kind,
+            workspace_source = ?workspace_source,
             "initialised vault configuration"
         );
 
@@ -272,6 +320,8 @@ impl Vault {
                 attachments_dir,
             )),
             settings: Arc::new(settings),
+            workspace_kind,
+            workspace_source,
         })
     }
 
@@ -283,6 +333,16 @@ impl Vault {
     /// Access the loaded Obsidian settings.
     pub fn settings(&self) -> &VaultSettings {
         &self.settings
+    }
+
+    /// Identify which workspace flavour is active.
+    pub fn workspace_kind(&self) -> WorkspaceKind {
+        self.workspace_kind
+    }
+
+    /// Describe the configuration source backing the current workspace.
+    pub fn workspace_source(&self) -> &WorkspaceSource {
+        &self.workspace_source
     }
 
     /// Ensure the Arrowhead working directory exists inside the vault.
@@ -576,6 +636,7 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, write_workspace_file};
     use chrono::TimeZone;
 
     fn fixture_root() -> PathBuf {
@@ -745,6 +806,93 @@ mod tests {
                 .any(|id| id.starts_with("Templates") || id.contains("Meeting Template"))
         );
     }
+
+    #[test]
+    fn generic_workspace_uses_arrowhead_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".arrowhead")).expect("arrowhead dir");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let file = WorkspaceFile {
+            attachments_dir: Some("Assets".to_string()),
+            ignored_folders: vec!["Private".to_string()],
+            daily_note_format: Some("YYYY-MM-DD".to_string()),
+            link_style: Some("absolute".to_string()),
+        };
+        let workspace_path = dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE);
+        write_workspace_file(&workspace_path, &file).expect("write workspace file");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        assert_eq!(vault.workspace_kind(), WorkspaceKind::Generic);
+        assert_eq!(
+            vault.settings().attachments_folder(),
+            Some(Path::new("Assets"))
+        );
+        assert_eq!(
+            vault.settings().ignored_folders(),
+            &[PathBuf::from("Private")]
+        );
+        assert_eq!(vault.settings().daily_note_format(), Some("YYYY-MM-DD"));
+        assert_eq!(vault.settings().link_style(), Some("absolute"));
+    }
+
+    #[test]
+    fn obsidian_settings_take_precedence_over_arrowhead_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let obsidian_dir = dir.path().join(".obsidian");
+        fs::create_dir_all(&obsidian_dir).expect("obsidian dir");
+        fs::write(
+            obsidian_dir.join("app.json"),
+            r#"{
+  "attachmentFolderPath": "Attachments",
+  "userIgnoreFilters": ["Templates/"]
+}"#,
+        )
+        .expect("write app.json");
+
+        fs::create_dir_all(dir.path().join(".arrowhead")).expect("arrowhead dir");
+        let file = WorkspaceFile {
+            attachments_dir: Some("Assets".to_string()),
+            ..WorkspaceFile::default()
+        };
+        write_workspace_file(
+            &dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE),
+            &file,
+        )
+        .expect("write workspace file");
+
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        assert_eq!(vault.workspace_kind(), WorkspaceKind::Obsidian);
+        assert_eq!(
+            vault.settings().attachments_folder(),
+            Some(Path::new("Attachments"))
+        );
+        assert_eq!(
+            vault.settings().ignored_folders(),
+            &[PathBuf::from("Templates")]
+        );
+    }
+
+    #[test]
+    fn obsidian_daily_note_format_is_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let obsidian_dir = dir.path().join(".obsidian");
+        fs::create_dir_all(&obsidian_dir).expect("obsidian dir");
+        fs::write(
+            obsidian_dir.join("daily-notes.json"),
+            r#"{"format": "YYYY/[week]WW"}"#,
+        )
+        .expect("write daily notes config");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        assert_eq!(vault.settings().daily_note_format(), Some("YYYY/[week]WW"));
+    }
 }
 
 fn collect_markdown_files(
@@ -877,6 +1025,8 @@ fn derive_note_id(path: &Path) -> Result<NoteId> {
 struct ObsidianAppConfig {
     #[serde(rename = "attachmentFolderPath")]
     attachment_folder_path: Option<String>,
+    #[serde(rename = "newLinkFormat")]
+    new_link_format: Option<String>,
     #[serde(rename = "userIgnoreFilters")]
     user_ignore_filters: Option<Vec<String>>,
 }
@@ -891,6 +1041,12 @@ fn load_obsidian_settings(obsidian_dir: &Path) -> VaultSettings {
                 if let Some(folder) = app.attachment_folder_path {
                     if let Some(relative) = normalise_relative_str(&folder) {
                         settings.attachments_folder = Some(relative);
+                    }
+                }
+
+                if let Some(link_style) = app.new_link_format {
+                    if let Some(normalised) = normalise_string_field(&link_style) {
+                        settings.link_style = Some(normalised);
                     }
                 }
 
@@ -914,10 +1070,97 @@ fn load_obsidian_settings(obsidian_dir: &Path) -> VaultSettings {
         }
     }
 
+    if let Some(format) = load_obsidian_daily_note_format(obsidian_dir) {
+        settings.daily_note_format = Some(format);
+    }
+
     settings
 }
 
-pub(crate) fn normalise_relative_str(value: &str) -> Option<PathBuf> {
+fn load_arrowhead_workspace_settings(path: &Path) -> Result<Option<VaultSettings>> {
+    let file = match load_workspace_file(path)? {
+        Some(file) => file,
+        None => return Ok(None),
+    };
+    Ok(Some(settings_from_workspace_file(file)))
+}
+
+fn settings_from_workspace_file(file: WorkspaceFile) -> VaultSettings {
+    let mut settings = VaultSettings::default();
+
+    if let Some(folder) = file.attachments_dir {
+        if let Some(relative) = normalise_relative_str(&folder) {
+            settings.attachments_folder = Some(relative);
+        }
+    }
+
+    let mut ignored = Vec::new();
+    for filter in file.ignored_folders {
+        if let Some(relative) = normalise_relative_str(&filter) {
+            ignored.push(relative);
+        }
+    }
+    ignored.sort();
+    ignored.dedup();
+    settings.ignored_folders = ignored;
+
+    if let Some(format) = file.daily_note_format {
+        settings.daily_note_format = normalise_string_field(&format);
+    }
+
+    if let Some(link_style) = file.link_style {
+        settings.link_style = normalise_string_field(&link_style);
+    }
+
+    settings
+}
+
+fn load_obsidian_daily_note_format(obsidian_dir: &Path) -> Option<String> {
+    let daily_notes_path = obsidian_dir.join("daily-notes.json");
+    match fs::read_to_string(&daily_notes_path) {
+        Ok(content) => match serde_json::from_str::<ObsidianDailyNotesConfig>(&content) {
+            Ok(config) => config
+                .format
+                .and_then(|value| normalise_string_field(&value)),
+            Err(err) => {
+                warn!(
+                    path = %daily_notes_path.display(),
+                    error = %err,
+                    "failed to parse Obsidian daily-notes.json"
+                );
+                None
+            }
+        },
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    path = %daily_notes_path.display(),
+                    error = %err,
+                    "failed to read Obsidian daily note settings"
+                );
+            }
+            None
+        }
+    }
+}
+
+fn normalise_string_field(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ObsidianDailyNotesConfig {
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// Normalise a relative path string by trimming whitespace and removing redundant separators.
+pub fn normalise_relative_str(value: &str) -> Option<PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -931,14 +1174,15 @@ pub(crate) fn normalise_relative_str(value: &str) -> Option<PathBuf> {
     normalise_relative_path(Path::new(trimmed))
 }
 
-pub(crate) fn normalise_relative_path(path: &Path) -> Option<PathBuf> {
+/// Normalise a relative [`Path`] by removing prefixes, `.` segments, and `..` escapes.
+pub fn normalise_relative_path(path: &Path) -> Option<PathBuf> {
     let mut cleaned = PathBuf::new();
 
     for component in path.components() {
         match component {
-            Component::Prefix(_) | Component::RootDir => continue,
+            Component::Prefix(_) | Component::RootDir => return None,
             Component::CurDir => continue,
-            Component::ParentDir => continue,
+            Component::ParentDir => return None,
             Component::Normal(part) => cleaned.push(part),
         }
     }
