@@ -203,6 +203,15 @@ impl IndexDatabase {
         Ok(ids)
     }
 
+    /// Return the number of notes currently stored in the index.
+    pub fn note_count(&self) -> Result<u64> {
+        let conn = self.connection()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .context("failed to count notes")?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Load resolution hints to support WikiLink matching (titles and aliases).
     pub fn link_resolution_maps(&self) -> Result<LinkResolutionMaps> {
         let conn = self.connection()?;

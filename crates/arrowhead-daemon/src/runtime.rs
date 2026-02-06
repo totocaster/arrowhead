@@ -507,7 +507,7 @@ impl DaemonRuntime {
             .as_ref()
             .expect("indexer should be initialised before reindexing");
         let stats = indexer.reindex_paths(&target_list).await?;
-        let indexed_notes = self.config.database.list_note_ids()?.len() as u64;
+        let indexed_notes = self.config.database.note_count()?;
 
         self.persist_status(|status| {
             status.indexed_notes = indexed_notes;

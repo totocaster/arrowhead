@@ -11,14 +11,13 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path, State, connect_info::ConnectInfo},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Serialize;
-use serde_json::Value;
 use tokio::{
     net::TcpListener,
     sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError},
@@ -462,23 +461,16 @@ fn build_response(payloads: Vec<RpcResponse>) -> Result<HttpResponse, anyhow::Er
     }
 
     if payloads.len() == 1 {
-        let value = serde_json::to_value(&payloads[0]).context("failed to encode JSON response")?;
-        return Ok(HttpResponse::json(StatusCode::OK, value));
+        return Ok(HttpResponse::json(StatusCode::OK, &payloads[0]));
     }
 
-    let mut values = Vec::with_capacity(payloads.len());
-    for payload in payloads {
-        let value = serde_json::to_value(&payload).context("failed to encode JSON response")?;
-        values.push(value);
-    }
-
-    Ok(HttpResponse::json(StatusCode::OK, Value::Array(values)))
+    Ok(HttpResponse::json(StatusCode::OK, &payloads))
 }
 
 #[derive(Debug)]
 struct HttpResponse {
     status: StatusCode,
-    body: Option<Value>,
+    body: Option<Bytes>,
     headers: HeaderMap,
 }
 
@@ -495,8 +487,8 @@ impl HttpResponse {
     where
         T: Serialize,
     {
-        let value = match serde_json::to_value(payload) {
-            Ok(value) => value,
+        let bytes = match serde_json::to_vec(&payload) {
+            Ok(bytes) => Bytes::from(bytes),
             Err(error) => {
                 error!(%error, "failed to serialise JSON response payload");
                 return Self::status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -505,7 +497,7 @@ impl HttpResponse {
 
         Self {
             status,
-            body: Some(value),
+            body: Some(bytes),
             headers: HeaderMap::new(),
         }
     }
@@ -549,7 +541,15 @@ impl HttpResponse {
 impl IntoResponse for HttpResponse {
     fn into_response(self) -> Response {
         let mut response = match self.body {
-            Some(body) => (self.status, axum::Json(body)).into_response(),
+            Some(body) => {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = self.status;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response
+            }
             None => self.status.into_response(),
         };
 
@@ -576,7 +576,7 @@ mod tests {
         extract::connect_info::MockConnectInfo,
         http::{Request, StatusCode},
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::time::{Duration, sleep};
     use tower::ServiceExt;
 

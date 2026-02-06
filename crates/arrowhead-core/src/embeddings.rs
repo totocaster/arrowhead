@@ -262,9 +262,11 @@ impl EmbeddingGenerator {
             return Ok(Vec::new());
         }
 
+        // fastembed accepts `Vec<S: AsRef<str>>`, so we can avoid cloning all input strings.
+        let inputs: Vec<&str> = documents.iter().map(|doc| doc.as_str()).collect();
         let mut lease = self.pool.checkout();
         let embeddings = lease
-            .embed(documents.to_vec(), None)
+            .embed(inputs, None)
             .context("failed to embed documents")?;
 
         embeddings.into_iter().map(normalize_vector).collect()
@@ -272,17 +274,22 @@ impl EmbeddingGenerator {
 
     /// Generate an embedding for a single document.
     pub fn embed_document(&self, document: &str) -> Result<Vec<f32>> {
-        let inputs = vec![document.to_string()];
-        let mut all = self.embed_documents(&inputs)?;
-        all.pop()
-            .ok_or_else(|| anyhow!("document embedding missing"))
+        let mut lease = self.pool.checkout();
+        let mut embeddings = lease
+            .embed(vec![document], None)
+            .context("failed to embed document")?;
+        let vector = embeddings
+            .pop()
+            .ok_or_else(|| anyhow!("document embedding missing"))?;
+        normalize_vector(vector)
     }
 
     /// Generate an embedding suitable for semantic query comparisons.
     pub fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let inputs = vec![query.to_string()];
         let mut lease = self.pool.checkout();
-        let mut embeddings = lease.embed(inputs, None).context("failed to embed query")?;
+        let mut embeddings = lease
+            .embed(vec![query], None)
+            .context("failed to embed query")?;
         let vector = embeddings
             .pop()
             .ok_or_else(|| anyhow!("query embedding missing"))?;

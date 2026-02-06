@@ -277,9 +277,11 @@ impl SearchService {
             model = pipeline.descriptor().identifier(),
             "using embedding pipeline for semantic search"
         );
-        let query_vector = pipeline
-            .generator()
-            .embed_query(&embedding_seed)
+        let generator = pipeline.generator().clone();
+        let seed = embedding_seed;
+        let query_vector = task::spawn_blocking(move || generator.embed_query(&seed))
+            .await
+            .context("embedding task aborted")?
             .context("failed to embed search query")?;
 
         let matches = pipeline
@@ -418,9 +420,11 @@ impl SearchService {
             "using embedding pipeline for hybrid search"
         );
 
-        let query_vector = pipeline
-            .generator()
-            .embed_query(&embedding_seed)
+        let generator = pipeline.generator().clone();
+        let seed = embedding_seed;
+        let query_vector = task::spawn_blocking(move || generator.embed_query(&seed))
+            .await
+            .context("embedding task aborted")?
             .context("failed to embed search query")?;
 
         let semantic_matches = pipeline
