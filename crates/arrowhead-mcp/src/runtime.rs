@@ -28,9 +28,9 @@ use tracing::warn;
 
 use crate::tools::{
     AgentsPlaybookPayload, MetadataCommonValue, MetadataFieldStats, MetadataValueKind,
-    NamingPatternSummary, NoteListItem, ObsidianSettingsPayload, RelatedNotePayload,
-    RelatedNotesPayload, RelatedNotesStrategy, StyleGuidePayload, VaultConventionsPayload,
-    VaultStatsPayload, WorkspaceSettingsPayload,
+    MetricsConventionsPayload, NamingPatternSummary, NoteListItem, ObsidianSettingsPayload,
+    RelatedNotePayload, RelatedNotesPayload, RelatedNotesStrategy, StyleGuidePayload,
+    VaultConventionsPayload, VaultStatsPayload, WorkspaceSettingsPayload,
 };
 
 use arrowhead_core::SearchResult;
@@ -380,14 +380,36 @@ impl McpRuntime {
         let style_guide = self.load_style_guide().await?;
         let workspace = build_workspace_settings(self.vault.as_ref());
         let obsidian = build_obsidian_settings_legacy(self.vault.as_ref());
+        let metrics = self.metrics_conventions_payload().await?;
 
         Ok(VaultConventionsPayload {
             naming_patterns,
             metadata_fields,
             obsidian,
             workspace,
+            metrics,
             style_guide,
             agents_playbook: Some(load_agents_playbook()),
+        })
+    }
+
+    async fn metrics_conventions_payload(&self) -> Result<MetricsConventionsPayload> {
+        let vault = Arc::clone(&self.vault);
+        let files = task::spawn_blocking(move || vault.metrics_files())
+            .await
+            .context("metrics discovery task aborted")??;
+        let conventions = self.vault.metrics_conventions();
+
+        Ok(MetricsConventionsPayload {
+            source: conventions.source.as_str().to_string(),
+            source_path: conventions.source.path().cloned(),
+            root: conventions.root.clone(),
+            extensions: conventions.extensions.clone(),
+            default_write_file: conventions.default_write_file.clone(),
+            record_reference_prefix: conventions.record_reference_prefix.clone(),
+            week_start_day: conventions.week_start_day.clone(),
+            day_start_hour: conventions.day_start_hour,
+            files: files.into_iter().map(|entry| entry.relative_path).collect(),
         })
     }
 

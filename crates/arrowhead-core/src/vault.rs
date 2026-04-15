@@ -21,6 +21,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::metrics::{
+    DEFAULT_DAY_START_HOUR, DEFAULT_METRIC_REFERENCE_PREFIX, DEFAULT_METRICS_EXTENSION,
+    DEFAULT_METRICS_ROOT, DEFAULT_METRICS_WRITE_FILE_NAME, DEFAULT_WEEK_START_DAY,
+    MetricsConfigFile, MetricsConventions, MetricsConventionsSource, MetricsFileEntry,
+};
 use crate::types::VaultPaths;
 use crate::workspace::{
     WORKSPACE_CONFIG_FILE, WorkspaceFile, WorkspaceKind, WorkspaceSource, load_workspace_file,
@@ -226,6 +231,7 @@ impl VaultSettings {
 pub struct Vault {
     paths: Arc<VaultPaths>,
     settings: Arc<VaultSettings>,
+    metrics: Arc<MetricsConventions>,
     workspace_kind: WorkspaceKind,
     workspace_source: WorkspaceSource,
 }
@@ -249,7 +255,11 @@ impl Vault {
         let workspace_file_path = arrowhead_dir.join(WORKSPACE_CONFIG_FILE);
         let obsidian_present = obsidian_dir.exists();
 
-        let arrowhead_settings = load_arrowhead_workspace_settings(&workspace_file_path)?;
+        let workspace_file = load_workspace_file(&workspace_file_path)?;
+        let arrowhead_settings = workspace_file.clone().map(settings_from_workspace_file);
+        let workspace_metrics = workspace_file
+            .as_ref()
+            .and_then(|file| file.metrics.clone());
 
         let (workspace_kind, workspace_source, mut settings) = if obsidian_present {
             if arrowhead_settings.is_some() {
@@ -282,6 +292,8 @@ impl Vault {
                 settings.attachments_folder = Some(relative);
             }
         }
+        let metrics =
+            resolve_metrics_conventions(&obsidian_dir, &workspace_file_path, workspace_metrics);
 
         let attachments_dir = settings
             .attachments_folder()
@@ -320,6 +332,7 @@ impl Vault {
                 attachments_dir,
             )),
             settings: Arc::new(settings),
+            metrics: Arc::new(metrics),
             workspace_kind,
             workspace_source,
         })
@@ -333,6 +346,11 @@ impl Vault {
     /// Access the loaded Obsidian settings.
     pub fn settings(&self) -> &VaultSettings {
         &self.settings
+    }
+
+    /// Access the resolved metrics conventions.
+    pub fn metrics_conventions(&self) -> &MetricsConventions {
+        &self.metrics
     }
 
     /// Identify which workspace flavour is active.
@@ -544,6 +562,42 @@ impl Vault {
         Ok(self.inventory_snapshot()?.into_entries())
     }
 
+    /// Discover metrics files using the resolved metrics conventions.
+    pub fn metrics_files(&self) -> Result<Vec<MetricsFileEntry>> {
+        let root = self.paths.root.join(&self.metrics.root);
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        if !root.is_dir() {
+            warn!(
+                metrics_root = %root.display(),
+                "configured metrics root is not a directory; skipping metrics discovery"
+            );
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+        for absolute_path in collect_metrics_files(&root, &self.metrics.extensions)? {
+            let relative_path = absolute_path
+                .strip_prefix(&self.paths.root)
+                .unwrap_or(&absolute_path)
+                .to_path_buf();
+            let file_meta = fs::metadata(&absolute_path).with_context(|| {
+                format!("failed to stat metrics file {}", absolute_path.display())
+            })?;
+            let modified =
+                system_time_to_utc(file_meta.modified().unwrap_or_else(|_| SystemTime::now()))?;
+            entries.push(MetricsFileEntry {
+                relative_path,
+                absolute_path,
+                file_modified_at: modified,
+            });
+        }
+
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
+    }
+
     fn build_inventory_entries(&self) -> Result<Vec<NoteInventoryEntry>> {
         let mut entries = Vec::new();
         let mut ids = BTreeMap::new();
@@ -636,6 +690,7 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{MetricsConfigFile, MetricsConventionsSource};
     use crate::workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, write_workspace_file};
     use chrono::TimeZone;
 
@@ -818,6 +873,7 @@ mod tests {
             ignored_folders: vec!["Private".to_string()],
             daily_note_format: Some("YYYY-MM-DD".to_string()),
             link_style: Some("absolute".to_string()),
+            metrics: None,
         };
         let workspace_path = dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE);
         write_workspace_file(&workspace_path, &file).expect("write workspace file");
@@ -893,6 +949,173 @@ mod tests {
             Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
         assert_eq!(vault.settings().daily_note_format(), Some("YYYY/[week]WW"));
     }
+
+    #[test]
+    fn metrics_conventions_default_when_no_config_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let metrics = vault.metrics_conventions();
+
+        assert_eq!(metrics.source, MetricsConventionsSource::Default);
+        assert_eq!(metrics.root, PathBuf::from("Metrics"));
+        assert_eq!(metrics.extensions, vec![".metrics.ndjson".to_string()]);
+        assert_eq!(
+            metrics.default_write_file,
+            PathBuf::from("Metrics/All.metrics.ndjson")
+        );
+        assert_eq!(metrics.record_reference_prefix, "metric:");
+        assert_eq!(metrics.week_start_day, "monday");
+        assert_eq!(metrics.day_start_hour, 0);
+    }
+
+    #[test]
+    fn workspace_metrics_conventions_are_loaded_for_generic_workspaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".arrowhead")).expect("arrowhead dir");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let file = WorkspaceFile {
+            metrics: Some(MetricsConfigFile {
+                root: Some("Health".to_string()),
+                extensions: vec!["health.ndjson".to_string()],
+                default_write_file: Some("Health/Daily.health.ndjson".to_string()),
+                record_reference_prefix: Some("health:".to_string()),
+                week_start_day: Some("Sunday".to_string()),
+                day_start_hour: Some(4),
+            }),
+            ..WorkspaceFile::default()
+        };
+        let workspace_path = dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE);
+        write_workspace_file(&workspace_path, &file).expect("write workspace file");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let metrics = vault.metrics_conventions();
+
+        assert_eq!(
+            metrics.source,
+            MetricsConventionsSource::ArrowheadWorkspace(workspace_path)
+        );
+        assert_eq!(metrics.root, PathBuf::from("Health"));
+        assert_eq!(metrics.extensions, vec![".health.ndjson".to_string()]);
+        assert_eq!(
+            metrics.default_write_file,
+            PathBuf::from("Health/Daily.health.ndjson")
+        );
+        assert_eq!(metrics.record_reference_prefix, "health:");
+        assert_eq!(metrics.week_start_day, "sunday");
+        assert_eq!(metrics.day_start_hour, 4);
+    }
+
+    #[test]
+    fn obsidian_metrics_plugin_takes_precedence_over_workspace_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let obsidian_dir = dir.path().join(".obsidian");
+        let plugin_dir = obsidian_dir.join("plugins").join("metrics-lens");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        fs::write(
+            plugin_dir.join("data.json"),
+            r#"{
+  "metricsRoot": "PluginMetrics",
+  "supportedExtensions": [".plugin.ndjson"],
+  "defaultWriteFile": "PluginMetrics/Inbox.plugin.ndjson",
+  "recordReferencePrefix": "plugin-metric:",
+  "weekStartsOn": 2,
+  "dayStartHour": 6
+}"#,
+        )
+        .expect("write plugin config");
+
+        fs::create_dir_all(dir.path().join(".arrowhead")).expect("arrowhead dir");
+        write_workspace_file(
+            &dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE),
+            &WorkspaceFile {
+                metrics: Some(MetricsConfigFile {
+                    root: Some("WorkspaceMetrics".to_string()),
+                    ..MetricsConfigFile::default()
+                }),
+                ..WorkspaceFile::default()
+            },
+        )
+        .expect("write workspace file");
+
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let metrics = vault.metrics_conventions();
+        let plugin_data_path =
+            fs::canonicalize(plugin_dir.join("data.json")).expect("canonicalise plugin path");
+
+        assert_eq!(
+            metrics.source,
+            MetricsConventionsSource::ObsidianPlugin(plugin_data_path)
+        );
+        assert_eq!(metrics.root, PathBuf::from("PluginMetrics"));
+        assert_eq!(metrics.extensions, vec![".plugin.ndjson".to_string()]);
+        assert_eq!(
+            metrics.default_write_file,
+            PathBuf::from("PluginMetrics/Inbox.plugin.ndjson")
+        );
+        assert_eq!(metrics.record_reference_prefix, "plugin-metric:");
+        assert_eq!(metrics.week_start_day, "tuesday");
+        assert_eq!(metrics.day_start_hour, 6);
+    }
+
+    #[test]
+    fn metrics_file_discovery_uses_configured_root_and_suffixes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".arrowhead")).expect("arrowhead dir");
+        fs::create_dir_all(dir.path().join("Health").join("nested")).expect("metrics dir");
+        fs::write(
+            dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE),
+            toml::to_string_pretty(&WorkspaceFile {
+                metrics: Some(MetricsConfigFile {
+                    root: Some("Health".to_string()),
+                    extensions: vec![".health.ndjson".to_string()],
+                    ..MetricsConfigFile::default()
+                }),
+                ..WorkspaceFile::default()
+            })
+            .expect("serialise workspace"),
+        )
+        .expect("write workspace file");
+        fs::write(
+            dir.path().join("Health").join("daily.health.ndjson"),
+            "{}\n",
+        )
+        .expect("write metrics file");
+        fs::write(
+            dir.path()
+                .join("Health")
+                .join("nested")
+                .join("other.health.ndjson"),
+            "{}\n",
+        )
+        .expect("write nested metrics file");
+        fs::write(dir.path().join("Health").join("ignore.txt"), "nope")
+            .expect("write unrelated file");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let files = vault.metrics_files().expect("metrics discovery succeeds");
+
+        let paths = files
+            .iter()
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("Health/daily.health.ndjson"),
+                PathBuf::from("Health/nested/other.health.ndjson"),
+            ]
+        );
+    }
 }
 
 fn collect_markdown_files(
@@ -960,11 +1183,43 @@ fn collect_markdown_files(
     Ok(files)
 }
 
+fn collect_metrics_files(root: &Path, suffixes: &[String]) -> Result<Vec<PathBuf>> {
+    let mut stack = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read directory {}", dir.display()))?
+        {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && is_metrics_file(&path, suffixes) {
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
 fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("md"))
         .unwrap_or(false)
+}
+
+fn is_metrics_file(path: &Path, suffixes: &[String]) -> bool {
+    let name = match path.file_name().and_then(|name| name.to_str()) {
+        Some(name) => name.to_ascii_lowercase(),
+        None => return false,
+    };
+    suffixes.iter().any(|suffix| name.ends_with(suffix))
 }
 
 fn is_ignored(relative: &Path, ignored_folders: &[PathBuf]) -> bool {
@@ -1077,14 +1332,6 @@ fn load_obsidian_settings(obsidian_dir: &Path) -> VaultSettings {
     settings
 }
 
-fn load_arrowhead_workspace_settings(path: &Path) -> Result<Option<VaultSettings>> {
-    let file = match load_workspace_file(path)? {
-        Some(file) => file,
-        None => return Ok(None),
-    };
-    Ok(Some(settings_from_workspace_file(file)))
-}
-
 fn settings_from_workspace_file(file: WorkspaceFile) -> VaultSettings {
     let mut settings = VaultSettings::default();
 
@@ -1113,6 +1360,255 @@ fn settings_from_workspace_file(file: WorkspaceFile) -> VaultSettings {
     }
 
     settings
+}
+
+fn resolve_metrics_conventions(
+    obsidian_dir: &Path,
+    workspace_file_path: &Path,
+    workspace_metrics: Option<MetricsConfigFile>,
+) -> MetricsConventions {
+    let plugin_path = obsidian_dir
+        .join("plugins")
+        .join("metrics-lens")
+        .join("data.json");
+    if let Some(config) = load_obsidian_metrics_config(&plugin_path) {
+        if workspace_metrics.is_some() {
+            warn!(
+                plugin = %plugin_path.display(),
+                workspace = %workspace_file_path.display(),
+                "found metrics-lens plugin config and Arrowhead metrics config; preferring plugin conventions"
+            );
+        }
+        return build_metrics_conventions(
+            config,
+            MetricsConventionsSource::ObsidianPlugin(plugin_path),
+        );
+    }
+
+    if let Some(config) = workspace_metrics {
+        return build_metrics_conventions(
+            config,
+            MetricsConventionsSource::ArrowheadWorkspace(workspace_file_path.to_path_buf()),
+        );
+    }
+
+    build_metrics_conventions(
+        MetricsConfigFile::default(),
+        MetricsConventionsSource::Default,
+    )
+}
+
+fn load_obsidian_metrics_config(path: &Path) -> Option<MetricsConfigFile> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    plugin = %path.display(),
+                    "failed to read metrics-lens settings: {err}"
+                );
+            }
+            return None;
+        }
+    };
+
+    let value = match serde_json::from_str::<Value>(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                plugin = %path.display(),
+                "failed to parse metrics-lens settings: {err}"
+            );
+            return None;
+        }
+    };
+
+    Some(MetricsConfigFile {
+        root: find_json_string(
+            &value,
+            &[
+                "metricsRoot",
+                "metricsFolder",
+                "metricsDir",
+                "metrics.root",
+                "storage.metricsRoot",
+            ],
+        ),
+        extensions: find_json_string_list(
+            &value,
+            &["extensions", "supportedExtensions", "metrics.extensions"],
+        ),
+        default_write_file: find_json_string(
+            &value,
+            &[
+                "defaultWriteFile",
+                "defaultFile",
+                "metrics.defaultWriteFile",
+                "storage.defaultWriteFile",
+            ],
+        ),
+        record_reference_prefix: find_json_string(
+            &value,
+            &[
+                "recordReferencePrefix",
+                "referencePrefix",
+                "metrics.recordReferencePrefix",
+            ],
+        ),
+        week_start_day: find_json_week_start_day(
+            &value,
+            &[
+                "weekStartDay",
+                "weekStart",
+                "calendar.weekStartDay",
+                "weekStartsOn",
+                "calendar.weekStartsOn",
+            ],
+        ),
+        day_start_hour: find_json_u8(
+            &value,
+            &["dayStartHour", "dayBoundaryHour", "calendar.dayStartHour"],
+        ),
+    })
+}
+
+fn build_metrics_conventions(
+    config: MetricsConfigFile,
+    source: MetricsConventionsSource,
+) -> MetricsConventions {
+    let root = config
+        .root
+        .as_deref()
+        .and_then(normalise_relative_str)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_METRICS_ROOT));
+    let extensions = normalise_metrics_extensions(&config.extensions);
+    let default_write_file = config
+        .default_write_file
+        .as_deref()
+        .and_then(normalise_relative_str)
+        .unwrap_or_else(|| root.join(DEFAULT_METRICS_WRITE_FILE_NAME));
+    let record_reference_prefix = config
+        .record_reference_prefix
+        .as_deref()
+        .and_then(normalise_string_field)
+        .unwrap_or_else(|| DEFAULT_METRIC_REFERENCE_PREFIX.to_string());
+    let week_start_day = config
+        .week_start_day
+        .as_deref()
+        .and_then(normalise_string_field)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| DEFAULT_WEEK_START_DAY.to_string());
+    let day_start_hour = config
+        .day_start_hour
+        .filter(|hour| *hour <= 23)
+        .unwrap_or(DEFAULT_DAY_START_HOUR);
+
+    MetricsConventions {
+        source,
+        root,
+        extensions,
+        default_write_file,
+        record_reference_prefix,
+        week_start_day,
+        day_start_hour,
+    }
+}
+
+fn normalise_metrics_extensions(extensions: &[String]) -> Vec<String> {
+    let mut normalised = Vec::new();
+    for extension in extensions {
+        let trimmed = extension.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = if trimmed.starts_with('.') {
+            trimmed.to_ascii_lowercase()
+        } else {
+            format!(".{}", trimmed.to_ascii_lowercase())
+        };
+        if !normalised.iter().any(|existing| existing == &value) {
+            normalised.push(value);
+        }
+    }
+
+    if normalised.is_empty() {
+        normalised.push(DEFAULT_METRICS_EXTENSION.to_string());
+    }
+
+    normalised
+}
+
+fn find_json_string(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        lookup_json_path(value, path).and_then(|candidate| match candidate {
+            Value::String(value) => normalise_string_field(value),
+            _ => None,
+        })
+    })
+}
+
+fn find_json_string_list(value: &Value, paths: &[&str]) -> Vec<String> {
+    for path in paths {
+        if let Some(candidate) = lookup_json_path(value, path) {
+            match candidate {
+                Value::Array(items) => {
+                    let collected = items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if !collected.is_empty() {
+                        return collected;
+                    }
+                }
+                Value::String(single) => {
+                    let trimmed = single.trim();
+                    if !trimmed.is_empty() {
+                        return vec![trimmed.to_string()];
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+fn find_json_u8(value: &Value, paths: &[&str]) -> Option<u8> {
+    paths.iter().find_map(|path| {
+        lookup_json_path(value, path).and_then(|candidate| match candidate {
+            Value::Number(number) => number.as_u64().and_then(|value| u8::try_from(value).ok()),
+            _ => None,
+        })
+    })
+}
+
+fn find_json_week_start_day(value: &Value, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        lookup_json_path(value, path).and_then(|candidate| match candidate {
+            Value::String(value) => normalise_string_field(value),
+            Value::Number(number) => number.as_u64().and_then(|value| match value {
+                0 => Some("sunday".to_string()),
+                1 => Some("monday".to_string()),
+                2 => Some("tuesday".to_string()),
+                3 => Some("wednesday".to_string()),
+                4 => Some("thursday".to_string()),
+                5 => Some("friday".to_string()),
+                6 => Some("saturday".to_string()),
+                _ => None,
+            }),
+            _ => None,
+        })
+    })
+}
+
+fn lookup_json_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
 }
 
 fn load_obsidian_daily_note_format(obsidian_dir: &Path) -> Option<String> {

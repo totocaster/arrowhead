@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use arrowhead_core::metrics::MetricsConfigFile;
 use arrowhead_core::status::DaemonStatus;
 use arrowhead_core::workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, write_workspace_file};
 use arrowhead_mcp::{
@@ -45,6 +46,7 @@ fn copy_fixture_generic() -> TempDir {
         ignored_folders: vec!["Drafts".to_string()],
         daily_note_format: Some("YYYY-MM-DD".to_string()),
         link_style: Some("relative".to_string()),
+        metrics: None,
     };
     write_workspace_file(&arrowhead_dir.join(WORKSPACE_CONFIG_FILE), &file)
         .expect("write workspace config");
@@ -406,6 +408,23 @@ async fn discovery_vault_conventions_returns_patterns() {
         structured.get("obsidian").is_some(),
         "legacy obsidian payload should remain for compatibility"
     );
+    let metrics = structured
+        .get("metrics")
+        .and_then(Value::as_object)
+        .expect("metrics payload present");
+    assert_eq!(
+        metrics.get("source").and_then(Value::as_str),
+        Some("default")
+    );
+    let files = metrics
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        files.is_empty(),
+        "fixture vault should not include metrics files"
+    );
 }
 
 #[tokio::test]
@@ -434,6 +453,72 @@ async fn discovery_vault_conventions_reports_generic_workspace_metadata() {
         .cloned()
         .unwrap_or_default();
     assert!(ignored.iter().any(|value| value == "Drafts"));
+}
+
+#[tokio::test]
+async fn discovery_vault_conventions_reports_metrics_overrides_and_files() {
+    let temp_dir = copy_fixture_generic();
+    fs::create_dir_all(temp_dir.path().join("Health")).expect("create metrics dir");
+    fs::write(
+        temp_dir.path().join("Health").join("daily.health.ndjson"),
+        "{}\n",
+    )
+    .expect("write metrics file");
+
+    write_workspace_file(
+        &temp_dir
+            .path()
+            .join(".arrowhead")
+            .join(WORKSPACE_CONFIG_FILE),
+        &WorkspaceFile {
+            attachments_dir: Some("Attachments".to_string()),
+            ignored_folders: vec!["Drafts".to_string()],
+            daily_note_format: Some("YYYY-MM-DD".to_string()),
+            link_style: Some("relative".to_string()),
+            metrics: Some(MetricsConfigFile {
+                root: Some("Health".to_string()),
+                extensions: vec![".health.ndjson".to_string()],
+                default_write_file: Some("Health/Inbox.health.ndjson".to_string()),
+                record_reference_prefix: Some("health:".to_string()),
+                week_start_day: Some("sunday".to_string()),
+                day_start_hour: Some(5),
+            }),
+        },
+    )
+    .expect("rewrite workspace config");
+
+    let handler = build_handler(&temp_dir).await;
+    let structured =
+        call_tool_structured(&handler, "discovery_get_vault_conventions", json!({})).await;
+
+    let metrics = structured
+        .get("metrics")
+        .and_then(Value::as_object)
+        .expect("metrics payload present");
+    assert_eq!(
+        metrics.get("source").and_then(Value::as_str),
+        Some("arrowhead-workspace")
+    );
+    assert_eq!(metrics.get("root").and_then(Value::as_str), Some("Health"));
+    assert_eq!(
+        metrics.get("defaultWriteFile").and_then(Value::as_str),
+        Some("Health/Inbox.health.ndjson")
+    );
+    assert_eq!(
+        metrics.get("recordReferencePrefix").and_then(Value::as_str),
+        Some("health:")
+    );
+    assert_eq!(metrics.get("dayStartHour").and_then(Value::as_u64), Some(5));
+    let files = metrics
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        files
+            .iter()
+            .any(|value| value == "Health/daily.health.ndjson")
+    );
 }
 
 #[tokio::test]

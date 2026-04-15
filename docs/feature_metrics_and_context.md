@@ -5,19 +5,19 @@ metrics data and richer context retrieval across notes, days, and metrics.
 
 ## Status
 
-> **Status:** Proposed, not started.
+> **Status:** In progress.
 >
 > **Last updated:** 2026-04-15
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Product direction | Proposed | Arrowhead stays a complementary assistant tool for agents, automation, CLI, and MCP usage. |
-| Metrics indexing model | Proposed | Metrics become a first-class indexed domain, separate from notes. |
+| Product direction | Accepted | Arrowhead stays a complementary assistant tool for agents, automation, CLI, and MCP usage. |
+| Metrics indexing model | In progress | Metrics conventions resolution and file discovery are now wired; indexed storage is still pending. |
 | Metrics CLI CRUD | Proposed | Create, read, update, and delete should be supported. |
 | Metrics MCP CRUD | Proposed | Create, read, update, and delete should be supported. |
 | Context command family | Proposed | New context surfaces should work across days, notes, and metrics. |
 | Proactive linking | Proposed | Explicit and inferred links should be surfaced with reasons. |
-| Implementation | Not started | No code shipped yet. |
+| Implementation | In progress | Round 1 foundation is landing; indexing, CRUD, and context retrieval are still pending. |
 
 ## Accepted Decisions
 

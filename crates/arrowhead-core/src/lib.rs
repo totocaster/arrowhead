@@ -16,6 +16,7 @@ pub mod embeddings;
 pub mod graph;
 pub mod indexer;
 pub mod metadata;
+pub mod metrics;
 pub mod query;
 pub mod search;
 pub mod sqlite;
@@ -27,6 +28,11 @@ pub mod workspace;
 // Re-export commonly used types for convenience across crates.
 pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolutionRecord};
 pub use indexer::IndexProgressEvent;
+pub use metrics::{
+    DEFAULT_DAY_START_HOUR, DEFAULT_METRIC_REFERENCE_PREFIX, DEFAULT_METRICS_EXTENSION,
+    DEFAULT_METRICS_ROOT, DEFAULT_METRICS_WRITE_FILE_NAME, DEFAULT_WEEK_START_DAY,
+    MetricsConfigFile, MetricsConventions, MetricsConventionsSource, MetricsFileEntry,
+};
 pub use search::{SearchConfig, SearchResult, SearchService};
 pub use status::{
     ActivityState, ActivityStatus, DAEMON_STATUS_VERSION, DaemonStatus, DownloadState,

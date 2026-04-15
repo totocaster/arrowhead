@@ -1298,6 +1298,56 @@ impl HandlerRegistry {
             },
             "additionalProperties": false
         });
+        let metrics_settings_schema = json!({
+            "type": "object",
+            "description": "Resolved metrics conventions and discovered metrics files.",
+            "required": [
+                "source",
+                "root",
+                "extensions",
+                "defaultWriteFile",
+                "recordReferencePrefix",
+                "weekStartDay",
+                "dayStartHour"
+            ],
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Source used to resolve metrics conventions."
+                },
+                "sourcePath": path_schema("Filesystem path backing the resolved metrics conventions."),
+                "root": path_schema("Metrics root directory relative to the vault root."),
+                "extensions": {
+                    "type": "array",
+                    "description": "File suffixes recognised as metrics files.",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "defaultWriteFile": path_schema("Default metrics write target relative to the vault root."),
+                "recordReferencePrefix": {
+                    "type": "string",
+                    "description": "Prefix used for metrics references such as `metric:<id>`."
+                },
+                "weekStartDay": {
+                    "type": "string",
+                    "description": "Week start day used by metrics time windows."
+                },
+                "dayStartHour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23,
+                    "description": "Hour offset that determines when a new metrics day starts."
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Metrics files currently discovered under the configured root.",
+                    "items": path_schema("Metrics file relative to the vault root."),
+                    "default": []
+                }
+            },
+            "additionalProperties": false
+        });
         let obsidian_settings_schema = json!({
             "type": "object",
             "description": "Legacy Obsidian metadata retained for backward compatibility.",
@@ -1323,7 +1373,7 @@ impl HandlerRegistry {
         let vault_conventions_payload_schema = json!({
             "type": "object",
             "description": "Summary of naming patterns, metadata usage, and conventions.",
-            "required": ["namingPatterns", "metadataFields"],
+            "required": ["namingPatterns", "metadataFields", "metrics"],
             "properties": {
                 "namingPatterns": {
                     "type": "array",
@@ -1337,6 +1387,7 @@ impl HandlerRegistry {
                 },
                 "obsidian": obsidian_settings_schema,
                 "workspace": workspace_settings_schema,
+                "metrics": metrics_settings_schema,
                 "styleGuide": style_guide_schema
             },
             "additionalProperties": false

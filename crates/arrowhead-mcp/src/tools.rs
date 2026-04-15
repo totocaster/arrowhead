@@ -548,6 +548,32 @@ pub struct WorkspaceSettingsPayload {
     pub link_style: Option<String>,
 }
 
+/// Metrics conventions surfaced to discovery tooling.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsConventionsPayload {
+    /// Where the conventions were resolved from.
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Filesystem path that backed the resolved conventions, if any.
+    pub source_path: Option<PathBuf>,
+    /// Relative root directory searched for metrics files.
+    pub root: PathBuf,
+    /// File suffixes recognised as metrics files.
+    pub extensions: Vec<String>,
+    /// Relative default write file used when a target is omitted.
+    pub default_write_file: PathBuf,
+    /// Prefix used for references such as `metric:<id>`.
+    pub record_reference_prefix: String,
+    /// Week start day used by metrics time windows.
+    pub week_start_day: String,
+    /// Hour offset that determines when a new metrics day starts.
+    pub day_start_hour: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Metrics files currently discovered under the configured root.
+    pub files: Vec<PathBuf>,
+}
+
 /// Legacy Obsidian-specific payload retained for backward compatibility.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -580,6 +606,8 @@ pub struct VaultConventionsPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Snapshot of workspace settings useful for reasoning about note structure.
     pub workspace: Option<WorkspaceSettingsPayload>,
+    /// Resolved metrics conventions and discovered metrics files.
+    pub metrics: MetricsConventionsPayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Optional user-authored style guide surfaced to agents.
     pub style_guide: Option<StyleGuidePayload>,

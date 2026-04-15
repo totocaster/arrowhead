@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::MetricsConfigFile;
+
 /// Default file name used to store Arrowhead workspace metadata.
 pub const WORKSPACE_CONFIG_FILE: &str = "workspace.toml";
 
@@ -35,6 +37,9 @@ pub struct WorkspaceFile {
     /// Preferred link style (mirrors Obsidian's `newLinkFormat`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_style: Option<String>,
+    /// Optional metrics conventions overrides stored under `[metrics]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsConfigFile>,
 }
 
 /// Load an Arrowhead workspace file from disk if present.
