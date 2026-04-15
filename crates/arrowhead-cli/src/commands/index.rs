@@ -738,11 +738,7 @@ fn launch_daemon_process(vault_path: &Path, embedding_model: Option<&str>) -> Re
     let binary = find_daemon_binary()?;
 
     let mut command = Command::new(binary);
-    command.arg("--vault").arg(vault_path);
-
-    if let Some(model) = embedding_model {
-        command.arg("--embedding-model").arg(model);
-    }
+    configure_daemon_command(&mut command, vault_path, embedding_model);
 
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
@@ -752,6 +748,18 @@ fn launch_daemon_process(vault_path: &Path, embedding_model: Option<&str>) -> Re
         .spawn()
         .context("failed to launch arrowhead indexer")?;
     Ok(child.id())
+}
+
+fn configure_daemon_command(
+    command: &mut Command,
+    vault_path: &Path,
+    embedding_model: Option<&str>,
+) {
+    let model = embedding_model.unwrap_or("none");
+    command.arg("--vault").arg(vault_path);
+    command.arg("--embedding-model").arg(model);
+    command.env("ARROWHEAD_VAULT", vault_path);
+    command.env("ARROWHEAD_EMBEDDING_MODEL", model);
 }
 
 fn find_daemon_binary() -> Result<PathBuf> {
@@ -1086,5 +1094,44 @@ mod tests {
         assert!(ctx.config.daemon.socket_path.is_some());
         assert!(ctx.config.daemon.status_path.is_some());
         assert_eq!(ctx.config.daemon.auto_start_enabled, Some(false));
+    }
+
+    #[test]
+    fn configure_daemon_command_sets_args_and_env_for_compatibility() {
+        let mut command = Command::new("arrowheadd");
+        configure_daemon_command(&mut command, Path::new("/tmp/vault"), None);
+
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec!["--vault", "/tmp/vault", "--embedding-model", "none"]
+        );
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|entry| entry.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            envs.contains(&(
+                "ARROWHEAD_VAULT".to_string(),
+                Some("/tmp/vault".to_string())
+            )),
+            "vault env should be configured"
+        );
+        assert!(
+            envs.contains(&(
+                "ARROWHEAD_EMBEDDING_MODEL".to_string(),
+                Some("none".to_string())
+            )),
+            "embedding env should be configured"
+        );
     }
 }

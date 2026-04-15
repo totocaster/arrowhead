@@ -16,6 +16,7 @@ use arrowhead_core::{
     ActivityState, ActivityStatus, DaemonStatus, DownloadState, DownloadStatus, IssueSeverity,
     StatusFrame, StatusIssue, Vault, VaultConfig,
 };
+use clap::Parser;
 use fastembed::{EmbeddingModel, ModelTrait};
 use hf_hub::api::{Progress, sync::ApiBuilder};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -1045,6 +1046,23 @@ const INDEX_ERROR_CODE: &str = "index_errors";
 const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
 const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
 
+#[derive(Debug, Parser)]
+#[command(name = "arrowheadd")]
+struct DaemonCliArgs {
+    /// Vault root to index.
+    #[arg(long, value_name = "PATH")]
+    vault: Option<PathBuf>,
+    /// Embedding model identifier, or `none` to disable semantic indexing.
+    #[arg(long = "embedding-model", value_name = "MODEL")]
+    embedding_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDaemonCli {
+    vault_root: PathBuf,
+    embedding_model: Option<String>,
+}
+
 fn update_index_error_issue(status: &mut DaemonStatus, errors: u64) {
     status.error_notes = errors;
     status.issues.retain(|issue| issue.code != INDEX_ERROR_CODE);
@@ -1067,29 +1085,60 @@ fn update_index_error_issue(status: &mut DaemonStatus, errors: u64) {
     status.issues.push(issue);
 }
 
-/// Default CLI entrypoint used by the binary.
-pub async fn cli_main() -> Result<()> {
-    let root = std::env::var_os("ARROWHEAD_VAULT")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("ARROWHEAD_VAULT environment variable must be set"))?;
+fn normalize_embedding_model(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty() || matches!(normalized.as_str(), "none" | "off" | "fts-only" | "fts") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
 
-    let embedding_model = match std::env::var("ARROWHEAD_EMBEDDING_MODEL") {
-        Ok(value) => {
-            let trimmed = value.trim();
-            let normalized = trimmed.to_ascii_lowercase();
-            if trimmed.is_empty()
-                || matches!(normalized.as_str(), "none" | "off" | "fts-only" | "fts")
-            {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        }
-        Err(_) => Some("fast".to_string()),
+fn resolve_daemon_cli_from<I, T>(
+    args: I,
+    env_vault: Option<PathBuf>,
+    env_embedding_model: Option<&str>,
+) -> Result<ResolvedDaemonCli>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = DaemonCliArgs::try_parse_from(args).map_err(|err| anyhow!(err.to_string()))?;
+    let vault_root = cli.vault.or(env_vault).ok_or_else(|| {
+        anyhow!("vault path must be provided with `--vault <path>` or ARROWHEAD_VAULT")
+    })?;
+    let embedding_model = if let Some(value) = cli.embedding_model {
+        normalize_embedding_model(Some(value))
+    } else if let Some(value) = env_embedding_model {
+        normalize_embedding_model(Some(value.to_string()))
+    } else {
+        Some("fast".to_string())
     };
 
-    let handle = DaemonRuntimeBuilder::new(root)
-        .embedding_model(embedding_model)
+    Ok(ResolvedDaemonCli {
+        vault_root,
+        embedding_model,
+    })
+}
+
+fn resolve_daemon_cli() -> Result<ResolvedDaemonCli> {
+    let env_vault = std::env::var_os("ARROWHEAD_VAULT").map(PathBuf::from);
+    let env_embedding_model = std::env::var("ARROWHEAD_EMBEDDING_MODEL").ok();
+    resolve_daemon_cli_from(
+        std::env::args_os(),
+        env_vault,
+        env_embedding_model.as_deref(),
+    )
+}
+
+/// Default CLI entrypoint used by the binary.
+pub async fn cli_main() -> Result<()> {
+    let cli = resolve_daemon_cli()?;
+
+    let handle = DaemonRuntimeBuilder::new(cli.vault_root)
+        .embedding_model(cli.embedding_model)
         .spawn()
         .await?;
     info!("arrowhead daemon started; waiting for shutdown signal");
@@ -1100,4 +1149,59 @@ pub async fn cli_main() -> Result<()> {
 
     info!("shutdown signal received; stopping daemon");
     handle.shutdown().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_daemon_cli_prefers_flags_over_env() {
+        let cli = resolve_daemon_cli_from(
+            [
+                "arrowheadd",
+                "--vault",
+                "/tmp/cli-vault",
+                "--embedding-model",
+                "mini",
+            ],
+            Some(PathBuf::from("/tmp/env-vault")),
+            Some("fast"),
+        )
+        .expect("cli should parse");
+
+        assert_eq!(cli.vault_root, PathBuf::from("/tmp/cli-vault"));
+        assert_eq!(cli.embedding_model, Some("mini".to_string()));
+    }
+
+    #[test]
+    fn resolve_daemon_cli_uses_env_fallbacks() {
+        let cli = resolve_daemon_cli_from(
+            ["arrowheadd"],
+            Some(PathBuf::from("/tmp/env-vault")),
+            Some("fts-only"),
+        )
+        .expect("env fallback should parse");
+
+        assert_eq!(cli.vault_root, PathBuf::from("/tmp/env-vault"));
+        assert_eq!(cli.embedding_model, None);
+    }
+
+    #[test]
+    fn resolve_daemon_cli_defaults_to_fast_embeddings() {
+        let cli = resolve_daemon_cli_from(["arrowheadd", "--vault", "/tmp/vault"], None, None)
+            .expect("default config should parse");
+
+        assert_eq!(cli.vault_root, PathBuf::from("/tmp/vault"));
+        assert_eq!(cli.embedding_model, Some("fast".to_string()));
+    }
+
+    #[test]
+    fn resolve_daemon_cli_requires_a_vault() {
+        let err = resolve_daemon_cli_from(["arrowheadd"], None, None).expect_err("vault required");
+        assert!(
+            err.to_string().contains("ARROWHEAD_VAULT"),
+            "unexpected error: {err}"
+        );
+    }
 }

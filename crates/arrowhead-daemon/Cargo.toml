@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 arrowhead-core = { path = "../arrowhead-core" }
+clap.workspace = true
 fastembed.workspace = true
 futures.workspace = true
 hf-hub.workspace = true

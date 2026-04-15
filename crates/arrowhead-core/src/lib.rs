@@ -17,6 +17,7 @@ pub mod graph;
 pub mod indexer;
 pub mod metadata;
 pub mod metrics;
+pub mod metrics_mutation;
 pub mod metrics_service;
 pub mod query;
 pub mod search;
@@ -35,6 +36,10 @@ pub use metrics::{
     MetricIssueSeverity, MetricRecord, MetricValidationIssue, MetricValidationStatus,
     MetricsConfigFile, MetricsConventions, MetricsConventionsSource, MetricsFileEntry,
     ParsedMetricRow, parse_metrics_file, parse_metrics_line, parse_metrics_reader,
+};
+pub use metrics_mutation::{
+    DeletedMetricRecord, MetricCreateRequest, MetricUpdateRequest, MetricsMutationService,
+    PatchValue,
 };
 pub use metrics_service::{
     DEFAULT_METRICS_SEARCH_LIMIT, MetricFileSummary, MetricRecordEntry, MetricsQuery,
