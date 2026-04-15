@@ -4,16 +4,17 @@ use std::{fs, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
+use serde_json::Value as JsonValue;
 use tracing::info;
 
-use super::CommandContext;
+use super::{
+    CommandContext,
+    context::{SemanticContextMode, build_context_service, render_context_payload},
+};
 use crate::logging;
 use arrowhead_core::{
-    MetadataMap, NoteRecord, SearchConfig, Vault, VaultConfig,
-    embeddings::{EmbeddingMatch, EmbeddingPipeline},
-    sqlite::IndexDatabase,
+    DEFAULT_CONTEXT_METRIC_LIMIT, MetadataMap, Vault, VaultConfig, sqlite::IndexDatabase,
 };
-use serde_json::{Value as JsonValue, json};
 
 /// CRUD operations for notes.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -36,7 +37,7 @@ pub enum NoteAction {
     Update(UpdateArgs),
     /// Delete a note.
     Delete(DeleteArgs),
-    /// Find semantically similar notes.
+    /// Compatibility alias for `context note`.
     #[command(visible_alias = "surprise")]
     Similar(SimilarArgs),
 }
@@ -108,12 +109,12 @@ pub struct DeleteArgs {
     pub yes: bool,
 }
 
-/// Arguments for the `notes similar`/`notes surprise` command.
+/// Arguments for the `notes similar`/`notes surprise` compatibility alias.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct SimilarArgs {
     /// Identifier of the anchor note.
     pub note_id: String,
-    /// Maximum number of related notes to surface.
+    /// Maximum number of related notes to surface inside the context payload.
     #[arg(long, default_value_t = 5)]
     pub limit: usize,
     /// Emit structured JSON instead of human-readable output.
@@ -129,7 +130,7 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
         .clone()
         .context("no vault configured. Provide --vault or run `arrowhead init`.")?;
 
-    let vault = Vault::new(VaultConfig::new(vault_path))?;
+    let vault = Arc::new(Vault::new(VaultConfig::new(vault_path))?);
     vault.ensure_arrowhead_dirs()?;
 
     let logs_dir = vault.paths().logs_dir();
@@ -138,13 +139,13 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
     match &command.action {
         NoteAction::Read(args) => {
             info!(note_id = %args.note_id, "reading note contents");
-            let content = read_note_raw(&vault, &args.note_id)?;
+            let content = read_note_raw(vault.as_ref(), &args.note_id)?;
             print!("{content}");
             Ok(())
         }
         NoteAction::List(args) => {
             info!(ids_only = args.ids_only, "listing notes");
-            let items = collect_note_list(&vault, args.ids_only)?;
+            let items = collect_note_list(vault.as_ref(), args.ids_only)?;
             for (id, title) in items {
                 if let Some(title) = title {
                     println!("{id}\t{title}");
@@ -156,7 +157,7 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
         }
         NoteAction::Create(args) => {
             info!(id = ?args.id, "creating note");
-            create_note(&vault, args)?;
+            create_note(vault.as_ref(), args)?;
             println!(
                 "Created note {}",
                 args.id
@@ -168,13 +169,13 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
         }
         NoteAction::Update(args) => {
             info!(note_id = %args.note_id, "updating note");
-            update_note(&vault, args)?;
+            update_note(vault.as_ref(), args)?;
             println!("Updated note {}", args.note_id);
             Ok(())
         }
         NoteAction::Delete(args) => {
             info!(note_id = %args.note_id, "deleting note");
-            delete_note(&vault, args)?;
+            delete_note(vault.as_ref(), args)?;
             println!("Deleted note {}", args.note_id);
             Ok(())
         }
@@ -183,9 +184,9 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
                 note_id = %args.note_id,
                 limit = args.limit,
                 json = args.json,
-                "finding similar notes"
+                "loading note context via compatibility alias"
             );
-            run_similar(ctx, &vault, args).await
+            run_similar_alias(ctx, Arc::clone(&vault), args).await
         }
     }
 }
@@ -368,193 +369,35 @@ fn merge_metadata_json(metadata: &mut MetadataMap, payload: &Option<String>) -> 
     Ok(())
 }
 
-async fn run_similar(ctx: &CommandContext, vault: &Vault, args: &SimilarArgs) -> Result<()> {
-    let anchor = vault
-        .load_note(&args.note_id)
-        .with_context(|| format!("note {} not found", args.note_id))?;
-    if note_is_semantically_empty(&anchor) {
-        render_empty_anchor_message(&args.note_id, args.json)?;
-        return Ok(());
-    }
-
-    let db_path = vault.paths().arrowhead_dir.join("index.db");
-    let database = Arc::new(IndexDatabase::open(&db_path)?);
-    let selected_model = ctx
-        .config
-        .embedding_model
-        .clone()
-        .unwrap_or_else(|| "fast".to_string());
-    let pipeline = EmbeddingPipeline::initialise(vault, Arc::clone(&database), &selected_model)
-        .await
-        .with_context(|| format!("failed to prepare embedding pipeline `{selected_model}`"))?;
-
-    let vector = pipeline
-        .store()
-        .vector_for_note(&args.note_id)
-        .await?
-        .with_context(|| {
-            format!(
-                "note {} does not have embeddings yet. Run `arrowhead index start` to reindex it.",
-                args.note_id
-            )
-        })?;
-
-    let limit = args.limit.max(1);
-    let config = SearchConfig::default();
-    let oversample = limit + 5;
-    let matches = pipeline
-        .store()
-        .search(&vector, oversample, config.semantic_threshold)
-        .await
-        .context("embedding search failed")?;
-
-    let synopses = build_similar_synopses(
-        &database,
-        &args.note_id,
-        &matches,
-        limit,
-        config.semantic_threshold,
-    )?;
-    render_similar_results(&synopses, args.json, vault)?;
-    Ok(())
-}
-
-fn build_similar_synopses(
-    database: &IndexDatabase,
-    anchor_id: &str,
-    matches: &[EmbeddingMatch],
-    limit: usize,
-    threshold: f32,
-) -> Result<Vec<SimilarSynopsis>> {
-    const SYNOPSIS_LIMIT: usize = 240;
-    let mut scored = Vec::new();
-    for item in matches {
-        if item.note_id == anchor_id {
-            continue;
-        }
-        let similarity = (1.0_f32 - item.distance).max(0.0_f32);
-        if similarity < threshold {
-            continue;
-        }
-        scored.push((item.note_id.clone(), similarity));
-        if scored.len() >= limit {
-            break;
-        }
-    }
-
-    if scored.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let note_ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
-    let title_map = database
-        .titles_for_notes(&note_ids)
-        .context("failed to load titles for similar notes")?;
-    let relative_map = database
-        .relative_paths_for_notes(&note_ids)
-        .context("failed to load note paths for similar notes")?;
-
-    let mut synopses = Vec::new();
-    for (note_id, similarity) in scored {
-        let title = title_map.get(&note_id).cloned().unwrap_or(None);
-        let relative_path = relative_map.get(&note_id).cloned();
-        let preview = database
-            .note_excerpt(&note_id, SYNOPSIS_LIMIT)
-            .context("failed to load note synopsis")?;
-        synopses.push(SimilarSynopsis {
-            note_id,
-            similarity,
-            title,
-            relative_path,
-            preview,
-        });
-    }
-
-    Ok(synopses)
-}
-
-fn render_similar_results(
-    results: &[SimilarSynopsis],
-    json_output: bool,
-    vault: &Vault,
+async fn run_similar_alias(
+    ctx: &CommandContext,
+    vault: Arc<Vault>,
+    args: &SimilarArgs,
 ) -> Result<()> {
-    if json_output {
-        let payload: Vec<_> = results
-            .iter()
-            .map(|entry| {
-                let mut object = json!({
-                    "note_id": entry.note_id,
-                    "similarity": entry.similarity,
-                    "title": entry.title,
-                    "preview": entry.preview,
-                    "relative_path": entry.relative_path,
-                });
-                if let Some(relative) = entry.relative_path.as_deref() {
-                    let absolute = vault.note_path(relative);
-                    if let serde_json::Value::Object(ref mut map) = object {
-                        map.insert(
-                            "absolute_path".to_string(),
-                            json!(absolute.display().to_string()),
-                        );
-                    }
-                }
-                object
-            })
-            .collect();
+    let database = Arc::new(IndexDatabase::open(
+        vault.paths().arrowhead_dir.join("index.db"),
+    )?);
+    let service = build_context_service(
+        ctx,
+        Arc::clone(&vault),
+        database,
+        SemanticContextMode::Preferred,
+    )
+    .await?;
+    let payload = service
+        .note(
+            &args.note_id,
+            Some(args.limit),
+            Some(DEFAULT_CONTEXT_METRIC_LIMIT),
+        )
+        .await?;
+
+    if args.json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
-    }
-
-    if results.is_empty() {
-        println!("No similar notes found.");
-        return Ok(());
-    }
-
-    for entry in results {
-        let title = entry.title.as_deref().unwrap_or("-");
-        println!("{}\t{:.3}\t{}", entry.note_id, entry.similarity, title);
-        if let Some(preview) = &entry.preview {
-            println!("  {}", preview.trim());
-        }
-    }
-
-    Ok(())
-}
-
-fn note_is_semantically_empty(note: &NoteRecord) -> bool {
-    let has_title = note
-        .title
-        .as_ref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    let has_metadata = !note.metadata.is_empty();
-    let has_body = !note.content.trim().is_empty();
-    !(has_title || has_metadata || has_body)
-}
-
-fn render_empty_anchor_message(note_id: &str, json_output: bool) -> Result<()> {
-    let message = format!(
-        "Note {note_id} is empty, so semantic discovery has nothing to compare. \
-         Add content or metadata, reindex, and try again."
-    );
-
-    if json_output {
-        println!("[]");
-        eprintln!("{message}");
     } else {
-        println!("{message}");
+        render_context_payload(&payload);
     }
-
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct SimilarSynopsis {
-    note_id: String,
-    similarity: f32,
-    title: Option<String>,
-    relative_path: Option<String>,
-    preview: Option<String>,
 }
 
 #[cfg(test)]
@@ -562,14 +405,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    use chrono::Utc;
     use tempfile::TempDir;
-
-    use arrowhead_core::{
-        NoteRecord,
-        graph::{LinkReason, LinkResolutionRecord},
-        metadata::{MetadataExtraction, MetadataExtractor},
-    };
 
     fn fixture_vault() -> Vault {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -705,102 +541,5 @@ mod tests {
         delete_note(&vault, &delete_args).expect("delete");
 
         assert!(!vault.note_file_path("Disposable").unwrap().exists());
-    }
-
-    #[test]
-    fn build_similar_synopses_returns_preview_and_title() {
-        let temp_dir = TempDir::new().expect("tempdir");
-        let database =
-            IndexDatabase::open(temp_dir.path().join("index.db")).expect("database opens");
-        let vault = fixture_vault();
-        let anchor = vault.load_note("2024-01-15").expect("anchor loads");
-        let candidate = vault
-            .load_note("Photography Equipment")
-            .expect("candidate note loads");
-
-        let extractor = MetadataExtractor::new();
-        let anchor_meta = extractor
-            .extract(&anchor)
-            .expect("anchor metadata extraction");
-        database
-            .upsert_note(&anchor, &anchor_meta, &make_links(&anchor_meta), Utc::now())
-            .expect("anchor upsert");
-
-        let candidate_meta = extractor
-            .extract(&candidate)
-            .expect("candidate metadata extraction");
-        database
-            .upsert_note(
-                &candidate,
-                &candidate_meta,
-                &make_links(&candidate_meta),
-                Utc::now(),
-            )
-            .expect("candidate upsert");
-
-        let matches = vec![
-            EmbeddingMatch {
-                note_id: anchor.id.clone(),
-                distance: 0.0,
-            },
-            EmbeddingMatch {
-                note_id: candidate.id.clone(),
-                distance: 0.05,
-            },
-        ];
-
-        let synopses = build_similar_synopses(
-            &database,
-            &anchor.id,
-            &matches,
-            5,
-            SearchConfig::default().semantic_threshold,
-        )
-        .expect("synopses build");
-        assert_eq!(synopses.len(), 1);
-        let synopsis = &synopses[0];
-        assert_eq!(synopsis.note_id, candidate.id);
-        let preview = synopsis.preview.as_ref().expect("preview present");
-        assert!(!preview.is_empty());
-        assert_eq!(synopsis.title, Some("Photography Equipment".to_string()));
-    }
-
-    #[test]
-    fn note_with_no_content_or_metadata_is_semantically_empty() {
-        let mut note = NoteRecord::new("Empty", "Empty.md", Utc::now(), String::new());
-        assert!(note_is_semantically_empty(&note));
-
-        note.content = "   ".to_string();
-        assert!(note_is_semantically_empty(&note));
-
-        note.content = "Body text".to_string();
-        assert!(!note_is_semantically_empty(&note));
-    }
-
-    #[test]
-    fn metadata_or_title_counts_as_semantic_content() {
-        let mut note = NoteRecord::new("MetaOnly", "MetaOnly.md", Utc::now(), String::new());
-
-        note.metadata
-            .insert("status".to_string(), JsonValue::String("draft".to_string()));
-        assert!(!note_is_semantically_empty(&note));
-
-        note.metadata.clear();
-        note.title = Some("Has Title".to_string());
-        assert!(!note_is_semantically_empty(&note));
-    }
-
-    fn make_links(extraction: &MetadataExtraction) -> Vec<LinkResolutionRecord> {
-        extraction
-            .wikilinks
-            .iter()
-            .map(|link| LinkResolutionRecord {
-                raw: link.raw.clone(),
-                target: Some(link.target.clone()),
-                display: link.display.clone(),
-                heading: link.heading.clone(),
-                reason: LinkReason::Direct,
-            })
-            .collect()
     }
 }

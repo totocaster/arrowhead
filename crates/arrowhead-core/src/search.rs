@@ -235,6 +235,122 @@ impl SearchService {
         Ok(results)
     }
 
+    /// Find notes semantically related to an indexed anchor note.
+    pub async fn related_to_note(
+        &self,
+        note_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<SearchResult>> {
+        let note_id = note_id.trim();
+        if note_id.is_empty() {
+            bail!("note id must not be empty");
+        }
+
+        let pipeline = match self.embeddings.as_ref() {
+            Some(pipeline) => pipeline,
+            None => bail!("semantic related-note search requires embeddings to be enabled"),
+        };
+
+        let vector = pipeline
+            .store()
+            .vector_for_note(note_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "note {note_id} does not have embeddings yet. Run `arrowhead index start` to reindex it."
+                )
+            })?;
+
+        let limit = limit.unwrap_or(self.config.default_limit).max(1);
+        info!(
+            note_id = note_id,
+            limit, "executing semantic related-note search"
+        );
+        debug!(
+            note_id = note_id,
+            model = pipeline.descriptor().identifier(),
+            "using embedding pipeline for related-note search"
+        );
+
+        let matches = pipeline
+            .store()
+            .search(&vector, limit * 2, self.config.semantic_threshold)
+            .await
+            .context("semantic vector search failed")?;
+
+        if matches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let allowed_list = matches
+            .iter()
+            .filter(|item| item.note_id != note_id)
+            .map(|item| item.note_id.clone())
+            .collect::<Vec<_>>();
+        if allowed_list.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let metadata_maps = self
+            .database
+            .metadata_for_notes(&allowed_list)
+            .context("failed to load metadata for related-note results")?;
+        let title_map = self
+            .database
+            .titles_for_notes(&allowed_list)
+            .context("failed to load note titles for related-note results")?;
+        let relative_path_map = self
+            .database
+            .relative_paths_for_notes(&allowed_list)
+            .context("failed to load note paths for related-note results")?;
+
+        let mut results = Vec::new();
+        for item in matches {
+            if item.note_id == note_id {
+                continue;
+            }
+
+            let similarity = (1.0_f32 - item.distance).max(0.0_f32);
+            if similarity < self.config.semantic_threshold {
+                continue;
+            }
+
+            let metadata = metadata_maps
+                .get(&item.note_id)
+                .cloned()
+                .unwrap_or_default();
+            let title = title_map.get(&item.note_id).cloned().unwrap_or(None);
+            let relative_path = relative_path_map.get(&item.note_id).cloned();
+            let preview = self
+                .database
+                .note_excerpt(&item.note_id, 240)
+                .context("failed to fetch note excerpt")?;
+
+            results.push(SearchResult {
+                note_id: item.note_id,
+                score: similarity,
+                bm25: f32::MAX,
+                relative_path,
+                preview,
+                reason: Some(format!("Semantic similarity {:.2}", similarity)),
+                metadata,
+                title,
+            });
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        info!(
+            note_id = note_id,
+            result_count = results.len(),
+            "semantic related-note search completed"
+        );
+        Ok(results)
+    }
+
     /// Execute a semantic similarity search.
     pub async fn search_semantic(
         &self,

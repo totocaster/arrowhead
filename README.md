@@ -226,7 +226,7 @@ arrowhead context day 2026-04-14
 arrowhead context week --this
 arrowhead context changed --days 3
 arrowhead context note "Project Hub"
-# Discovery helpers
+# Compatibility aliases and richer context views
 arrowhead notes similar "Photography Equipment"
 arrowhead notes surprise "Project Hub" --limit 3 --json
 arrowhead context metric body.weight
@@ -269,9 +269,9 @@ Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable o
 - `arrowhead index <subcommand>` — manage the background indexer (`start`, `stop`, `restart`, `status`, `autostart`).
 - `arrowhead vault <subcommand>` — inspect filesystem state or reset Arrowhead caches (`status`, `reset`).
 - `arrowhead search` — execute FTS, semantic, or hybrid searches with pipe-friendly output formats.
-- `arrowhead notes` — perform note CRUD operations, metadata inspection, and semantic discovery (`notes similar` / `notes surprise`).
+- `arrowhead notes` — perform note CRUD operations plus compatibility aliases that forward `notes similar` / `notes surprise` to `context note`.
 - `arrowhead context` — retrieve richer day, week, changed, note, metric, and source context views with stable JSON sections.
-- `arrowhead graph` — inspect backlinks, forward links, orphans, unresolved links, or combined context views (`--json` emits machine-readable payloads).
+- `arrowhead graph` — inspect backlinks, forward links, orphans, unresolved links, or the `graph context` compatibility alias for `context note` (`--json` emits machine-readable payloads).
 - `arrowhead --mcp[(-server)]` — launch the stdio or HTTP MCP transport with shared handlers, token auth, CIDR filtering, and `/health` readiness probes.
 
 ### MCP transport options

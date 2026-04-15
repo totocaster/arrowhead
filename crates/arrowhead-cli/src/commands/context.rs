@@ -6,14 +6,24 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Args, Subcommand};
 use serde_json::to_string_pretty;
+use tracing::warn;
 
 use super::CommandContext;
 use crate::logging;
 use arrowhead_core::{
     ContextAttentionItem, ContextLink, ContextPayload, ContextService, ContextTargetKind,
     DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT, SearchConfig, SearchService, Vault,
-    VaultConfig, WeekContextSelector, sqlite::IndexDatabase,
+    VaultConfig, WeekContextSelector, embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
 };
+
+/// Controls whether note-context flows should try to load embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticContextMode {
+    /// Do not initialise embeddings.
+    Disabled,
+    /// Try to initialise embeddings, but keep going if they are unavailable.
+    Preferred,
+}
 
 /// Context retrieval commands spanning notes, metrics, and sources.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -167,8 +177,15 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
     let database = Arc::new(IndexDatabase::open(
         vault.paths().arrowhead_dir.join("index.db"),
     )?);
-    let search = SearchService::new(Arc::clone(&database), SearchConfig::default(), None);
-    let service = ContextService::new(vault, database, search);
+    let semantic_mode = match &command.action {
+        ContextAction::Note(_) => SemanticContextMode::Preferred,
+        ContextAction::Day(_)
+        | ContextAction::Week(_)
+        | ContextAction::Changed(_)
+        | ContextAction::Metric(_)
+        | ContextAction::Source(_) => SemanticContextMode::Disabled,
+    };
+    let service = build_context_service(ctx, Arc::clone(&vault), database, semantic_mode).await?;
 
     let payload = match &command.action {
         ContextAction::Day(args) => {
@@ -233,13 +250,50 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
     if json {
         println!("{}", to_string_pretty(&payload)?);
     } else {
-        render_context(&payload);
+        render_context_payload(&payload);
     }
 
     Ok(())
 }
 
-fn render_context(payload: &ContextPayload) {
+pub(crate) async fn build_context_service(
+    ctx: &CommandContext,
+    vault: Arc<Vault>,
+    database: Arc<IndexDatabase>,
+    semantic_mode: SemanticContextMode,
+) -> Result<ContextService> {
+    let embeddings = match semantic_mode {
+        SemanticContextMode::Disabled => None,
+        SemanticContextMode::Preferred => {
+            let selected_model = ctx
+                .config
+                .embedding_model
+                .clone()
+                .unwrap_or_else(|| "fast".to_string());
+            match EmbeddingPipeline::initialise(
+                vault.as_ref(),
+                Arc::clone(&database),
+                &selected_model,
+            )
+            .await
+            {
+                Ok(pipeline) => Some(Arc::new(pipeline)),
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        model = %selected_model,
+                        "semantic context unavailable; continuing without embeddings"
+                    );
+                    None
+                }
+            }
+        }
+    };
+    let search = SearchService::new(Arc::clone(&database), SearchConfig::default(), embeddings);
+    Ok(ContextService::new(vault, database, search))
+}
+
+pub(crate) fn render_context_payload(payload: &ContextPayload) {
     println!(
         "Context: {} {}",
         render_target_kind(payload.summary.kind),

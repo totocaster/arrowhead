@@ -320,6 +320,24 @@ impl ContextService {
                 }
             }
         }
+        if related_notes.len() < note_limit {
+            if let Ok(search_results) = self
+                .search
+                .related_to_note(&note.id, Some(note_limit * 2))
+                .await
+            {
+                let semantic_matches = search_results
+                    .into_iter()
+                    .map(|result| note_item_from_search_result(result, None))
+                    .collect::<Vec<_>>();
+                merge_note_items(
+                    &mut related_notes,
+                    semantic_matches,
+                    note_limit,
+                    &mut seen_note_ids,
+                );
+            }
+        }
 
         let explicit_metric_ids = extract_metric_references(&note);
         let note_dates = extract_note_dates(&note);

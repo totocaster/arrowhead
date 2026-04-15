@@ -15,9 +15,9 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics indexing model | In progress | Metrics conventions resolution, parser/validator coverage, SQLite persistence, core indexing refresh, and read/search surfaces are now wired; mutation indexing is now refreshed directly after record writes. |
 | Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
-| Context command family | In progress | `context day|week|changed|note|metric|source` are now wired in CLI/MCP; compatibility aliasing for older note/graph surfaces is still pending. |
+| Context command family | In progress | `context day|week|changed|note|metric|source` are now wired in CLI/MCP, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
 | Proactive linking | Proposed | Explicit and inferred links should be surfaced with reasons. |
-| Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD plus full time-window and entity context are now landing; compatibility aliasing and proactive linking are still pending. |
+| Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD plus full time-window and entity context are now landing; CLI compatibility aliasing is in, while proactive linking and MCP discovery consolidation are still pending. |
 
 ## Accepted Decisions
 

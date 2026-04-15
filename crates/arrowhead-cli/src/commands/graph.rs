@@ -7,10 +7,14 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::json;
 
 use arrowhead_core::{
-    GraphContext, GraphService, LinkEdge, LinkReason, Vault, VaultConfig, sqlite::IndexDatabase,
+    DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT, GraphService, LinkEdge, LinkReason,
+    Vault, VaultConfig, sqlite::IndexDatabase,
 };
 
-use super::CommandContext;
+use super::{
+    CommandContext,
+    context::{SemanticContextMode, build_context_service, render_context_payload},
+};
 
 /// Graph command dispatcher.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -37,7 +41,7 @@ pub enum GraphAction {
     Orphans,
     /// List unresolved WikiLinks.
     Unresolved,
-    /// Show a full context summary for a note.
+    /// Compatibility alias for `context note`.
     Context(NoteIdArg),
     /// Treat bare `note-id` invocations as context requests.
     #[command(external_subcommand)]
@@ -74,7 +78,7 @@ pub async fn run(ctx: &CommandContext, command: &GraphCommand) -> Result<()> {
         .clone()
         .context("no vault configured. Provide --vault or run `arrowhead init`.")?;
 
-    let vault = Vault::new(VaultConfig::new(vault_path))?;
+    let vault = Arc::new(Vault::new(VaultConfig::new(vault_path))?);
     vault.ensure_arrowhead_dirs()?;
     let db_path = vault.paths().arrowhead_dir.join("index.db");
     let database = Arc::new(IndexDatabase::open(&db_path)?);
@@ -92,14 +96,30 @@ pub async fn run(ctx: &CommandContext, command: &GraphCommand) -> Result<()> {
             render_forward_links(&note_id, &edges, command.json, command.format)?;
         }
         ResolvedGraphAction::Context(note_id) => {
-            ensure_note_indexed(&database, &note_id)?;
-            let context = service.context(&note_id).await?;
             if !command.json && command.format == GraphOutputFormat::Ids {
                 bail!(
                     "--format ids is not supported for `graph context`; use `graph forward-links` or `graph backlinks` instead."
                 );
             }
-            render_context(&note_id, &context, command.json, command.format)?;
+            let context_service = build_context_service(
+                ctx,
+                Arc::clone(&vault),
+                Arc::clone(&database),
+                SemanticContextMode::Preferred,
+            )
+            .await?;
+            let payload = context_service
+                .note(
+                    &note_id,
+                    Some(DEFAULT_CONTEXT_NOTE_LIMIT),
+                    Some(DEFAULT_CONTEXT_METRIC_LIMIT),
+                )
+                .await?;
+            if command.json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                render_context_payload(&payload);
+            }
         }
         ResolvedGraphAction::Orphans => {
             let orphans = service.orphans().await?;
@@ -312,89 +332,6 @@ fn render_unresolved(
         }
         GraphOutputFormat::Ids => {
             for identifier in unresolved_identifiers(edges) {
-                println!("{}", identifier);
-            }
-            Ok(())
-        }
-    }
-}
-
-fn render_context(
-    note_id: &str,
-    context: &GraphContext,
-    json_output: bool,
-    format: GraphOutputFormat,
-) -> Result<()> {
-    if json_output {
-        let forward: Vec<_> = context
-            .forward_links
-            .iter()
-            .map(|edge| edge_to_json(edge, LinkDirection::Forward))
-            .collect();
-        let backlinks: Vec<_> = context
-            .backlinks
-            .iter()
-            .map(|edge| edge_to_json(edge, LinkDirection::Backward))
-            .collect();
-        let unresolved: Vec<_> = context
-            .forward_links
-            .iter()
-            .filter(|edge| edge.reason == LinkReason::Unresolved)
-            .map(|edge| edge_to_json(edge, LinkDirection::Forward))
-            .collect();
-
-        let payload = json!({
-            "note_id": note_id,
-            "summary": {
-                "forward": forward.len(),
-                "backlinks": backlinks.len(),
-                "unresolved": unresolved.len(),
-            },
-            "forward_links": forward,
-            "backlinks": backlinks,
-            "unresolved": unresolved,
-        });
-
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
-    }
-
-    match format {
-        GraphOutputFormat::Human => {
-            render_forward_links(note_id, &context.forward_links, false, format)?;
-            println!();
-            render_backlinks(note_id, &context.backlinks, false, format)?;
-
-            let unresolved: Vec<&LinkEdge> = context
-                .forward_links
-                .iter()
-                .filter(|edge| edge.reason == LinkReason::Unresolved)
-                .collect();
-            if !unresolved.is_empty() {
-                println!();
-                println!("Unresolved links from {}:", note_id);
-                for edge in unresolved {
-                    println!("- [[{}]]", edge.raw);
-                }
-            }
-
-            Ok(())
-        }
-        GraphOutputFormat::Ids => {
-            // This branch is currently gated by the caller; keep logic for completeness.
-            for identifier in forward_link_identifiers(&context.forward_links) {
-                println!("{}", identifier);
-            }
-            for identifier in backlink_identifiers(&context.backlinks) {
-                println!("{}", identifier);
-            }
-            let unresolved_edges: Vec<LinkEdge> = context
-                .forward_links
-                .iter()
-                .filter(|edge| edge.reason == LinkReason::Unresolved)
-                .cloned()
-                .collect();
-            for identifier in unresolved_identifiers(&unresolved_edges) {
                 println!("{}", identifier);
             }
             Ok(())
