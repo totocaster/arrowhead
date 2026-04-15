@@ -1,7 +1,7 @@
 //! Safe metrics file mutation helpers.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -117,6 +117,54 @@ pub struct DeletedMetricRecord {
     pub source_line: usize,
 }
 
+/// Structured result for a created metrics file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedMetricFile {
+    /// Relative path of the created file.
+    pub relative_path: PathBuf,
+}
+
+/// Structured result for a renamed metrics file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamedMetricFile {
+    /// Previous relative file path.
+    pub source_path: PathBuf,
+    /// New relative file path.
+    pub destination_path: PathBuf,
+}
+
+/// Structured result for a deleted metrics file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedMetricFile {
+    /// Relative path of the deleted file.
+    pub relative_path: PathBuf,
+    /// Number of non-empty rows that were present before deletion.
+    pub row_count: usize,
+}
+
+/// Per-file summary for `assign-missing-ids`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignedMetricIdsFile {
+    /// Relative path of the rewritten file.
+    pub relative_path: PathBuf,
+    /// Number of ids assigned in this file.
+    pub assigned_count: usize,
+}
+
+/// Aggregate result for `assign-missing-ids`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignedMetricIdsSummary {
+    /// File-level assignment results.
+    pub files: Vec<AssignedMetricIdsFile>,
+    /// Total ids assigned across every processed file.
+    pub total_assigned: usize,
+}
+
 /// Metrics mutation service backed by a vault and index database.
 #[derive(Debug, Clone)]
 pub struct MetricsMutationService {
@@ -156,6 +204,58 @@ impl MetricsMutationService {
         task::spawn_blocking(move || delete_record(vault.as_ref(), database.as_ref(), &metric_ref))
             .await
             .context("metrics delete task aborted")?
+    }
+
+    /// Create an empty metrics file and refresh the index entry.
+    pub async fn create_file(&self, path: &Path) -> Result<CreatedMetricFile> {
+        let vault = Arc::clone(&self.vault);
+        let database = Arc::clone(&self.database);
+        let path = path.to_path_buf();
+        task::spawn_blocking(move || create_metrics_file(vault.as_ref(), database.as_ref(), &path))
+            .await
+            .context("metrics file create task aborted")?
+    }
+
+    /// Rename a metrics file and refresh its indexed location.
+    pub async fn rename_file(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<RenamedMetricFile> {
+        let vault = Arc::clone(&self.vault);
+        let database = Arc::clone(&self.database);
+        let source = source.to_path_buf();
+        let destination = destination.to_path_buf();
+        task::spawn_blocking(move || {
+            rename_metrics_file(vault.as_ref(), database.as_ref(), &source, &destination)
+        })
+        .await
+        .context("metrics file rename task aborted")?
+    }
+
+    /// Delete a metrics file and remove its indexed rows.
+    pub async fn delete_file(&self, path: &Path) -> Result<DeletedMetricFile> {
+        let vault = Arc::clone(&self.vault);
+        let database = Arc::clone(&self.database);
+        let path = path.to_path_buf();
+        task::spawn_blocking(move || delete_metrics_file(vault.as_ref(), database.as_ref(), &path))
+            .await
+            .context("metrics file delete task aborted")?
+    }
+
+    /// Assign generated ids to legacy rows that are missing them.
+    pub async fn assign_missing_ids(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<AssignedMetricIdsSummary> {
+        let vault = Arc::clone(&self.vault);
+        let database = Arc::clone(&self.database);
+        let path = path.map(Path::to_path_buf);
+        task::spawn_blocking(move || {
+            assign_missing_metric_ids(vault.as_ref(), database.as_ref(), path.as_deref())
+        })
+        .await
+        .context("metrics assign-missing-ids task aborted")?
     }
 }
 
@@ -281,6 +381,132 @@ fn delete_record(
     })
 }
 
+fn create_metrics_file(
+    vault: &Vault,
+    database: &IndexDatabase,
+    requested_path: &Path,
+) -> Result<CreatedMetricFile> {
+    let (relative_path, absolute_path) = resolve_existing_metrics_file_path(vault, requested_path)?;
+    if absolute_path.exists() {
+        bail!("metrics file `{}` already exists", relative_path.display());
+    }
+
+    write_string_atomic(&absolute_path, "")?;
+    refresh_index_for_file(vault, database, &relative_path)?;
+    Ok(CreatedMetricFile { relative_path })
+}
+
+fn rename_metrics_file(
+    vault: &Vault,
+    database: &IndexDatabase,
+    source_path: &Path,
+    destination_path: &Path,
+) -> Result<RenamedMetricFile> {
+    let (source_relative, source_absolute) =
+        resolve_existing_metrics_file_path(vault, source_path)?;
+    let (destination_relative, destination_absolute) =
+        resolve_existing_metrics_file_path(vault, destination_path)?;
+
+    if source_relative == destination_relative {
+        bail!("source and destination metrics files must be different");
+    }
+    if !source_absolute.exists() {
+        bail!(
+            "metrics file `{}` does not exist",
+            source_relative.display()
+        );
+    }
+    if destination_absolute.exists() {
+        bail!(
+            "metrics file `{}` already exists",
+            destination_relative.display()
+        );
+    }
+
+    if let Some(parent) = destination_absolute.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create metrics directory {}", parent.display()))?;
+    }
+
+    fs::rename(&source_absolute, &destination_absolute).with_context(|| {
+        format!(
+            "failed to rename metrics file {} to {}",
+            source_absolute.display(),
+            destination_absolute.display()
+        )
+    })?;
+    database.remove_metrics_file(&source_relative.to_string_lossy())?;
+    refresh_index_for_file(vault, database, &destination_relative)?;
+    clean_empty_metrics_parents(vault, source_absolute.parent())?;
+
+    Ok(RenamedMetricFile {
+        source_path: source_relative,
+        destination_path: destination_relative,
+    })
+}
+
+fn delete_metrics_file(
+    vault: &Vault,
+    database: &IndexDatabase,
+    requested_path: &Path,
+) -> Result<DeletedMetricFile> {
+    let (relative_path, absolute_path) = resolve_existing_metrics_file_path(vault, requested_path)?;
+    if !absolute_path.exists() {
+        bail!("metrics file `{}` does not exist", relative_path.display());
+    }
+
+    let row_count = parse_metrics_file(&absolute_path)?.len();
+    fs::remove_file(&absolute_path)
+        .with_context(|| format!("failed to delete metrics file {}", absolute_path.display()))?;
+    database.remove_metrics_file(&relative_path.to_string_lossy())?;
+    clean_empty_metrics_parents(vault, absolute_path.parent())?;
+
+    Ok(DeletedMetricFile {
+        relative_path,
+        row_count,
+    })
+}
+
+fn assign_missing_metric_ids(
+    vault: &Vault,
+    database: &IndexDatabase,
+    requested_path: Option<&Path>,
+) -> Result<AssignedMetricIdsSummary> {
+    let targets = resolve_assign_id_targets(vault, requested_path)?;
+    let mut used_ids = collect_present_metric_ids(vault)?;
+    let mut files = Vec::new();
+    let mut total_assigned = 0;
+
+    for target in targets {
+        let mut rows = parse_metrics_file(&target.absolute_path)?;
+        let mut assigned_count = 0;
+
+        for row in &mut rows {
+            if let Some(updated_line) = assign_missing_id_to_raw_line(&row.raw_line, &mut used_ids)?
+            {
+                row.raw_line = updated_line;
+                assigned_count += 1;
+            }
+        }
+
+        if assigned_count > 0 {
+            write_rows_preserving_raw_lines(&target.absolute_path, &rows)?;
+            refresh_index_for_file(vault, database, &target.relative_path)?;
+        }
+
+        total_assigned += assigned_count;
+        files.push(AssignedMetricIdsFile {
+            relative_path: target.relative_path,
+            assigned_count,
+        });
+    }
+
+    Ok(AssignedMetricIdsSummary {
+        files,
+        total_assigned,
+    })
+}
+
 fn resolve_write_target(vault: &Vault, requested: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
     let metrics = vault.metrics_conventions();
     let relative_path = if let Some(path) = requested {
@@ -296,6 +522,24 @@ fn resolve_write_target(vault: &Vault, requested: Option<&Path>) -> Result<(Path
     };
 
     Ok((relative_path.clone(), vault.note_path(&relative_path)))
+}
+
+fn resolve_existing_metrics_file_path(
+    vault: &Vault,
+    requested: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    let metrics = vault.metrics_conventions();
+    let relative_path = vault
+        .resolve_relative_metrics_path(requested)
+        .ok_or_else(|| {
+            anyhow!(
+                "metrics file `{}` must live under `{}` and use a supported metrics extension",
+                requested.display(),
+                metrics.root.display()
+            )
+        })?;
+    let absolute_path = vault.note_path(&relative_path);
+    Ok((relative_path, absolute_path))
 }
 
 fn locate_unique_metric_row(vault: &Vault, metric_id: &str) -> Result<LocatedMetricRow> {
@@ -364,6 +608,86 @@ fn append_metric_line(path: &Path, raw_line: &str) -> Result<()> {
     content.push_str(raw_line);
     content.push('\n');
     write_string_atomic(path, &content)
+}
+
+fn resolve_assign_id_targets(
+    vault: &Vault,
+    requested_path: Option<&Path>,
+) -> Result<Vec<crate::metrics::MetricsFileEntry>> {
+    if let Some(path) = requested_path {
+        let (relative_path, absolute_path) = resolve_existing_metrics_file_path(vault, path)?;
+        if !absolute_path.exists() {
+            bail!("metrics file `{}` does not exist", relative_path.display());
+        }
+        let metadata = fs::metadata(&absolute_path)
+            .with_context(|| format!("failed to stat metrics file {}", absolute_path.display()))?;
+        let file_modified_at = metadata
+            .modified()
+            .with_context(|| format!("failed to read metrics mtime {}", absolute_path.display()))?
+            .into();
+        return Ok(vec![crate::metrics::MetricsFileEntry {
+            relative_path,
+            absolute_path,
+            file_modified_at,
+        }]);
+    }
+
+    let targets = vault.metrics_files()?;
+    if targets.is_empty() {
+        bail!("no metrics files were discovered in this vault");
+    }
+    Ok(targets)
+}
+
+fn collect_present_metric_ids(vault: &Vault) -> Result<BTreeSet<String>> {
+    let mut ids = BTreeSet::new();
+    for file in vault.metrics_files()? {
+        for row in parse_metrics_file(&file.absolute_path)? {
+            if let Some(id) = extract_present_metric_id(&row.raw_line) {
+                ids.insert(id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn extract_present_metric_id(raw_line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(raw_line).ok()?;
+    let object = value.as_object()?;
+    let id = object.get("id")?.as_str()?.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+fn assign_missing_id_to_raw_line(
+    raw_line: &str,
+    used_ids: &mut BTreeSet<String>,
+) -> Result<Option<String>> {
+    let parsed = match serde_json::from_str::<Value>(raw_line) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let Value::Object(mut object) = parsed else {
+        return Ok(None);
+    };
+
+    let needs_id = match object.get("id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.trim().is_empty(),
+        Some(_) => false,
+    };
+    if !needs_id {
+        return Ok(None);
+    }
+
+    let id = generate_unique_metric_id(used_ids);
+    object.insert("id".to_string(), Value::String(id));
+    serde_json::to_string(&Value::Object(object))
+        .map(Some)
+        .context("failed to serialise metrics row with assigned id")
 }
 
 fn write_rows_preserving_raw_lines(path: &Path, rows: &[ParsedMetricRow]) -> Result<()> {
@@ -572,6 +896,40 @@ fn generate_metric_id() -> String {
     output.iter().collect()
 }
 
+fn generate_unique_metric_id(used_ids: &mut BTreeSet<String>) -> String {
+    loop {
+        let candidate = generate_metric_id();
+        if used_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+}
+
+fn clean_empty_metrics_parents(vault: &Vault, start: Option<&Path>) -> Result<()> {
+    let metrics_root = vault.note_path(&vault.metrics_conventions().root);
+    let Some(mut current) = start.map(Path::to_path_buf) else {
+        return Ok(());
+    };
+
+    while current.starts_with(&metrics_root) && current != metrics_root {
+        let is_empty = fs::read_dir(&current)
+            .with_context(|| format!("failed to inspect metrics directory {}", current.display()))?
+            .next()
+            .is_none();
+        if !is_empty {
+            break;
+        }
+        fs::remove_dir(&current)
+            .with_context(|| format!("failed to remove empty directory {}", current.display()))?;
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +1095,182 @@ mod tests {
             err.to_string().contains("ambiguous"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_file_creates_empty_metrics_file_and_indexes_it() {
+        let (_dir, mutation, read) = build_service();
+
+        let created = mutation
+            .create_file(Path::new("Metrics/Health.metrics.ndjson"))
+            .await
+            .expect("create file");
+
+        assert_eq!(
+            created.relative_path,
+            PathBuf::from("Metrics/Health.metrics.ndjson")
+        );
+        assert!(
+            mutation.vault.note_path(&created.relative_path).exists(),
+            "created file should exist on disk"
+        );
+
+        let files = read.list_files().await.expect("list files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, created.relative_path);
+        assert_eq!(files[0].row_count, 0);
+    }
+
+    #[tokio::test]
+    async fn rename_file_moves_metrics_file_and_updates_index() {
+        let (_dir, mutation, read) = build_service();
+
+        mutation
+            .create(MetricCreateRequest {
+                file: Some(PathBuf::from("Metrics/Legacy.metrics.ndjson")),
+                id: Some("01TESTRENAME00000000000000".to_string()),
+                ts: DateTime::parse_from_rfc3339("2026-04-14T08:30:00+04:00").expect("ts"),
+                key: "body.weight".to_string(),
+                value: 105.6,
+                source: "withings".to_string(),
+                date: None,
+                unit: Some("kg".to_string()),
+                origin_id: None,
+                note: None,
+                context: None,
+                tags: Vec::new(),
+                extra_fields: BTreeMap::new(),
+            })
+            .await
+            .expect("seed file");
+
+        let renamed = mutation
+            .rename_file(
+                Path::new("Metrics/Legacy.metrics.ndjson"),
+                Path::new("Metrics/Body.metrics.ndjson"),
+            )
+            .await
+            .expect("rename file");
+
+        assert_eq!(
+            renamed.source_path,
+            PathBuf::from("Metrics/Legacy.metrics.ndjson")
+        );
+        assert_eq!(
+            renamed.destination_path,
+            PathBuf::from("Metrics/Body.metrics.ndjson")
+        );
+        assert!(
+            !mutation
+                .vault
+                .note_path("Metrics/Legacy.metrics.ndjson")
+                .exists(),
+            "source file should be removed"
+        );
+        assert!(
+            mutation
+                .vault
+                .note_path("Metrics/Body.metrics.ndjson")
+                .exists(),
+            "destination file should exist"
+        );
+
+        let files = read.list_files().await.expect("list files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].relative_path, renamed.destination_path);
+        assert_eq!(
+            read.read_record("01TESTRENAME00000000000000")
+                .await
+                .expect("read renamed record")
+                .expect("record present")
+                .source_file,
+            PathBuf::from("Metrics/Body.metrics.ndjson")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_file_removes_metrics_file_and_index_rows() {
+        let (_dir, mutation, read) = build_service();
+
+        mutation
+            .create(MetricCreateRequest {
+                file: Some(PathBuf::from("Metrics/Legacy.metrics.ndjson")),
+                id: Some("01TESTFILEDELETE0000000000".to_string()),
+                ts: DateTime::parse_from_rfc3339("2026-04-14T08:30:00+04:00").expect("ts"),
+                key: "body.weight".to_string(),
+                value: 105.6,
+                source: "withings".to_string(),
+                date: None,
+                unit: Some("kg".to_string()),
+                origin_id: None,
+                note: None,
+                context: None,
+                tags: Vec::new(),
+                extra_fields: BTreeMap::new(),
+            })
+            .await
+            .expect("seed file");
+
+        let deleted = mutation
+            .delete_file(Path::new("Metrics/Legacy.metrics.ndjson"))
+            .await
+            .expect("delete file");
+
+        assert_eq!(
+            deleted.relative_path,
+            PathBuf::from("Metrics/Legacy.metrics.ndjson")
+        );
+        assert_eq!(deleted.row_count, 1);
+        assert!(
+            !mutation
+                .vault
+                .note_path("Metrics/Legacy.metrics.ndjson")
+                .exists(),
+            "deleted file should be removed from disk"
+        );
+        assert!(
+            read.list_files().await.expect("list files").is_empty(),
+            "deleted file should be removed from index"
+        );
+    }
+
+    #[tokio::test]
+    async fn assign_missing_ids_rewrites_missing_id_rows_and_refreshes_index() {
+        let (_dir, mutation, read) = build_service();
+        let path = mutation.vault.note_path("Metrics/Legacy.metrics.ndjson");
+        fs::create_dir_all(path.parent().expect("metrics dir")).expect("create metrics dir");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"ts":"2026-04-14T08:30:00+04:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings"}"#,
+                "\n",
+                r#"{"id":"01HASID000000000000000000","ts":"2026-04-15T08:30:00+04:00","key":"body.weight","value":104.9,"unit":"kg","source":"withings"}"#,
+                "\n"
+            ),
+        )
+        .expect("write legacy file");
+
+        let summary = mutation
+            .assign_missing_ids(Some(Path::new("Metrics/Legacy.metrics.ndjson")))
+            .await
+            .expect("assign missing ids");
+
+        assert_eq!(summary.total_assigned, 1);
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].assigned_count, 1);
+
+        let content = fs::read_to_string(&path).expect("read rewritten file");
+        assert!(content.contains("\"id\":\"01HASID000000000000000000\""));
+        assert!(
+            content
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("\"id\":\"")),
+            "first legacy row should receive a generated id"
+        );
+
+        let files = read.list_files().await.expect("list files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].record_count, 2);
     }
 }

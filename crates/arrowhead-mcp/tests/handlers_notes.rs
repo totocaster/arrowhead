@@ -366,6 +366,115 @@ async fn metrics_delete_removes_record() {
 }
 
 #[tokio::test]
+async fn metrics_create_file_creates_indexed_file() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_create_file",
+        json!({ "path": "Metrics/new.metrics.ndjson" }),
+    )
+    .await;
+
+    let file = structured
+        .get("file")
+        .and_then(Value::as_object)
+        .expect("file payload present");
+    assert_eq!(
+        file.get("relativePath").and_then(Value::as_str),
+        Some("Metrics/new.metrics.ndjson")
+    );
+    assert!(
+        temp_dir.path().join("Metrics/new.metrics.ndjson").exists(),
+        "created file should exist on disk"
+    );
+}
+
+#[tokio::test]
+async fn metrics_rename_file_moves_indexed_file() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_rename_file",
+        json!({
+            "sourcePath": "Metrics/health.metrics.ndjson",
+            "destinationPath": "Metrics/body.metrics.ndjson"
+        }),
+    )
+    .await;
+
+    let file = structured
+        .get("file")
+        .and_then(Value::as_object)
+        .expect("file payload present");
+    assert_eq!(
+        file.get("sourcePath").and_then(Value::as_str),
+        Some("Metrics/health.metrics.ndjson")
+    );
+    assert_eq!(
+        file.get("destinationPath").and_then(Value::as_str),
+        Some("Metrics/body.metrics.ndjson")
+    );
+    assert!(
+        !temp_dir
+            .path()
+            .join("Metrics/health.metrics.ndjson")
+            .exists(),
+        "source file should be removed"
+    );
+    assert!(
+        temp_dir.path().join("Metrics/body.metrics.ndjson").exists(),
+        "destination file should exist"
+    );
+}
+
+#[tokio::test]
+async fn metrics_delete_file_requires_confirmation() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let err = call_tool_error(
+        &handler,
+        "metrics_delete_file",
+        json!({ "path": "Metrics/health.metrics.ndjson" }),
+    )
+    .await;
+    assert!(matches!(err, ProtocolError::InvalidParams { .. }));
+}
+
+#[tokio::test]
+async fn metrics_delete_file_removes_path() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_delete_file",
+        json!({ "path": "Metrics/health.metrics.ndjson", "confirm": true }),
+    )
+    .await;
+
+    let file = structured
+        .get("file")
+        .and_then(Value::as_object)
+        .expect("file payload present");
+    assert_eq!(
+        file.get("relativePath").and_then(Value::as_str),
+        Some("Metrics/health.metrics.ndjson")
+    );
+    assert!(
+        !temp_dir
+            .path()
+            .join("Metrics/health.metrics.ndjson")
+            .exists(),
+        "deleted file should be removed"
+    );
+}
+
+#[tokio::test]
 async fn vault_status_returns_cached_status_when_daemon_unreachable() {
     let temp_dir = copy_fixture();
     let status_path = temp_dir.path().join("status.json");
@@ -812,5 +921,23 @@ async fn protocol_tools_list_contains_metrics_and_note_tools() {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_delete")),
         "tool list should include metrics_delete"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_create_file")),
+        "tool list should include metrics_create_file"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_rename_file")),
+        "tool list should include metrics_rename_file"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_delete_file")),
+        "tool list should include metrics_delete_file"
     );
 }

@@ -11,11 +11,12 @@ use tracing::info;
 use super::CommandContext;
 use crate::logging;
 use arrowhead_core::{
-    DeletedMetricRecord, MetricCreateRequest, MetricRecordEntry, MetricUpdateRequest,
-    MetricsMutationService, MetricsService, PatchValue, Vault, VaultConfig, sqlite::IndexDatabase,
+    AssignedMetricIdsSummary, CreatedMetricFile, DeletedMetricFile, DeletedMetricRecord,
+    MetricCreateRequest, MetricRecordEntry, MetricUpdateRequest, MetricsMutationService,
+    MetricsService, PatchValue, RenamedMetricFile, Vault, VaultConfig, sqlite::IndexDatabase,
 };
 
-/// Read-only metrics operations.
+/// Metrics read and write operations.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct MetricsCommand {
     /// Select which metrics operation to perform.
@@ -38,11 +39,62 @@ pub enum MetricsAction {
     Update(UpdateArgs),
     /// Delete a metric record by id.
     Delete(DeleteArgs),
+    /// Assign generated ids to legacy rows that are missing them.
+    AssignMissingIds(AssignMissingIdsArgs),
 }
 
 /// Arguments for `arrowhead metrics files`.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct FilesArgs {
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+    /// Optional file mutation subcommand.
+    #[command(subcommand)]
+    pub action: Option<FilesAction>,
+}
+
+/// Available `arrowhead metrics files` subcommands.
+#[derive(Debug, Subcommand, Clone, PartialEq)]
+pub enum FilesAction {
+    /// Create an empty metrics file.
+    Create(FileCreateArgs),
+    /// Rename a metrics file.
+    Rename(FileRenameArgs),
+    /// Delete a metrics file.
+    Delete(FileDeleteArgs),
+}
+
+/// Arguments for `arrowhead metrics files create`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct FileCreateArgs {
+    /// Target metrics file relative to the vault root.
+    pub path: PathBuf,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `arrowhead metrics files rename`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct FileRenameArgs {
+    /// Existing metrics file relative to the vault root.
+    pub source_path: PathBuf,
+    /// New metrics file relative to the vault root.
+    pub destination_path: PathBuf,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `arrowhead metrics files delete`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct FileDeleteArgs {
+    /// Metrics file relative to the vault root.
+    pub path: PathBuf,
+    /// Required acknowledgement for destructive deletes.
+    #[arg(long)]
+    pub yes: bool,
     /// Emit structured JSON instead of human-readable output.
     #[arg(long)]
     pub json: bool,
@@ -186,6 +238,17 @@ pub struct DeleteArgs {
     pub json: bool,
 }
 
+/// Arguments for `arrowhead metrics assign-missing-ids`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct AssignMissingIdsArgs {
+    /// Optional metrics file relative to the vault root. Defaults to all discovered metrics files.
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// Execute the requested metrics command.
 pub async fn run(ctx: &CommandContext, command: &MetricsCommand) -> Result<()> {
     let vault_path = ctx
@@ -207,32 +270,83 @@ pub async fn run(ctx: &CommandContext, command: &MetricsCommand) -> Result<()> {
 
     match &command.action {
         MetricsAction::Files(args) => {
-            info!(json = args.json, "listing indexed metrics files");
-            let files = read_service.list_files().await?;
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({ "files": files }))?
-                );
-                return Ok(());
-            }
+            match &args.action {
+                None => {
+                    info!(json = args.json, "listing indexed metrics files");
+                    let files = read_service.list_files().await?;
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "files": files }))?
+                        );
+                        return Ok(());
+                    }
 
-            if files.is_empty() {
-                render_empty_metrics_state(vault.as_ref())?;
-                return Ok(());
-            }
+                    if files.is_empty() {
+                        render_empty_metrics_state(vault.as_ref())?;
+                        return Ok(());
+                    }
 
-            for file in files {
-                println!(
-                    "{}\n  rows: {}  records: {}  warnings: {}  errors: {}\n  modified: {}\n  indexed: {}",
-                    file.relative_path.display(),
-                    file.row_count,
-                    file.record_count,
-                    file.warning_count,
-                    file.error_count,
-                    file.file_modified_at.to_rfc3339(),
-                    file.indexed_at.to_rfc3339(),
-                );
+                    for file in files {
+                        println!(
+                            "{}\n  rows: {}  records: {}  warnings: {}  errors: {}\n  modified: {}\n  indexed: {}",
+                            file.relative_path.display(),
+                            file.row_count,
+                            file.record_count,
+                            file.warning_count,
+                            file.error_count,
+                            file.file_modified_at.to_rfc3339(),
+                            file.indexed_at.to_rfc3339(),
+                        );
+                    }
+                }
+                Some(FilesAction::Create(file_args)) => {
+                    let created = mutation_service.create_file(&file_args.path).await?;
+                    if file_args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "action": "created",
+                                "file": created
+                            }))?
+                        );
+                    } else {
+                        print_created_metrics_file(&created);
+                    }
+                }
+                Some(FilesAction::Rename(file_args)) => {
+                    let renamed = mutation_service
+                        .rename_file(&file_args.source_path, &file_args.destination_path)
+                        .await?;
+                    if file_args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "action": "renamed",
+                                "file": renamed
+                            }))?
+                        );
+                    } else {
+                        print_renamed_metrics_file(&renamed);
+                    }
+                }
+                Some(FilesAction::Delete(file_args)) => {
+                    if !file_args.yes {
+                        bail!("metrics files delete requires `--yes`");
+                    }
+                    let deleted = mutation_service.delete_file(&file_args.path).await?;
+                    if file_args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "action": "deleted",
+                                "file": deleted
+                            }))?
+                        );
+                    } else {
+                        print_deleted_metrics_file(&deleted);
+                    }
+                }
             }
             Ok(())
         }
@@ -339,6 +453,23 @@ pub async fn run(ctx: &CommandContext, command: &MetricsCommand) -> Result<()> {
                 );
             } else {
                 print_deleted_metric_record(&deleted);
+            }
+            Ok(())
+        }
+        MetricsAction::AssignMissingIds(args) => {
+            let summary = mutation_service
+                .assign_missing_ids(args.file.as_deref())
+                .await?;
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "action": "assigned_missing_ids",
+                        "summary": summary
+                    }))?
+                );
+            } else {
+                print_assigned_metric_ids_summary(&summary);
             }
             Ok(())
         }
@@ -561,6 +692,71 @@ fn print_deleted_metric_record(record: &DeletedMetricRecord) {
         record.source_file.display(),
         record.source_line
     );
+}
+
+fn print_created_metrics_file(file: &CreatedMetricFile) {
+    println!("Created metrics file {}", file.relative_path.display());
+}
+
+fn print_renamed_metrics_file(file: &RenamedMetricFile) {
+    println!(
+        "Renamed metrics file {} -> {}",
+        file.source_path.display(),
+        file.destination_path.display()
+    );
+}
+
+fn print_deleted_metrics_file(file: &DeletedMetricFile) {
+    println!(
+        "Deleted metrics file {} ({} row{})",
+        file.relative_path.display(),
+        file.row_count,
+        if file.row_count == 1 { "" } else { "s" }
+    );
+}
+
+fn print_assigned_metric_ids_summary(summary: &AssignedMetricIdsSummary) {
+    if summary.total_assigned == 0 {
+        println!(
+            "No missing metric ids were found in {} file{}.",
+            summary.files.len(),
+            if summary.files.len() == 1 { "" } else { "s" }
+        );
+        return;
+    }
+
+    println!(
+        "Assigned {} missing metric id{} across {} file{}.",
+        summary.total_assigned,
+        if summary.total_assigned == 1 { "" } else { "s" },
+        summary
+            .files
+            .iter()
+            .filter(|file| file.assigned_count > 0)
+            .count(),
+        if summary
+            .files
+            .iter()
+            .filter(|file| file.assigned_count > 0)
+            .count()
+            == 1
+        {
+            ""
+        } else {
+            "s"
+        }
+    );
+    for file in &summary.files {
+        if file.assigned_count == 0 {
+            continue;
+        }
+        println!(
+            "  {}: {} row{}",
+            file.relative_path.display(),
+            file.assigned_count,
+            if file.assigned_count == 1 { "" } else { "s" }
+        );
+    }
 }
 
 fn metric_validation_label(record: &MetricRecordEntry) -> &'static str {

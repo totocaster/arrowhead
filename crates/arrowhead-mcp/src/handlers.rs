@@ -28,11 +28,13 @@ use crate::{
         CallToolParams, CallToolResultPayload, DaemonStatusPayload, GraphContextPayload,
         GraphLinksPayload, GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload,
         ImplementationDescriptor, InitializeParams, InitializeResultPayload, LinkEdgePayload,
-        MetricCreateParams, MetricDeleteParams, MetricDeletePayload, MetricReadParams,
-        MetricReadPayload, MetricUpdateParams, MetricsFilesPayload, MetricsSearchResultsPayload,
-        NoteContentPayload, NoteCreateParams, NoteDeleteParams, NoteDeletePayload, NoteListItem,
-        NoteMetadataParams, NoteMetadataPayload, NoteReadParams, NoteUpdateParams, NotesListParams,
-        NotesListPayload, OrphanNotePayload, RelatedNotesParams, SearchParams, SearchResultPayload,
+        MetricCreateParams, MetricDeleteParams, MetricDeletePayload, MetricFileCreateParams,
+        MetricFileCreatePayload, MetricFileDeleteParams, MetricFileDeletePayload,
+        MetricFileRenameParams, MetricFileRenamePayload, MetricReadParams, MetricReadPayload,
+        MetricUpdateParams, MetricsFilesPayload, MetricsSearchResultsPayload, NoteContentPayload,
+        NoteCreateParams, NoteDeleteParams, NoteDeletePayload, NoteListItem, NoteMetadataParams,
+        NoteMetadataPayload, NoteReadParams, NoteUpdateParams, NotesListParams, NotesListPayload,
+        OrphanNotePayload, RelatedNotesParams, SearchParams, SearchResultPayload,
         SearchResultsPayload, ServerCapabilitiesPayload, ToolCapabilityPayload, ToolDescriptor,
         ToolsListPayload, VaultStatsParams,
     },
@@ -355,6 +357,51 @@ impl HandlerRegistry {
         let payload = MetricDeletePayload { deleted };
         serde_json::to_value(payload).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise deleted metric record: {err}"))
+        })
+    }
+
+    async fn handle_metrics_create_file(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricFileCreateParams = request.params.deserialize()?;
+        let service = self.runtime.metrics_mutation_service().clone();
+        let file = service
+            .create_file(&params.path)
+            .await
+            .map_err(map_metrics_mutation_error)?;
+        let payload = MetricFileCreatePayload { file };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise created metrics file: {err}"))
+        })
+    }
+
+    async fn handle_metrics_rename_file(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricFileRenameParams = request.params.deserialize()?;
+        let service = self.runtime.metrics_mutation_service().clone();
+        let file = service
+            .rename_file(&params.source_path, &params.destination_path)
+            .await
+            .map_err(map_metrics_mutation_error)?;
+        let payload = MetricFileRenamePayload { file };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise renamed metrics file: {err}"))
+        })
+    }
+
+    async fn handle_metrics_delete_file(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricFileDeleteParams = request.params.deserialize()?;
+        if !params.confirm {
+            return Err(ProtocolError::invalid_params(
+                "set `confirm: true` to delete a metrics file",
+            ));
+        }
+
+        let service = self.runtime.metrics_mutation_service().clone();
+        let file = service
+            .delete_file(&params.path)
+            .await
+            .map_err(map_metrics_mutation_error)?;
+        let payload = MetricFileDeletePayload { file };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise deleted metrics file: {err}"))
         })
     }
 
@@ -730,6 +777,35 @@ impl HandlerRegistry {
                     .map(|metric_id| format!("Deleted metric {metric_id}."));
                 CallToolResultPayload::from_value_with_message(result, message)
             }
+            "metrics_create_file" => {
+                let message = result
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .and_then(|file| file.get("relativePath"))
+                    .and_then(Value::as_str)
+                    .map(|path| format!("Created metrics file {path}."));
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
+            "metrics_rename_file" => {
+                let message = result
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .and_then(|file| {
+                        let source = file.get("sourcePath")?.as_str()?;
+                        let destination = file.get("destinationPath")?.as_str()?;
+                        Some(format!("Renamed metrics file {source} -> {destination}."))
+                    });
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
+            "metrics_delete_file" => {
+                let message = result
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .and_then(|file| file.get("relativePath"))
+                    .and_then(Value::as_str)
+                    .map(|path| format!("Deleted metrics file {path}."));
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
             "vault_status" => {
                 let message = result
                     .get("summary")
@@ -768,6 +844,9 @@ impl HandlerRegistry {
             "mcp.metrics.create" => self.handle_metrics_create(request).await,
             "mcp.metrics.update" => self.handle_metrics_update(request).await,
             "mcp.metrics.delete" => self.handle_metrics_delete(request).await,
+            "mcp.metrics.create_file" => self.handle_metrics_create_file(request).await,
+            "mcp.metrics.rename_file" => self.handle_metrics_rename_file(request).await,
+            "mcp.metrics.delete_file" => self.handle_metrics_delete_file(request).await,
             "mcp.vault.status" => self.handle_vault_status().await,
             "mcp.notes.read" => self.handle_note_read(request).await,
             "mcp.notes.list" => self.handle_note_list(request).await,
@@ -1028,6 +1107,39 @@ impl HandlerRegistry {
                 }
             },
             "required": ["metricId"]
+        });
+        let metric_file_create_schema = json!({
+            "type": "object",
+            "description": "Parameters for creating an empty metrics file.",
+            "additionalProperties": false,
+            "properties": {
+                "path": path_schema("Target metrics file relative to the vault root.")
+            },
+            "required": ["path"]
+        });
+        let metric_file_rename_schema = json!({
+            "type": "object",
+            "description": "Parameters for renaming a metrics file.",
+            "additionalProperties": false,
+            "properties": {
+                "sourcePath": path_schema("Existing metrics file relative to the vault root."),
+                "destinationPath": path_schema("New metrics file relative to the vault root.")
+            },
+            "required": ["sourcePath", "destinationPath"]
+        });
+        let metric_file_delete_schema = json!({
+            "type": "object",
+            "description": "Parameters for deleting a metrics file.",
+            "additionalProperties": false,
+            "properties": {
+                "path": path_schema("Metrics file relative to the vault root."),
+                "confirm": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Safety confirmation flag; must be true to delete."
+                }
+            },
+            "required": ["path"]
         });
         let notes_list_schema = json!({
             "type": "object",
@@ -1313,6 +1425,60 @@ impl HandlerRegistry {
                             "type": "integer",
                             "minimum": 1,
                             "description": "1-based line number of the deleted record before removal."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_file_create_payload_schema = json!({
+            "type": "object",
+            "description": "Confirmation that a metrics file was created.",
+            "required": ["file"],
+            "properties": {
+                "file": {
+                    "type": "object",
+                    "required": ["relativePath"],
+                    "properties": {
+                        "relativePath": path_schema("Vault-relative metrics file path.")
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_file_rename_payload_schema = json!({
+            "type": "object",
+            "description": "Confirmation that a metrics file was renamed.",
+            "required": ["file"],
+            "properties": {
+                "file": {
+                    "type": "object",
+                    "required": ["sourcePath", "destinationPath"],
+                    "properties": {
+                        "sourcePath": path_schema("Previous vault-relative metrics file path."),
+                        "destinationPath": path_schema("New vault-relative metrics file path.")
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_file_delete_payload_schema = json!({
+            "type": "object",
+            "description": "Confirmation that a metrics file was deleted.",
+            "required": ["file"],
+            "properties": {
+                "file": {
+                    "type": "object",
+                    "required": ["relativePath", "rowCount"],
+                    "properties": {
+                        "relativePath": path_schema("Deleted vault-relative metrics file path."),
+                        "rowCount": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Number of non-empty rows that existed before deletion."
                         }
                     },
                     "additionalProperties": false
@@ -2000,6 +2166,39 @@ impl HandlerRegistry {
                 annotations: Some(json!({ "method": "mcp.metrics.delete" })),
             },
             ToolDescriptor {
+                name: "metrics_create_file".to_string(),
+                title: Some("Metrics: Create File".to_string()),
+                description: Some(
+                    "Create an empty metrics NDJSON file and refresh the metrics index."
+                        .to_string(),
+                ),
+                input_schema: metric_file_create_schema,
+                output_schema: Some(metric_file_create_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.create_file" })),
+            },
+            ToolDescriptor {
+                name: "metrics_rename_file".to_string(),
+                title: Some("Metrics: Rename File".to_string()),
+                description: Some(
+                    "Rename a metrics file and move its indexed rows to the new path."
+                        .to_string(),
+                ),
+                input_schema: metric_file_rename_schema,
+                output_schema: Some(metric_file_rename_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.rename_file" })),
+            },
+            ToolDescriptor {
+                name: "metrics_delete_file".to_string(),
+                title: Some("Metrics: Delete File".to_string()),
+                description: Some(
+                    "Delete a metrics file after explicit confirmation and remove it from the index."
+                        .to_string(),
+                ),
+                input_schema: metric_file_delete_schema,
+                output_schema: Some(metric_file_delete_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.delete_file" })),
+            },
+            ToolDescriptor {
                 name: "vault_status".to_string(),
                 title: Some("Vault: Status".to_string()),
                 description: Some(
@@ -2213,6 +2412,9 @@ fn resolve_tool_method(name: &str) -> Option<&'static str> {
         "metrics_create" => Some("mcp.metrics.create"),
         "metrics_update" => Some("mcp.metrics.update"),
         "metrics_delete" => Some("mcp.metrics.delete"),
+        "metrics_create_file" => Some("mcp.metrics.create_file"),
+        "metrics_rename_file" => Some("mcp.metrics.rename_file"),
+        "metrics_delete_file" => Some("mcp.metrics.delete_file"),
         "vault_status" => Some("mcp.vault.status"),
         "notes_read" => Some("mcp.notes.read"),
         "notes_list" => Some("mcp.notes.list"),
@@ -2263,6 +2465,10 @@ fn map_metrics_mutation_error(err: Error) -> ProtocolError {
         || message.contains("ambiguous")
         || message.contains("cannot use `--")
         || message.contains("metric row is invalid")
+        || message.contains("does not exist")
+        || message.contains("must live under")
+        || message.contains("must be different")
+        || message.contains("no metrics files were discovered")
     {
         ProtocolError::invalid_params(message)
     } else {

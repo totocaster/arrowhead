@@ -13,11 +13,11 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | --- | --- | --- |
 | Product direction | Accepted | Arrowhead stays a complementary assistant tool for agents, automation, CLI, and MCP usage. |
 | Metrics indexing model | In progress | Metrics conventions resolution, parser/validator coverage, SQLite persistence, core indexing refresh, and read/search surfaces are now wired; mutation indexing is now refreshed directly after record writes. |
-| Metrics CLI CRUD | In progress | Record-level `metrics create`, `metrics update`, and `metrics delete` are now wired alongside `metrics files`, `metrics read`, and `metrics search`; file subcommands and `assign-missing-ids` are still pending. |
-| Metrics MCP CRUD | In progress | Record-level `mcp.metrics.create`, `mcp.metrics.update`, and `mcp.metrics.delete` now join the read-only metrics tools; file-level MCP mutations are still pending. |
+| Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
+| Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
 | Context command family | Proposed | New context surfaces should work across days, notes, and metrics. |
 | Proactive linking | Proposed | Explicit and inferred links should be surfaced with reasons. |
-| Implementation | In progress | Round 1 through record-level CLI/MCP metrics CRUD are now landing; file subcommands and context retrieval are still pending. |
+| Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD are now landing; context retrieval is still pending. |
 
 ## Accepted Decisions
 
@@ -602,8 +602,10 @@ This should complement the existing Metrics plugin, not compete with it.
 
 - implement CLI CRUD
   - record-level `create`, `update`, and `delete` are now wired
+  - file-level `files create`, `files rename`, `files delete`, and `assign-missing-ids` are now wired
 - implement MCP CRUD
   - record-level `create`, `update`, and `delete` are now wired
+  - file-level `create_file`, `rename_file`, and `delete_file` are now wired
 - ensure writes go to canonical NDJSON files
 - reject unsafe mutations with actionable errors
 

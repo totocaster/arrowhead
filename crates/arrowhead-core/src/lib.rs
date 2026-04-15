@@ -38,8 +38,9 @@ pub use metrics::{
     ParsedMetricRow, parse_metrics_file, parse_metrics_line, parse_metrics_reader,
 };
 pub use metrics_mutation::{
+    AssignedMetricIdsFile, AssignedMetricIdsSummary, CreatedMetricFile, DeletedMetricFile,
     DeletedMetricRecord, MetricCreateRequest, MetricUpdateRequest, MetricsMutationService,
-    PatchValue,
+    PatchValue, RenamedMetricFile,
 };
 pub use metrics_service::{
     DEFAULT_METRICS_SEARCH_LIMIT, MetricFileSummary, MetricRecordEntry, MetricsQuery,

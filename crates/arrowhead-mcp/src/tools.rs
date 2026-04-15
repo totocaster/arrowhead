@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use arrowhead_core::{
-    DeletedMetricRecord, LinkEdge, MetadataMap, MetricFileSummary, MetricRecordEntry, NoteRecord,
-    SearchResult,
+    CreatedMetricFile, DeletedMetricFile, DeletedMetricRecord, LinkEdge, MetadataMap,
+    MetricFileSummary, MetricRecordEntry, NoteRecord, RenamedMetricFile, SearchResult,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -237,6 +237,35 @@ pub struct MetricDeleteParams {
     pub confirm: bool,
 }
 
+/// Parameters for creating an empty metrics file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricFileCreateParams {
+    /// Target metrics file relative to the vault root.
+    pub path: PathBuf,
+}
+
+/// Parameters for renaming a metrics file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricFileRenameParams {
+    /// Existing metrics file relative to the vault root.
+    pub source_path: PathBuf,
+    /// New metrics file relative to the vault root.
+    pub destination_path: PathBuf,
+}
+
+/// Parameters for deleting a metrics file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricFileDeleteParams {
+    /// Metrics file relative to the vault root.
+    pub path: PathBuf,
+    #[serde(default)]
+    /// Safety confirmation flag; must be true to delete.
+    pub confirm: bool,
+}
+
 /// Response payload for `mcp.metrics.list_files`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -259,6 +288,30 @@ pub struct MetricReadPayload {
 pub struct MetricDeletePayload {
     /// Deleted metric descriptor.
     pub deleted: DeletedMetricRecord,
+}
+
+/// Response payload for `mcp.metrics.create_file`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricFileCreatePayload {
+    /// Created metrics file descriptor.
+    pub file: CreatedMetricFile,
+}
+
+/// Response payload for `mcp.metrics.rename_file`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricFileRenamePayload {
+    /// Renamed metrics file descriptor.
+    pub file: RenamedMetricFile,
+}
+
+/// Response payload for `mcp.metrics.delete_file`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricFileDeletePayload {
+    /// Deleted metrics file descriptor.
+    pub file: DeletedMetricFile,
 }
 
 /// Response payload for `mcp.metrics.search`.
