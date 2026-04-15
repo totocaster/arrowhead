@@ -611,6 +611,87 @@ async fn metrics_delete_file_removes_path() {
 }
 
 #[tokio::test]
+async fn context_get_day_returns_context_sections() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured =
+        call_tool_structured(&handler, "context_get_day", json!({ "day": "2026-04-14" })).await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("day")
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
+            .and_then(|activity| activity.get("metrics"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected day context metric activity"
+    );
+}
+
+#[tokio::test]
+async fn context_get_week_accepts_anchor_day() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured =
+        call_tool_structured(&handler, "context_get_week", json!({ "day": "2026-04-14" })).await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("week")
+    );
+    assert!(
+        structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("days"))
+            .and_then(Value::as_array)
+            .is_some_and(|days| days.iter().any(|day| day.as_str() == Some("2026-04-14"))),
+        "expected week context related days"
+    );
+}
+
+#[tokio::test]
+async fn context_get_changed_returns_recent_activity() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured =
+        call_tool_structured(&handler, "context_get_changed", json!({ "days": 3 })).await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("changed")
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
+            .and_then(|activity| activity.get("notes"))
+            .and_then(Value::as_array)
+            .is_some_and(|notes| !notes.is_empty()),
+        "expected changed context note activity"
+    );
+}
+
+#[tokio::test]
 async fn context_get_note_returns_context_sections() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let handler = build_handler_with_context(&temp_dir).await;
@@ -1170,6 +1251,24 @@ async fn protocol_tools_list_contains_metrics_and_note_tools() {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_delete_file")),
         "tool list should include metrics_delete_file"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_day")),
+        "tool list should include context_get_day"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_week")),
+        "tool list should include context_get_week"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_changed")),
+        "tool list should include context_get_changed"
     );
     assert!(
         tools

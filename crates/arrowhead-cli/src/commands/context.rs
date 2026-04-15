@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use clap::{Args, Subcommand};
 use serde_json::to_string_pretty;
 
@@ -11,7 +12,7 @@ use crate::logging;
 use arrowhead_core::{
     ContextAttentionItem, ContextLink, ContextPayload, ContextService, ContextTargetKind,
     DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT, SearchConfig, SearchService, Vault,
-    VaultConfig, sqlite::IndexDatabase,
+    VaultConfig, WeekContextSelector, sqlite::IndexDatabase,
 };
 
 /// Context retrieval commands spanning notes, metrics, and sources.
@@ -25,12 +26,74 @@ pub struct ContextCommand {
 /// Available `arrowhead context` subcommands.
 #[derive(Debug, Subcommand, Clone, PartialEq)]
 pub enum ContextAction {
+    /// Show context for a specific day.
+    Day(DayArgs),
+    /// Show context for a calendar week.
+    Week(WeekArgs),
+    /// Show recently changed notes and metrics.
+    Changed(ChangedArgs),
     /// Show context around a note.
     Note(NoteArgs),
     /// Show context around a metric id or key.
     Metric(MetricArgs),
     /// Show context around a metrics source.
     Source(SourceArgs),
+}
+
+/// Arguments for `arrowhead context day`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct DayArgs {
+    /// Day to inspect in YYYY-MM-DD format.
+    pub day: String,
+    /// Maximum number of related notes to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_NOTE_LIMIT)]
+    pub note_limit: usize,
+    /// Maximum number of metric records to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_METRIC_LIMIT)]
+    pub metric_limit: usize,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `arrowhead context week`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct WeekArgs {
+    /// Optional day inside the week to inspect in YYYY-MM-DD format.
+    #[arg(conflicts_with_all = ["this", "last"])]
+    pub day: Option<String>,
+    /// Inspect the current week.
+    #[arg(long, conflicts_with = "last")]
+    pub this: bool,
+    /// Inspect the previous week.
+    #[arg(long, conflicts_with = "this")]
+    pub last: bool,
+    /// Maximum number of related notes to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_NOTE_LIMIT)]
+    pub note_limit: usize,
+    /// Maximum number of metric records to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_METRIC_LIMIT)]
+    pub metric_limit: usize,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `arrowhead context changed`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct ChangedArgs {
+    /// Number of trailing days to inspect.
+    #[arg(long, default_value_t = 7)]
+    pub days: usize,
+    /// Maximum number of related notes to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_NOTE_LIMIT)]
+    pub note_limit: usize,
+    /// Maximum number of metric records to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_METRIC_LIMIT)]
+    pub metric_limit: usize,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `arrowhead context note`.
@@ -108,6 +171,25 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
     let service = ContextService::new(vault, database, search);
 
     let payload = match &command.action {
+        ContextAction::Day(args) => {
+            service
+                .day(&args.day, Some(args.note_limit), Some(args.metric_limit))
+                .await?
+        }
+        ContextAction::Week(args) => {
+            service
+                .week(
+                    resolve_week_selector(args)?,
+                    Some(args.note_limit),
+                    Some(args.metric_limit),
+                )
+                .await?
+        }
+        ContextAction::Changed(args) => {
+            service
+                .changed(args.days, Some(args.note_limit), Some(args.metric_limit))
+                .await?
+        }
         ContextAction::Note(args) => {
             service
                 .note(
@@ -140,6 +222,9 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
     };
 
     let json = match &command.action {
+        ContextAction::Day(args) => args.json,
+        ContextAction::Week(args) => args.json,
+        ContextAction::Changed(args) => args.json,
         ContextAction::Note(args) => args.json,
         ContextAction::Metric(args) => args.json,
         ContextAction::Source(args) => args.json,
@@ -218,11 +303,15 @@ fn render_context(payload: &ContextPayload) {
         }
     }
 
-    if !payload.related.notes.is_empty()
+    if !payload.related.days.is_empty()
+        || !payload.related.notes.is_empty()
         || !payload.related.metric_keys.is_empty()
         || !payload.related.sources.is_empty()
     {
         println!("\nRelated");
+        for day in &payload.related.days {
+            println!("- Day: {day}");
+        }
         for note in &payload.related.notes {
             print_note_line(note);
         }
@@ -237,10 +326,25 @@ fn render_context(payload: &ContextPayload) {
 
 fn render_target_kind(kind: ContextTargetKind) -> &'static str {
     match kind {
+        ContextTargetKind::Day => "day",
+        ContextTargetKind::Week => "week",
+        ContextTargetKind::Changed => "changed",
         ContextTargetKind::Note => "note",
         ContextTargetKind::Metric => "metric",
         ContextTargetKind::Source => "source",
     }
+}
+
+fn resolve_week_selector(args: &WeekArgs) -> Result<WeekContextSelector> {
+    if args.last {
+        return Ok(WeekContextSelector::LastWeek);
+    }
+    if let Some(day) = args.day.as_deref() {
+        let parsed = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d")
+            .with_context(|| format!("invalid week day `{}`", day.trim()))?;
+        return Ok(WeekContextSelector::ContainingDay(parsed));
+    }
+    Ok(WeekContextSelector::ThisWeek)
 }
 
 fn print_note_line(note: &arrowhead_core::ContextNoteItem) {

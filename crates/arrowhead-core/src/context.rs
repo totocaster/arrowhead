@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,7 +15,9 @@ use tokio::task;
 
 use crate::{
     GraphService, LinkEdge, LinkReason, MetricFileSummary, MetricRecordEntry, MetricsService,
-    NoteRecord, SearchResult, SearchService, Vault, sqlite::IndexDatabase,
+    NoteRecord, SearchResult, SearchService, Vault,
+    query::{DateRange, parse_absolute_date, parse_relative_range},
+    sqlite::IndexDatabase,
 };
 
 /// Default number of related notes returned by context queries.
@@ -34,6 +36,12 @@ static DATE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextTargetKind {
+    /// Day-oriented context.
+    Day,
+    /// Week-oriented context.
+    Week,
+    /// Recently changed context.
+    Changed,
     /// Note-centric context.
     Note,
     /// Metric key or metric record context.
@@ -186,6 +194,9 @@ pub struct ContextAttention {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextRelated {
+    /// Day identifiers adjacent to the target or active within the window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<String>,
     /// Notes adjacent to the target.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<ContextNoteItem>,
@@ -223,6 +234,17 @@ pub struct ContextService {
     graph: GraphService,
     metrics: MetricsService,
     search: SearchService,
+}
+
+/// Selects which week should be inspected by `ContextService::week`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeekContextSelector {
+    /// Week containing the current day.
+    ThisWeek,
+    /// Week preceding the current day.
+    LastWeek,
+    /// Week containing the supplied day.
+    ContainingDay(NaiveDate),
 }
 
 impl ContextService {
@@ -342,6 +364,7 @@ impl ContextService {
             links: ContextLinks { items: links },
             attention: ContextAttention { items: attention },
             related: ContextRelated {
+                days: note_dates.iter().map(ToString::to_string).collect(),
                 notes: related_notes,
                 metric_keys: unique_metric_keys(&metrics),
                 sources: unique_metric_sources(&metrics),
@@ -504,6 +527,9 @@ impl ContextService {
             links: ContextLinks { items: links },
             attention: ContextAttention { items: attention },
             related: ContextRelated {
+                days: active_days_from_notes_and_metrics(&related_notes, &metrics)
+                    .into_iter()
+                    .collect(),
                 notes: related_notes,
                 metric_keys: unique_metric_keys(&metrics),
                 sources: unique_metric_sources(&metrics),
@@ -617,9 +643,270 @@ impl ContextService {
             links: ContextLinks { items: links },
             attention: ContextAttention { items: attention },
             related: ContextRelated {
+                days: active_days_from_notes_and_metrics(&related_notes, &metrics)
+                    .into_iter()
+                    .collect(),
                 notes: related_notes,
                 metric_keys: unique_metric_keys(&metrics),
                 sources: vec![source.to_string()],
+            },
+        })
+    }
+
+    /// Build context around a specific day.
+    pub async fn day(
+        &self,
+        day: &str,
+        note_limit: Option<usize>,
+        metric_limit: Option<usize>,
+    ) -> Result<ContextPayload> {
+        let day = parse_day(day)?;
+        let note_limit = note_limit.unwrap_or(DEFAULT_CONTEXT_NOTE_LIMIT).max(1);
+        let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
+        let day_range = date_range_for_day(day);
+        let note_dates = BTreeSet::from([day]);
+
+        let mut history_notes = self
+            .note_items_for_dates(&note_dates, "Daily note for requested day")
+            .await?;
+        let mut activity_notes = self
+            .note_items_for_modified_range(&day_range, "Modified during requested day")
+            .await?;
+        trim_note_items(&mut history_notes, note_limit);
+        trim_note_items(&mut activity_notes, note_limit);
+        let mut metrics = self
+            .metrics
+            .search(&format!("date:{day}"), Some(metric_limit))
+            .await?;
+        sort_metric_records(&mut metrics);
+        trim_metric_records(&mut metrics, metric_limit);
+
+        let related_notes = merged_note_items(
+            vec![history_notes.clone(), activity_notes.clone()],
+            note_limit,
+        );
+        let related_days = self.adjacent_active_days(day).await?;
+        let files = self.metric_files_for_records(&metrics).await?;
+        let mut attention = attention_items_for_metrics(&metrics);
+        let links = build_window_links(
+            &format!("day:{day}"),
+            "Requested day contains note activity",
+            &related_notes,
+            "Requested day contains metric activity",
+            &metrics,
+        );
+        attention.sort_by(|left, right| left.message.cmp(&right.message));
+
+        Ok(ContextPayload {
+            summary: ContextSummary {
+                kind: ContextTargetKind::Day,
+                target: day.to_string(),
+                label: Some(day.to_string()),
+                note_count: unique_note_count([
+                    history_notes.as_slice(),
+                    activity_notes.as_slice(),
+                ]),
+                metric_count: metrics.len(),
+                link_count: links.len(),
+                attention_count: attention.len(),
+            },
+            history: ContextHistory {
+                notes: history_notes,
+                metrics: metrics.clone(),
+            },
+            activity: ContextActivity {
+                notes: activity_notes,
+                metrics: metrics.clone(),
+                files,
+            },
+            links: ContextLinks { items: links },
+            attention: ContextAttention { items: attention },
+            related: ContextRelated {
+                days: related_days,
+                notes: related_notes,
+                metric_keys: unique_metric_keys(&metrics),
+                sources: unique_metric_sources(&metrics),
+            },
+        })
+    }
+
+    /// Build context around a calendar week.
+    pub async fn week(
+        &self,
+        selector: WeekContextSelector,
+        note_limit: Option<usize>,
+        metric_limit: Option<usize>,
+    ) -> Result<ContextPayload> {
+        let note_limit = note_limit.unwrap_or(DEFAULT_CONTEXT_NOTE_LIMIT).max(1);
+        let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
+        let (start, end) = week_bounds(selector);
+        let week_range = date_range_for_span(start, end);
+        let note_dates = dates_in_range(&week_range)?;
+
+        let mut history_notes = self
+            .note_items_for_dates(&note_dates, "Daily note in requested week")
+            .await?;
+        let mut activity_notes = self
+            .note_items_for_modified_range(&week_range, "Modified during requested week")
+            .await?;
+        trim_note_items(&mut history_notes, note_limit);
+        trim_note_items(&mut activity_notes, note_limit);
+        let mut metrics = self
+            .metrics
+            .search(
+                &format!(
+                    "date:{}..{}",
+                    start.format("%Y-%m-%d"),
+                    end.format("%Y-%m-%d")
+                ),
+                Some(metric_limit),
+            )
+            .await?;
+        sort_metric_records(&mut metrics);
+        trim_metric_records(&mut metrics, metric_limit);
+
+        let related_notes = merged_note_items(
+            vec![history_notes.clone(), activity_notes.clone()],
+            note_limit,
+        );
+        let files = self.metric_files_for_records(&metrics).await?;
+        let active_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let attention = attention_items_for_metrics(&metrics);
+        let links = build_window_links(
+            &format!("week:{}..{}", start, end),
+            "Requested week contains note activity",
+            &related_notes,
+            "Requested week contains metric activity",
+            &metrics,
+        );
+
+        Ok(ContextPayload {
+            summary: ContextSummary {
+                kind: ContextTargetKind::Week,
+                target: format!("{start}..{end}"),
+                label: Some(format!("Week of {start}")),
+                note_count: unique_note_count([
+                    history_notes.as_slice(),
+                    activity_notes.as_slice(),
+                ]),
+                metric_count: metrics.len(),
+                link_count: links.len(),
+                attention_count: attention.len(),
+            },
+            history: ContextHistory {
+                notes: history_notes,
+                metrics: metrics.clone(),
+            },
+            activity: ContextActivity {
+                notes: activity_notes,
+                metrics: metrics.clone(),
+                files,
+            },
+            links: ContextLinks { items: links },
+            attention: ContextAttention { items: attention },
+            related: ContextRelated {
+                days: active_days,
+                notes: related_notes,
+                metric_keys: unique_metric_keys(&metrics),
+                sources: unique_metric_sources(&metrics),
+            },
+        })
+    }
+
+    /// Build context around recently changed notes and metrics.
+    pub async fn changed(
+        &self,
+        days: usize,
+        note_limit: Option<usize>,
+        metric_limit: Option<usize>,
+    ) -> Result<ContextPayload> {
+        if days == 0 {
+            bail!("changed window must cover at least one day");
+        }
+
+        let note_limit = note_limit.unwrap_or(DEFAULT_CONTEXT_NOTE_LIMIT).max(1);
+        let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
+        let changed_range = parse_relative_range(&format!("past{days}d"), Utc::now())?
+            .context("failed to build changed context window")?;
+
+        let mut activity_notes = self
+            .note_items_for_modified_range(&changed_range, "Modified recently")
+            .await?;
+        let note_dates = active_dates_from_notes_and_metrics(&activity_notes, &[]);
+        let mut history_notes = self
+            .note_items_for_dates(&note_dates, "Daily note in changed window")
+            .await?;
+        trim_note_items(&mut history_notes, note_limit);
+        trim_note_items(&mut activity_notes, note_limit);
+        let (start, end) = date_bounds_for_range(&changed_range)?;
+        let mut metrics = self
+            .metrics
+            .search(
+                &format!(
+                    "date:{}..{}",
+                    start.format("%Y-%m-%d"),
+                    end.format("%Y-%m-%d")
+                ),
+                Some(metric_limit),
+            )
+            .await?;
+        sort_metric_records(&mut metrics);
+        trim_metric_records(&mut metrics, metric_limit);
+
+        let related_notes = merged_note_items(
+            vec![history_notes.clone(), activity_notes.clone()],
+            note_limit,
+        );
+        let files = merge_metric_files(
+            self.metric_files_for_records(&metrics).await?,
+            self.metric_files_for_modified_range(&changed_range).await?,
+        );
+        let active_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let attention = attention_items_for_metrics(&metrics);
+        let links = build_window_links(
+            &format!("changed:past{days}d"),
+            "Recently changed note",
+            &related_notes,
+            "Recently recorded metric",
+            &metrics,
+        );
+
+        Ok(ContextPayload {
+            summary: ContextSummary {
+                kind: ContextTargetKind::Changed,
+                target: format!("past{days}d"),
+                label: Some(format!(
+                    "Changed in past {days} day{}",
+                    if days == 1 { "" } else { "s" }
+                )),
+                note_count: unique_note_count([
+                    history_notes.as_slice(),
+                    activity_notes.as_slice(),
+                ]),
+                metric_count: metrics.len(),
+                link_count: links.len(),
+                attention_count: attention.len(),
+            },
+            history: ContextHistory {
+                notes: history_notes,
+                metrics: metrics.clone(),
+            },
+            activity: ContextActivity {
+                notes: activity_notes,
+                metrics: metrics.clone(),
+                files,
+            },
+            links: ContextLinks { items: links },
+            attention: ContextAttention { items: attention },
+            related: ContextRelated {
+                days: active_days,
+                notes: related_notes,
+                metric_keys: unique_metric_keys(&metrics),
+                sources: unique_metric_sources(&metrics),
             },
         })
     }
@@ -754,6 +1041,55 @@ impl ContextService {
             .collect())
     }
 
+    async fn note_items_for_dates(
+        &self,
+        dates: &BTreeSet<NaiveDate>,
+        reason: &str,
+    ) -> Result<Vec<ContextNoteItem>> {
+        if dates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let vault = Arc::clone(&self.vault);
+        let database = Arc::clone(&self.database);
+        let reason = reason.to_string();
+        let dates = dates.clone();
+        task::spawn_blocking(move || -> Result<Vec<ContextNoteItem>> {
+            let snapshot = vault.inventory_snapshot()?;
+            let date_strings = dates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<HashSet<_>>();
+            let mut note_ids = snapshot
+                .entries()
+                .iter()
+                .filter(|entry| date_strings.contains(&entry.id))
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>();
+            note_ids.sort();
+
+            let titles = database.titles_for_notes(&note_ids)?;
+            let relative_paths = database.relative_paths_for_notes(&note_ids)?;
+            let mut items = Vec::new();
+            for note_id in note_ids {
+                let entry = snapshot.get_by_id(&note_id);
+                items.push(ContextNoteItem {
+                    note_id: note_id.clone(),
+                    title: titles.get(&note_id).cloned().unwrap_or(None),
+                    relative_path: entry
+                        .map(|item| item.relative_path.clone())
+                        .or_else(|| relative_paths.get(&note_id).map(PathBuf::from)),
+                    file_modified_at: entry.map(|item| item.file_modified_at),
+                    preview: database.note_excerpt(&note_id, 240)?,
+                    reason: Some(reason.clone()),
+                });
+            }
+            Ok(items)
+        })
+        .await
+        .context("note-by-date task aborted")?
+    }
+
     async fn note_items_for_metric_dates(
         &self,
         records: &[MetricRecordEntry],
@@ -766,32 +1102,39 @@ impl ContextService {
         if dates.is_empty() {
             return Ok(Vec::new());
         }
+        self.note_items_for_dates(&dates, reason).await
+    }
 
-        let vault = Arc::clone(&self.vault);
+    async fn note_items_for_modified_range(
+        &self,
+        range: &DateRange,
+        reason: &str,
+    ) -> Result<Vec<ContextNoteItem>> {
         let database = Arc::clone(&self.database);
         let reason = reason.to_string();
+        let range = range.clone();
         task::spawn_blocking(move || -> Result<Vec<ContextNoteItem>> {
-            let snapshot = vault.inventory_snapshot()?;
-            let mut note_ids = Vec::new();
-            let date_strings = dates
-                .iter()
-                .map(ToString::to_string)
-                .collect::<HashSet<_>>();
-            for entry in snapshot.entries() {
-                if date_strings.contains(&entry.id) {
-                    note_ids.push(entry.id.clone());
-                }
-            }
+            let states = database.note_states()?;
+            let mut entries = states
+                .into_iter()
+                .filter(|(_, state)| range_contains_timestamp(&range, state.file_modified_at))
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| right.1.file_modified_at.cmp(&left.1.file_modified_at));
 
+            let note_ids = entries
+                .iter()
+                .map(|(note_id, _)| note_id.clone())
+                .collect::<Vec<_>>();
             let titles = database.titles_for_notes(&note_ids)?;
+            let relative_paths = database.relative_paths_for_notes(&note_ids)?;
+
             let mut items = Vec::new();
-            for note_id in note_ids {
-                let entry = snapshot.get_by_id(&note_id);
+            for (note_id, state) in entries {
                 items.push(ContextNoteItem {
                     note_id: note_id.clone(),
                     title: titles.get(&note_id).cloned().unwrap_or(None),
-                    relative_path: entry.map(|item| item.relative_path.clone()),
-                    file_modified_at: entry.map(|item| item.file_modified_at),
+                    relative_path: relative_paths.get(&note_id).map(PathBuf::from),
+                    file_modified_at: Some(state.file_modified_at),
                     preview: database.note_excerpt(&note_id, 240)?,
                     reason: Some(reason.clone()),
                 });
@@ -799,7 +1142,7 @@ impl ContextService {
             Ok(items)
         })
         .await
-        .context("note-by-date task aborted")?
+        .context("note-by-modified task aborted")?
     }
 
     async fn note_metric_links(
@@ -866,6 +1209,224 @@ impl ContextService {
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         Ok(files)
     }
+
+    async fn metric_files_for_modified_range(
+        &self,
+        range: &DateRange,
+    ) -> Result<Vec<MetricFileSummary>> {
+        let mut files = self.metrics.list_files().await?;
+        files.retain(|file| range_contains_timestamp(range, file.file_modified_at));
+        files.sort_by(|left, right| {
+            right
+                .file_modified_at
+                .cmp(&left.file_modified_at)
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        Ok(files)
+    }
+
+    async fn adjacent_active_days(&self, day: NaiveDate) -> Result<Vec<String>> {
+        let previous = day - Duration::days(1);
+        let next = day + Duration::days(1);
+        let mut related = Vec::new();
+        if self.day_has_activity(previous).await? {
+            related.push(previous.to_string());
+        }
+        if self.day_has_activity(next).await? {
+            related.push(next.to_string());
+        }
+        Ok(related)
+    }
+
+    async fn day_has_activity(&self, day: NaiveDate) -> Result<bool> {
+        let notes = self
+            .note_items_for_dates(&BTreeSet::from([day]), "Adjacent day")
+            .await?;
+        if !notes.is_empty() {
+            return Ok(true);
+        }
+
+        let metrics = self.metrics.search(&format!("date:{day}"), Some(1)).await?;
+        Ok(!metrics.is_empty())
+    }
+}
+
+fn parse_day(input: &str) -> Result<NaiveDate> {
+    let parsed = parse_absolute_date(input.trim())
+        .with_context(|| format!("invalid day `{}`", input.trim()))?;
+    Ok(parsed.instant.date_naive())
+}
+
+fn date_range_for_day(day: NaiveDate) -> DateRange {
+    date_range_for_span(day, day)
+}
+
+fn date_range_for_span(start: NaiveDate, end: NaiveDate) -> DateRange {
+    let start_dt = start
+        .and_hms_opt(0, 0, 0)
+        .expect("valid start of day")
+        .and_utc();
+    let end_dt = end
+        .and_hms_opt(23, 59, 59)
+        .expect("valid end of day")
+        .and_utc()
+        + Duration::microseconds(999_999);
+    DateRange::new(
+        Some(crate::query::DateRangeBound {
+            value: start_dt,
+            inclusive: true,
+        }),
+        Some(crate::query::DateRangeBound {
+            value: end_dt,
+            inclusive: true,
+        }),
+    )
+}
+
+fn date_bounds_for_range(range: &DateRange) -> Result<(NaiveDate, NaiveDate)> {
+    let start = range
+        .start
+        .as_ref()
+        .map(|bound| bound.value.date_naive())
+        .context("range is missing a start bound")?;
+    let end = range
+        .end
+        .as_ref()
+        .map(|bound| bound.value.date_naive())
+        .context("range is missing an end bound")?;
+    Ok((start, end))
+}
+
+fn dates_in_range(range: &DateRange) -> Result<BTreeSet<NaiveDate>> {
+    let (start, end) = date_bounds_for_range(range)?;
+    let mut dates = BTreeSet::new();
+    let mut cursor = start;
+    while cursor <= end {
+        dates.insert(cursor);
+        cursor += Duration::days(1);
+    }
+    Ok(dates)
+}
+
+fn week_bounds(selector: WeekContextSelector) -> (NaiveDate, NaiveDate) {
+    let anchor = match selector {
+        WeekContextSelector::ThisWeek => Utc::now().date_naive(),
+        WeekContextSelector::LastWeek => Utc::now().date_naive() - Duration::weeks(1),
+        WeekContextSelector::ContainingDay(day) => day,
+    };
+    let weekday_offset = i64::from(anchor.weekday().num_days_from_monday());
+    let start = anchor - Duration::days(weekday_offset);
+    let end = start + Duration::days(6);
+    (start, end)
+}
+
+fn range_contains_timestamp(range: &DateRange, timestamp: DateTime<Utc>) -> bool {
+    let micros = timestamp.timestamp_micros();
+    let lower_ok = range
+        .lower_bound_micros()
+        .is_none_or(|lower| micros >= lower);
+    let upper_ok = range
+        .upper_bound_micros()
+        .is_none_or(|upper| micros <= upper);
+    lower_ok && upper_ok
+}
+
+fn merged_note_items(groups: Vec<Vec<ContextNoteItem>>, limit: usize) -> Vec<ContextNoteItem> {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for group in groups {
+        merge_note_items(&mut merged, group, limit, &mut seen);
+        if merged.len() >= limit {
+            break;
+        }
+    }
+    merged
+}
+
+fn unique_note_count<const N: usize>(groups: [&[ContextNoteItem]; N]) -> usize {
+    groups
+        .into_iter()
+        .flat_map(|items| items.iter().map(|item| item.note_id.clone()))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn build_window_links(
+    target: &str,
+    note_reason: &str,
+    notes: &[ContextNoteItem],
+    metric_reason: &str,
+    metrics: &[MetricRecordEntry],
+) -> Vec<ContextLink> {
+    let mut links = notes
+        .iter()
+        .map(|note| ContextLink {
+            kind: ContextLinkKind::Structural,
+            from: target.to_string(),
+            to: format!("note:{}", note.note_id),
+            reason: note_reason.to_string(),
+            confidence: None,
+        })
+        .collect::<Vec<_>>();
+    links.extend(metrics.iter().map(|record| ContextLink {
+        kind: ContextLinkKind::Structural,
+        from: target.to_string(),
+        to: format!("metric:{}", record.record.id),
+        reason: metric_reason.to_string(),
+        confidence: None,
+    }));
+    links
+}
+
+fn merge_metric_files(
+    left: Vec<MetricFileSummary>,
+    right: Vec<MetricFileSummary>,
+) -> Vec<MetricFileSummary> {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+    for file in left.into_iter().chain(right) {
+        if seen.insert(file.relative_path.clone()) {
+            merged.push(file);
+        }
+    }
+    merged.sort_by(|lhs, rhs| {
+        rhs.file_modified_at
+            .cmp(&lhs.file_modified_at)
+            .then_with(|| lhs.relative_path.cmp(&rhs.relative_path))
+    });
+    merged
+}
+
+fn active_days_from_notes_and_metrics(
+    notes: &[ContextNoteItem],
+    metrics: &[MetricRecordEntry],
+) -> BTreeSet<String> {
+    active_dates_from_notes_and_metrics(notes, metrics)
+        .into_iter()
+        .map(|date| date.to_string())
+        .collect()
+}
+
+fn active_dates_from_notes_and_metrics(
+    notes: &[ContextNoteItem],
+    metrics: &[MetricRecordEntry],
+) -> BTreeSet<NaiveDate> {
+    let mut days = BTreeSet::new();
+    for note in notes {
+        if let Some(captures) = DATE_PREFIX_RE.captures(&note.note_id) {
+            if let Some(matched) = captures.get(1) {
+                if let Ok(date) = NaiveDate::parse_from_str(matched.as_str(), "%Y-%m-%d") {
+                    days.insert(date);
+                }
+            }
+        }
+    }
+    for metric in metrics {
+        if let Some(date) = metric.record.date {
+            days.insert(date);
+        }
+    }
+    days
 }
 
 fn note_item_from_note_record(note: &NoteRecord, reason: Option<String>) -> ContextNoteItem {
@@ -1368,6 +1929,64 @@ mod tests {
         assert!(
             payload.summary.metric_count >= 1,
             "expected metrics for source context"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_context_surfaces_day_metrics_and_adjacent_days() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .day("2026-04-14", Some(5), Some(5))
+            .await
+            .expect("day context");
+
+        assert_eq!(payload.summary.kind, ContextTargetKind::Day);
+        assert_eq!(payload.summary.target, "2026-04-14");
+        assert_eq!(payload.activity.metrics.len(), 1);
+        assert!(
+            payload.related.days.iter().any(|day| day == "2026-04-15"),
+            "expected adjacent active day"
+        );
+    }
+
+    #[tokio::test]
+    async fn week_context_accepts_anchor_day() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .week(
+                WeekContextSelector::ContainingDay(
+                    NaiveDate::from_ymd_opt(2026, 4, 14).expect("date"),
+                ),
+                Some(5),
+                Some(5),
+            )
+            .await
+            .expect("week context");
+
+        assert_eq!(payload.summary.kind, ContextTargetKind::Week);
+        assert_eq!(payload.summary.target, "2026-04-13..2026-04-19");
+        assert!(
+            payload
+                .related
+                .days
+                .iter()
+                .any(|day| day == "2026-04-14" || day == "2026-04-15"),
+            "expected active days inside requested week"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_context_surfaces_recent_note_activity() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .changed(3, Some(5), Some(5))
+            .await
+            .expect("changed context");
+
+        assert_eq!(payload.summary.kind, ContextTargetKind::Changed);
+        assert!(
+            !payload.activity.notes.is_empty(),
+            "expected recent note activity in changed context"
         );
     }
 

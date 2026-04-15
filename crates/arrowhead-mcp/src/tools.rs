@@ -266,6 +266,48 @@ pub struct MetricFileDeleteParams {
     pub confirm: bool,
 }
 
+/// Parameters for `mcp.context.get_day`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextDayParams {
+    /// Day to inspect in YYYY-MM-DD format.
+    pub day: String,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
+/// Parameters for `mcp.context.get_week`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextWeekParams {
+    /// Optional day inside the week to inspect in YYYY-MM-DD format.
+    pub day: Option<String>,
+    /// Inspect the current week.
+    #[serde(default)]
+    pub this: bool,
+    /// Inspect the previous week.
+    #[serde(default)]
+    pub last: bool,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
+/// Parameters for `mcp.context.get_changed`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextChangedParams {
+    /// Number of trailing days to inspect.
+    pub days: Option<usize>,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
 /// Parameters for `mcp.context.get_note`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
