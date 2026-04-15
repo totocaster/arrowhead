@@ -21,7 +21,23 @@ specification.
   via `tracing::dispatcher::with_default`) so log output continues flowing to
   the configured file logger.
 
-## 3. Testing Expectations
+## 3. CLI Design
+- Arrowhead CLI UX must follow the [Command Line Interface Guidelines](https://clig.dev/).
+- Design commands for humans first while keeping them composable for automation.
+- Every user-facing command family should provide:
+  - clear command names and subcommands
+  - concise help text
+  - concrete examples in help where useful
+  - actionable error messages
+  - machine-readable output via `--json` when the command returns structured data
+  - human-readable default output that summarises the most important result first
+- Prefer stable, predictable command trees. Avoid introducing overlapping
+  top-level concepts when one orchestration surface and one primitive surface
+  would be clearer.
+- When a command is likely to be used conversationally, help the user recover by
+  suggesting the next command or flag to try.
+
+## 4. Testing Expectations
 - Unit tests co-located with the code (`#[cfg(test)]`). Use the fixture vault in
   `tests/fixtures/test-vault` for vault/indexer scenarios; never mutate it.
 - Stub embeddings in tests (e.g. set `with_embedding_model(None)` or `disable_embeddings()`) to avoid downloading models; semantic behaviour should be validated via fixtures and sqlite-vec tables.
@@ -33,7 +49,7 @@ specification.
 - Always run `cargo fmt`, `cargo check`, and the relevant `cargo test` suite
   prior to handing work back.
 
-## 4. Data & Persistence
+## 5. Data & Persistence
 - SQLite changes require migrations in `sqlite.rs` plus tests proving schema
   upgrades succeed. Document versioning decisions so release notes capture the
   impact.
@@ -41,7 +57,7 @@ specification.
   `.obsidian/app.json` ignore filters, attachment directories) and surface them
   through the `VaultSettings` APIs.
 - Generic Markdown workspaces configure those same options via `.arrowhead/workspace.toml`; keep the schema updated if you add new vault-scoped settings, and expose any new knobs through `arrowhead workspace show/set` so non-Obsidian users stay unblocked.
-## 5. Documentation & Communication
+## 6. Documentation & Communication
 - Update the specs/design docs in `docs/` after significant milestones or
   architecture shifts.
 - When a new workflow or guideline emerges, add it here and cross-reference
@@ -49,7 +65,7 @@ specification.
 - Summaries in delivery comments must describe behaviour, tests executed, and
   immediate next steps or risks.
 
-## 6. Review Checklist
+## 7. Review Checklist
 1. Logging routed to file, stdout kept clean.
 2. Tests covering success, edge cases, and error paths.
 3. Docs + status files updated.
