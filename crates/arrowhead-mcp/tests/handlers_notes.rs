@@ -1,10 +1,12 @@
 use std::{
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use arrowhead_core::metrics::MetricsConfigFile;
+use arrowhead_core::parse_metrics_reader;
 use arrowhead_core::status::DaemonStatus;
 use arrowhead_core::workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, write_workspace_file};
 use arrowhead_mcp::{
@@ -83,6 +85,41 @@ async fn build_handler(temp_dir: &TempDir) -> HandlerRegistry {
     HandlerRegistry::new(Arc::new(runtime))
 }
 
+async fn build_handler_with_metrics(temp_dir: &TempDir) -> HandlerRegistry {
+    let metrics_dir = temp_dir.path().join("Metrics");
+    fs::create_dir_all(&metrics_dir).expect("create metrics dir");
+    let relative_path = "Metrics/health.metrics.ndjson";
+    let contents = concat!(
+        r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings","note":"Morning weigh-in","tags":["health"]}"#,
+        "\n",
+        r#"{"id":"01AAB","ts":"2026-04-14T12:00:00+00:00","key":"nutrition.energy_intake","value":850,"unit":"kcal","source":"manual","note":"Steak dinner","tags":["food"]}"#
+    );
+    fs::write(
+        metrics_dir.join("health.metrics.ndjson"),
+        format!("{contents}\n"),
+    )
+    .expect("write metrics file");
+
+    let vault_path = temp_dir.path().to_path_buf();
+    let runtime = McpRuntime::initialise(
+        RuntimeOptions::new(vault_path)
+            .with_embedding_model(None)
+            .with_daemon_socket(Some(temp_dir.path().join("control.sock")))
+            .with_daemon_status(Some(temp_dir.path().join("status.json"))),
+    )
+    .await
+    .expect("runtime initialises");
+
+    let rows = parse_metrics_reader(Cursor::new(contents), Path::new(relative_path))
+        .expect("parse metrics rows");
+    runtime
+        .database()
+        .upsert_metrics_file(relative_path, chrono::Utc::now(), &rows, chrono::Utc::now())
+        .expect("upsert indexed metrics");
+
+    HandlerRegistry::new(Arc::new(runtime))
+}
+
 async fn call_tool(handler: &HandlerRegistry, name: &str, arguments: Value) -> Value {
     let params = Params::new(json!({ "name": name, "arguments": arguments })).expect("tool params");
     let request = Request::new(0, "tools/call", params);
@@ -150,6 +187,79 @@ async fn notes_read_returns_expected_fields() {
     );
     assert!(structured.get("content").and_then(Value::as_str).is_some());
     assert!(structured.get("metadata").is_some());
+}
+
+#[tokio::test]
+async fn metrics_list_files_returns_results() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(&handler, "metrics_list_files", json!({})).await;
+
+    let files = structured
+        .get("files")
+        .and_then(Value::as_array)
+        .expect("files array present");
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].get("relativePath").and_then(Value::as_str),
+        Some("Metrics/health.metrics.ndjson")
+    );
+}
+
+#[tokio::test]
+async fn metrics_read_returns_expected_fields() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_read",
+        json!({ "metricId": "metric:01AAA" }),
+    )
+    .await;
+
+    let record = structured
+        .get("record")
+        .and_then(Value::as_object)
+        .expect("record payload present");
+    assert_eq!(
+        record
+            .get("record")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str),
+        Some("01AAA")
+    );
+    assert_eq!(record.get("sourceLine").and_then(Value::as_u64), Some(1));
+}
+
+#[tokio::test]
+async fn metrics_search_returns_matches() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_search",
+        json!({ "query": "\"steak dinner\"", "limit": 5 }),
+    )
+    .await;
+
+    assert_eq!(structured.get("total").and_then(Value::as_u64), Some(1));
+    let results = structured
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("results array present");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]
+            .get("record")
+            .and_then(Value::as_object)
+            .and_then(|record| record.get("id"))
+            .and_then(Value::as_str),
+        Some("01AAB")
+    );
 }
 
 #[tokio::test]
@@ -556,7 +666,7 @@ async fn protocol_initialize_reports_capabilities() {
 }
 
 #[tokio::test]
-async fn protocol_tools_list_contains_note_create() {
+async fn protocol_tools_list_contains_metrics_and_note_tools() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;
 
@@ -575,5 +685,11 @@ async fn protocol_tools_list_contains_note_create() {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("notes_create")),
         "tool list should include notes_create"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_search")),
+        "tool list should include metrics_search"
     );
 }

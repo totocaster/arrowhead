@@ -10,6 +10,7 @@ pub mod graph;
 pub mod index;
 pub mod init;
 pub mod mcp;
+pub mod metrics;
 pub mod notes;
 pub mod paths;
 pub mod search;

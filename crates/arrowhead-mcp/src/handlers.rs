@@ -27,6 +27,7 @@ use crate::{
         CallToolParams, CallToolResultPayload, DaemonStatusPayload, GraphContextPayload,
         GraphLinksPayload, GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload,
         ImplementationDescriptor, InitializeParams, InitializeResultPayload, LinkEdgePayload,
+        MetricReadParams, MetricReadPayload, MetricsFilesPayload, MetricsSearchResultsPayload,
         NoteContentPayload, NoteCreateParams, NoteDeleteParams, NoteDeletePayload, NoteListItem,
         NoteMetadataParams, NoteMetadataPayload, NoteReadParams, NoteUpdateParams, NotesListParams,
         NotesListPayload, OrphanNotePayload, RelatedNotesParams, SearchParams, SearchResultPayload,
@@ -261,6 +262,52 @@ impl HandlerRegistry {
         };
         serde_json::to_value(payload).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise search results: {err}"))
+        })
+    }
+
+    async fn handle_metrics_list_files(&self) -> Result<Value, ProtocolError> {
+        let service = self.runtime.metrics_service().clone();
+        let files = service.list_files().await.map_err(|err| {
+            ProtocolError::internal(format!("failed to list indexed metrics files: {err}"))
+        })?;
+        let payload = MetricsFilesPayload { files };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise metrics files: {err}"))
+        })
+    }
+
+    async fn handle_metrics_read(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricReadParams = request.params.deserialize()?;
+        let service = self.runtime.metrics_service().clone();
+        let metric_id = params.metric_id.clone();
+        let record = service.read_record(&metric_id).await.map_err(|err| {
+            ProtocolError::internal(format!("failed to load metric record {metric_id}: {err}"))
+        })?;
+        let Some(record) = record else {
+            return Err(ProtocolError::invalid_params(format!(
+                "metric {metric_id} was not found in the index. Run `arrowhead index start` to refresh metrics data."
+            )));
+        };
+
+        let payload = MetricReadPayload { record };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise metric record: {err}"))
+        })
+    }
+
+    async fn handle_metrics_search(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: SearchParams = request.params.deserialize()?;
+        let service = self.runtime.metrics_service().clone();
+        let results = service
+            .search(&params.query, params.limit)
+            .await
+            .map_err(map_metrics_search_error)?;
+        let payload = MetricsSearchResultsPayload {
+            total: results.len(),
+            results,
+        };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise metrics search results: {err}"))
         })
     }
 
@@ -659,6 +706,9 @@ impl HandlerRegistry {
             "mcp.search.fts" => self.handle_search_fts(request).await,
             "mcp.search.semantic" => self.handle_search_semantic(request).await,
             "mcp.search.hybrid" => self.handle_search_hybrid(request).await,
+            "mcp.metrics.list_files" => self.handle_metrics_list_files().await,
+            "mcp.metrics.read" => self.handle_metrics_read(request).await,
+            "mcp.metrics.search" => self.handle_metrics_search(request).await,
             "mcp.vault.status" => self.handle_vault_status().await,
             "mcp.notes.read" => self.handle_note_read(request).await,
             "mcp.notes.list" => self.handle_note_list(request).await,
@@ -753,6 +803,19 @@ impl HandlerRegistry {
                 }
             },
             "required": ["query"]
+        });
+        let metric_id_schema = json!({
+            "type": "object",
+            "description": "Parameters that identify a single metric record.",
+            "additionalProperties": false,
+            "properties": {
+                "metricId": {
+                    "type": "string",
+                    "description": "Stable metric id or `metric:<id>` reference.",
+                    "examples": ["01JV7RK8Q4X60M0E2N0A6QK61V", "metric:01JV7RK8Q4X60M0E2N0A6QK61V"]
+                }
+            },
+            "required": ["metricId"]
         });
         let notes_list_schema = json!({
             "type": "object",
@@ -889,6 +952,133 @@ impl HandlerRegistry {
                 "reason": {
                     "type": "string",
                     "description": "Explanation of how the link target was resolved."
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_issue_schema = json!({
+            "type": "object",
+            "description": "Validation issue attached to a metric record.",
+            "required": ["severity", "code", "message"],
+            "properties": {
+                "severity": {
+                    "type": "string",
+                    "enum": ["warning", "error"],
+                    "description": "Issue severity."
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Stable validation issue code."
+                },
+                "field": {
+                    "type": "string",
+                    "description": "Field associated with the issue, when known."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Human-readable validation message."
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_record_entry_schema = json!({
+            "type": "object",
+            "description": "Indexed metric record with validation metadata.",
+            "required": ["sourceFile", "sourceLine", "record", "rawLine", "validationStatus", "issues"],
+            "properties": {
+                "sourceFile": path_schema("Vault-relative metrics file containing the record."),
+                "sourceLine": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line number in the metrics file."
+                },
+                "record": {
+                    "type": "object",
+                    "description": "Parsed metric record fields.",
+                    "additionalProperties": true
+                },
+                "rawLine": {
+                    "type": "string",
+                    "description": "Raw NDJSON line as stored in the source file."
+                },
+                "validationStatus": {
+                    "type": "string",
+                    "enum": ["valid", "warning", "invalid"],
+                    "description": "Aggregate validation state for the record."
+                },
+                "issues": {
+                    "type": "array",
+                    "description": "Validation issues associated with the record.",
+                    "items": metric_issue_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_file_summary_schema = json!({
+            "type": "object",
+            "description": "Indexed metrics file summary.",
+            "required": ["relativePath", "fileModifiedAt", "indexedAt", "rowCount", "recordCount", "warningCount", "errorCount"],
+            "properties": {
+                "relativePath": path_schema("Vault-relative metrics file path."),
+                "fileModifiedAt": date_time_schema("Filesystem modification timestamp stored for the file."),
+                "indexedAt": date_time_schema("Timestamp when Arrowhead last indexed the file."),
+                "rowCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of non-empty NDJSON rows encountered in the file."
+                },
+                "recordCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of rows promoted into indexed metric records."
+                },
+                "warningCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of warning-level validation issues in the file."
+                },
+                "errorCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of error-level validation issues in the file."
+                }
+            },
+            "additionalProperties": false
+        });
+        let metrics_files_payload_schema = json!({
+            "type": "object",
+            "description": "Indexed metrics file summaries.",
+            "required": ["files"],
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": metric_file_summary_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_read_payload_schema = json!({
+            "type": "object",
+            "description": "Single indexed metric record.",
+            "required": ["record"],
+            "properties": {
+                "record": metric_record_entry_schema.clone()
+            },
+            "additionalProperties": false
+        });
+        let metrics_search_results_payload_schema = json!({
+            "type": "object",
+            "description": "Metrics search results.",
+            "required": ["total", "results"],
+            "properties": {
+                "total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Number of metric records returned."
+                },
+                "results": {
+                    "type": "array",
+                    "items": metric_record_entry_schema.clone()
                 }
             },
             "additionalProperties": false
@@ -1502,9 +1692,42 @@ impl HandlerRegistry {
                 description: Some(
                     "Combine semantic and keyword search results for balanced relevance.".to_string(),
                 ),
-                input_schema: search_schema,
+                input_schema: search_schema.clone(),
                 output_schema: Some(search_results_payload_schema),
                 annotations: Some(json!({ "method": "mcp.search.hybrid" })),
+            },
+            ToolDescriptor {
+                name: "metrics_list_files".to_string(),
+                title: Some("Metrics: List Files".to_string()),
+                description: Some(
+                    "List indexed metrics files together with stored validation counts."
+                        .to_string(),
+                ),
+                input_schema: empty_schema(),
+                output_schema: Some(metrics_files_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.list_files" })),
+            },
+            ToolDescriptor {
+                name: "metrics_read".to_string(),
+                title: Some("Metrics: Read".to_string()),
+                description: Some(
+                    "Read a single indexed metric record by stable id or `metric:<id>` reference."
+                        .to_string(),
+                ),
+                input_schema: metric_id_schema,
+                output_schema: Some(metric_read_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.read" })),
+            },
+            ToolDescriptor {
+                name: "metrics_search".to_string(),
+                title: Some("Metrics: Search".to_string()),
+                description: Some(
+                    "Search indexed metrics records using free text plus `key:`, `source:`, `file:`, `date:`, and `note:` filters."
+                        .to_string(),
+                ),
+                input_schema: search_schema,
+                output_schema: Some(metrics_search_results_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.search" })),
             },
             ToolDescriptor {
                 name: "vault_status".to_string(),
@@ -1714,6 +1937,9 @@ fn resolve_tool_method(name: &str) -> Option<&'static str> {
         "search_fts" => Some("mcp.search.fts"),
         "search_semantic" => Some("mcp.search.semantic"),
         "search_hybrid" => Some("mcp.search.hybrid"),
+        "metrics_list_files" => Some("mcp.metrics.list_files"),
+        "metrics_read" => Some("mcp.metrics.read"),
+        "metrics_search" => Some("mcp.metrics.search"),
         "vault_status" => Some("mcp.vault.status"),
         "notes_read" => Some("mcp.notes.read"),
         "notes_list" => Some("mcp.notes.list"),
@@ -1740,6 +1966,15 @@ fn map_search_error(err: Error) -> ProtocolError {
         ProtocolError::invalid_params("search query must not be empty")
     } else if message.contains("requires embeddings") {
         ProtocolError::custom(ErrorCode::ToolDisabled, message, None)
+    } else {
+        ProtocolError::internal(message)
+    }
+}
+
+fn map_metrics_search_error(err: Error) -> ProtocolError {
+    let message = err.to_string();
+    if message.contains("empty metrics query") {
+        ProtocolError::invalid_params("metrics query must not be empty")
     } else {
         ProtocolError::internal(message)
     }

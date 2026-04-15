@@ -4,7 +4,9 @@
 
 use std::path::PathBuf;
 
-use arrowhead_core::{LinkEdge, MetadataMap, NoteRecord, SearchResult};
+use arrowhead_core::{
+    LinkEdge, MetadataMap, MetricFileSummary, MetricRecordEntry, NoteRecord, SearchResult,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,6 +137,40 @@ impl SearchResultPayload {
             metadata: result.metadata.clone(),
         }
     }
+}
+
+/// Parameters for reading a specific metric record.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricReadParams {
+    /// Stable metric id or `metric:<id>` reference.
+    pub metric_id: String,
+}
+
+/// Response payload for `mcp.metrics.list_files`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsFilesPayload {
+    /// Indexed metrics files.
+    pub files: Vec<MetricFileSummary>,
+}
+
+/// Response payload for `mcp.metrics.read`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricReadPayload {
+    /// Indexed metric record.
+    pub record: MetricRecordEntry,
+}
+
+/// Response payload for `mcp.metrics.search`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsSearchResultsPayload {
+    /// Total number of results returned in this response.
+    pub total: usize,
+    /// Detailed metrics records matching the query.
+    pub results: Vec<MetricRecordEntry>,
 }
 
 /// Parameters for reading a specific note.
