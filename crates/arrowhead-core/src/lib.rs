@@ -30,8 +30,10 @@ pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolution
 pub use indexer::IndexProgressEvent;
 pub use metrics::{
     DEFAULT_DAY_START_HOUR, DEFAULT_METRIC_REFERENCE_PREFIX, DEFAULT_METRICS_EXTENSION,
-    DEFAULT_METRICS_ROOT, DEFAULT_METRICS_WRITE_FILE_NAME, DEFAULT_WEEK_START_DAY,
+    DEFAULT_METRICS_ROOT, DEFAULT_METRICS_WRITE_FILE_NAME, DEFAULT_WEEK_START_DAY, MetricIssueCode,
+    MetricIssueSeverity, MetricRecord, MetricValidationIssue, MetricValidationStatus,
     MetricsConfigFile, MetricsConventions, MetricsConventionsSource, MetricsFileEntry,
+    ParsedMetricRow, parse_metrics_file, parse_metrics_line, parse_metrics_reader,
 };
 pub use search::{SearchConfig, SearchResult, SearchService};
 pub use status::{
