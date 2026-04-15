@@ -4,4 +4,7 @@ mod parser;
 mod time;
 
 pub use parser::{ParsedQuery, QueryFilters, parse_query};
-pub use time::{DateRange, DateRangeBound, parse_absolute_date};
+pub use time::{
+    DateRange, DateRangeBound, parse_absolute_date, parse_relative_range, range_from_lower,
+    range_from_parsed_date, range_from_upper,
+};

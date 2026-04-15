@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::Path,
     sync::{
@@ -26,7 +26,11 @@ use crate::{
     MetadataMap, NoteRecord,
     graph::{LinkResolutionRecord, normalise_link_lookup},
     metadata::MetadataExtraction,
-    metrics::{MetricIssueCode, MetricIssueSeverity, MetricValidationStatus, ParsedMetricRow},
+    metrics::{
+        MetricIssueCode, MetricIssueSeverity, MetricRecord, MetricValidationIssue,
+        MetricValidationStatus, ParsedMetricRow,
+    },
+    metrics_service::{MetricFileSummary, MetricRecordEntry, MetricsQuery},
     query::{QueryFilters, parse_absolute_date},
 };
 
@@ -248,6 +252,142 @@ impl IndexDatabase {
         }
 
         Ok(result)
+    }
+
+    /// List indexed metrics files with stored validation counts.
+    pub fn list_metric_files(&self) -> Result<Vec<MetricFileSummary>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT relative_path, file_modified_at, indexed_at, row_count, record_count, warning_count, error_count
+             FROM metric_files
+             ORDER BY relative_path ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut files = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let relative_path: String = row.get(0)?;
+            let file_modified_at: i64 = row.get(1)?;
+            let indexed_at: i64 = row.get(2)?;
+            let row_count: i64 = row.get(3)?;
+            let record_count: i64 = row.get(4)?;
+            let warning_count: i64 = row.get(5)?;
+            let error_count: i64 = row.get(6)?;
+            files.push(MetricFileSummary {
+                relative_path: relative_path.into(),
+                file_modified_at: from_micros(file_modified_at)?,
+                indexed_at: from_micros(indexed_at)?,
+                row_count: row_count.max(0) as u64,
+                record_count: record_count.max(0) as u64,
+                warning_count: warning_count.max(0) as u64,
+                error_count: error_count.max(0) as u64,
+            });
+        }
+
+        Ok(files)
+    }
+
+    /// Load a single indexed metric record by stable id.
+    pub fn metric_record_by_id(&self, id: &str) -> Result<Option<MetricRecordEntry>> {
+        let conn = self.connection()?;
+        let row = conn
+            .query_row(
+                "SELECT source_file, source_line FROM metric_records WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .context("failed to query metric record")?;
+
+        row.map(|(source_file, source_line)| {
+            load_metric_record_entry(&conn, &source_file, source_line as usize)
+        })
+        .transpose()
+    }
+
+    /// Search indexed metric records using the supplied structured query.
+    pub fn search_metric_records(
+        &self,
+        query: &MetricsQuery,
+        limit: usize,
+    ) -> Result<Vec<MetricRecordEntry>> {
+        let conn = self.connection()?;
+        let mut sql = String::from(
+            "SELECT source_file, source_line
+             FROM metric_records
+             WHERE 1 = 1",
+        );
+        let mut params: Vec<SqlValue> = Vec::new();
+
+        for key in &query.key_filters {
+            sql.push_str(" AND LOWER(key) = ?");
+            params.push(SqlValue::from(key.to_ascii_lowercase()));
+        }
+
+        for source in &query.source_filters {
+            sql.push_str(" AND LOWER(source) = ?");
+            params.push(SqlValue::from(source.to_ascii_lowercase()));
+        }
+
+        for file in &query.file_filters {
+            sql.push_str(" AND LOWER(source_file) LIKE ?");
+            params.push(SqlValue::from(like_pattern(file)));
+        }
+
+        for note in &query.note_filters {
+            sql.push_str(" AND LOWER(COALESCE(note, '')) LIKE ?");
+            params.push(SqlValue::from(like_pattern(note)));
+        }
+
+        if let Some(range) = &query.date_range {
+            if let Some(start) = range.lower_bound_micros() {
+                sql.push_str(" AND COALESCE(date_micros, ts_utc) >= ?");
+                params.push(SqlValue::from(start));
+            }
+            if let Some(end) = range.upper_bound_micros() {
+                sql.push_str(" AND COALESCE(date_micros, ts_utc) <= ?");
+                params.push(SqlValue::from(end));
+            }
+        }
+
+        for term in &query.text_terms {
+            sql.push_str(
+                " AND (
+                    LOWER(COALESCE(note, '')) LIKE ?
+                    OR LOWER(raw_line) LIKE ?
+                    OR LOWER(source_file) LIKE ?
+                    OR LOWER(COALESCE(tags_json, '')) LIKE ?
+                    OR LOWER(COALESCE(context_json, '')) LIKE ?
+                    OR LOWER(COALESCE(extra_fields_json, '')) LIKE ?
+                )",
+            );
+            let pattern = like_pattern(term);
+            for _ in 0..6 {
+                params.push(SqlValue::from(pattern.clone()));
+            }
+        }
+
+        sql.push_str(
+            " ORDER BY COALESCE(date_micros, ts_utc) DESC, source_file ASC, source_line ASC LIMIT ?",
+        );
+        params.push(SqlValue::from(limit.max(1) as i64));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (source_file, source_line) = row?;
+            records.push(load_metric_record_entry(
+                &conn,
+                &source_file,
+                source_line as usize,
+            )?);
+        }
+
+        Ok(records)
     }
 
     /// List every note identifier stored in the index.
@@ -1202,6 +1342,209 @@ fn metric_issue_code(code: MetricIssueCode) -> &'static str {
         MetricIssueCode::UnitMismatch => "unit_mismatch",
         MetricIssueCode::DuplicateId => "duplicate_id",
         MetricIssueCode::DuplicateOriginId => "duplicate_origin_id",
+    }
+}
+
+fn like_pattern(value: &str) -> String {
+    format!("%{}%", value.trim().to_ascii_lowercase())
+}
+
+fn load_metric_record_entry(
+    conn: &Connection,
+    source_file: &str,
+    source_line: usize,
+) -> Result<MetricRecordEntry> {
+    let row = conn
+        .query_row(
+            "SELECT id, ts, key, value, source, date, unit, origin_id, note, context_json, tags_json, raw_line, validation_status, extra_fields_json
+             FROM metric_records
+             WHERE source_file = ?1 AND source_line = ?2",
+            params![source_file, source_line as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            },
+        )
+        .with_context(|| {
+            format!(
+                "failed to load metric record {}:{}",
+                source_file, source_line
+            )
+        })?;
+
+    let (
+        id,
+        ts,
+        key,
+        value,
+        source,
+        date,
+        unit,
+        origin_id,
+        note,
+        context_json,
+        tags_json,
+        raw_line,
+        validation_status,
+        extra_fields_json,
+    ) = row;
+
+    let context = context_json
+        .as_deref()
+        .map(serde_json::from_str::<serde_json::Map<String, Value>>)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to parse stored metric context for {}:{}",
+                source_file, source_line
+            )
+        })?;
+    let tags = tags_json
+        .as_deref()
+        .map(serde_json::from_str::<Vec<String>>)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to parse stored metric tags for {}:{}",
+                source_file, source_line
+            )
+        })?
+        .unwrap_or_default();
+    let extra_fields = extra_fields_json
+        .as_deref()
+        .map(serde_json::from_str::<BTreeMap<String, Value>>)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to parse stored metric extra fields for {}:{}",
+                source_file, source_line
+            )
+        })?
+        .unwrap_or_default();
+
+    Ok(MetricRecordEntry {
+        source_file: source_file.into(),
+        source_line,
+        record: MetricRecord {
+            id,
+            ts: DateTime::parse_from_rfc3339(&ts).with_context(|| {
+                format!(
+                    "failed to parse stored metric timestamp for {}:{}",
+                    source_file, source_line
+                )
+            })?,
+            key,
+            value,
+            source,
+            date: date
+                .as_deref()
+                .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "failed to parse stored metric date for {}:{}",
+                        source_file, source_line
+                    )
+                })?,
+            unit,
+            origin_id,
+            note,
+            context,
+            tags,
+            extra_fields,
+        },
+        raw_line,
+        validation_status: parse_metric_validation_status(&validation_status)?,
+        issues: load_metric_issues(conn, source_file, source_line)?,
+    })
+}
+
+fn load_metric_issues(
+    conn: &Connection,
+    source_file: &str,
+    source_line: usize,
+) -> Result<Vec<MetricValidationIssue>> {
+    let mut stmt = conn.prepare(
+        "SELECT severity, code, field, message
+         FROM metric_issues
+         WHERE source_file = ?1 AND source_line = ?2
+         ORDER BY issue_ordinal ASC",
+    )?;
+    let rows = stmt.query_map(params![source_file, source_line as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut issues = Vec::new();
+    for row in rows {
+        let (severity, code, field, message) = row?;
+        issues.push(MetricValidationIssue {
+            severity: parse_metric_issue_severity(&severity)?,
+            code: parse_metric_issue_code(&code)?,
+            field,
+            message,
+        });
+    }
+    Ok(issues)
+}
+
+fn parse_metric_validation_status(value: &str) -> Result<MetricValidationStatus> {
+    match value {
+        "valid" => Ok(MetricValidationStatus::Valid),
+        "warning" => Ok(MetricValidationStatus::Warning),
+        "invalid" => Ok(MetricValidationStatus::Invalid),
+        _ => Err(anyhow!("unknown metric validation status `{value}`")),
+    }
+}
+
+fn parse_metric_issue_severity(value: &str) -> Result<MetricIssueSeverity> {
+    match value {
+        "warning" => Ok(MetricIssueSeverity::Warning),
+        "error" => Ok(MetricIssueSeverity::Error),
+        _ => Err(anyhow!("unknown metric issue severity `{value}`")),
+    }
+}
+
+fn parse_metric_issue_code(value: &str) -> Result<MetricIssueCode> {
+    match value {
+        "invalid_json" => Ok(MetricIssueCode::InvalidJson),
+        "invalid_row_type" => Ok(MetricIssueCode::InvalidRowType),
+        "invalid_id" => Ok(MetricIssueCode::InvalidId),
+        "invalid_timestamp" => Ok(MetricIssueCode::InvalidTimestamp),
+        "invalid_key" => Ok(MetricIssueCode::InvalidKey),
+        "invalid_value" => Ok(MetricIssueCode::InvalidValue),
+        "invalid_source" => Ok(MetricIssueCode::InvalidSource),
+        "invalid_date" => Ok(MetricIssueCode::InvalidDate),
+        "invalid_unit" => Ok(MetricIssueCode::InvalidUnit),
+        "invalid_origin_id" => Ok(MetricIssueCode::InvalidOriginId),
+        "invalid_note" => Ok(MetricIssueCode::InvalidNote),
+        "invalid_context" => Ok(MetricIssueCode::InvalidContext),
+        "invalid_tags" => Ok(MetricIssueCode::InvalidTags),
+        "unknown_field" => Ok(MetricIssueCode::UnknownField),
+        "unknown_metric_key" => Ok(MetricIssueCode::UnknownMetricKey),
+        "unknown_unit" => Ok(MetricIssueCode::UnknownUnit),
+        "unit_mismatch" => Ok(MetricIssueCode::UnitMismatch),
+        "duplicate_id" => Ok(MetricIssueCode::DuplicateId),
+        "duplicate_origin_id" => Ok(MetricIssueCode::DuplicateOriginId),
+        _ => Err(anyhow!("unknown metric issue code `{value}`")),
     }
 }
 
