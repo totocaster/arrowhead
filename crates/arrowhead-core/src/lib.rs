@@ -12,6 +12,7 @@
 
 #![warn(missing_docs)]
 
+pub mod context;
 pub mod embeddings;
 pub mod graph;
 pub mod indexer;
@@ -28,6 +29,11 @@ pub mod vault;
 pub mod workspace;
 
 // Re-export commonly used types for convenience across crates.
+pub use context::{
+    ContextActivity, ContextAttention, ContextAttentionItem, ContextHistory, ContextLink,
+    ContextLinkKind, ContextNoteItem, ContextPayload, ContextRelated, ContextService,
+    ContextSummary, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT,
+};
 pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolutionRecord};
 pub use indexer::IndexProgressEvent;
 pub use metrics::{

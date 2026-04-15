@@ -1,14 +1,21 @@
 use std::{
+    collections::HashSet,
     fs,
     io::Cursor,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use arrowhead_core::metrics::MetricsConfigFile;
-use arrowhead_core::parse_metrics_reader;
 use arrowhead_core::status::DaemonStatus;
 use arrowhead_core::workspace::{WORKSPACE_CONFIG_FILE, WorkspaceFile, write_workspace_file};
+use arrowhead_core::{
+    LinkResolutionRecord, MetadataMap, NoteRecord, Vault,
+    graph::LinkReason,
+    metadata::{MetadataExtraction, MetadataExtractor},
+    metrics::MetricsConfigFile,
+    parse_metrics_reader,
+    sqlite::IndexDatabase,
+};
 use arrowhead_mcp::{
     handlers::HandlerRegistry,
     protocol::{Params, ProtocolError, Request},
@@ -118,6 +125,135 @@ async fn build_handler_with_metrics(temp_dir: &TempDir) -> HandlerRegistry {
         .expect("upsert indexed metrics");
 
     HandlerRegistry::new(Arc::new(runtime))
+}
+
+async fn build_handler_with_context(temp_dir: &TempDir) -> HandlerRegistry {
+    let arrowhead_dir = temp_dir.path().join(".arrowhead");
+    fs::create_dir_all(&arrowhead_dir).expect("create arrowhead dir");
+    write_workspace_file(
+        &arrowhead_dir.join(WORKSPACE_CONFIG_FILE),
+        &WorkspaceFile {
+            attachments_dir: None,
+            ignored_folders: Vec::new(),
+            daily_note_format: Some("YYYY-MM-DD".to_string()),
+            link_style: Some("relative".to_string()),
+            metrics: Some(MetricsConfigFile {
+                root: Some("Metrics".to_string()),
+                extensions: vec![".metrics.ndjson".to_string()],
+                default_write_file: Some("Metrics/All.metrics.ndjson".to_string()),
+                record_reference_prefix: Some("metric:".to_string()),
+                week_start_day: None,
+                day_start_hour: None,
+            }),
+        },
+    )
+    .expect("write workspace config");
+
+    let vault_path = temp_dir.path().to_path_buf();
+    let runtime = McpRuntime::initialise(
+        RuntimeOptions::new(vault_path)
+            .with_embedding_model(None)
+            .with_daemon_socket(Some(temp_dir.path().join("control.sock")))
+            .with_daemon_status(Some(temp_dir.path().join("status.json"))),
+    )
+    .await
+    .expect("runtime initialises");
+
+    seed_context_vault(runtime.vault().as_ref(), runtime.database().as_ref());
+
+    HandlerRegistry::new(Arc::new(runtime))
+}
+
+fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
+    let notes = vec![
+        build_context_note(
+            vault,
+            "Project Hub",
+            Some("Project Hub"),
+            "Track body.weight in [[2026-04-14]] and metric:01AAA from withings.",
+        ),
+        build_context_note(
+            vault,
+            "2026-04-14",
+            Some("2026-04-14"),
+            "Daily note for body.weight updates.",
+        ),
+        build_context_note(
+            vault,
+            "Related Note",
+            Some("Related Note"),
+            "See [[Project Hub]] for the latest withings import.",
+        ),
+    ];
+    let note_ids = notes
+        .iter()
+        .map(|note| note.id.clone())
+        .collect::<HashSet<_>>();
+
+    for note in notes {
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract metadata");
+        let resolved_links = make_resolved_links(&extraction, &note_ids);
+        database
+            .upsert_note(&note, &extraction, &resolved_links, chrono::Utc::now())
+            .expect("upsert note");
+    }
+
+    let rows = parse_metrics_reader(
+        Cursor::new(
+            concat!(
+                r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","date":"2026-04-14","key":"body.weight","value":105.6,"unit":"kg","source":"withings","note":"Morning weigh-in"}"#,
+                "\n",
+                r#"{"id":"01AAB","ts":"2026-04-15T08:30:00+00:00","date":"2026-04-15","key":"body.weight","value":105.2,"unit":"kg","source":"withings","note":"Follow-up weigh-in"}"#
+            ),
+        ),
+        Path::new("Metrics/All.metrics.ndjson"),
+    )
+    .expect("parse metrics rows");
+    database
+        .upsert_metrics_file(
+            "Metrics/All.metrics.ndjson",
+            chrono::Utc::now(),
+            &rows,
+            chrono::Utc::now(),
+        )
+        .expect("upsert context metrics");
+}
+
+fn build_context_note(vault: &Vault, note_id: &str, title: Option<&str>, body: &str) -> NoteRecord {
+    let mut metadata = MetadataMap::default();
+    if let Some(title) = title {
+        metadata.insert("title".to_string(), Value::String(title.to_string()));
+    }
+    vault
+        .write_note(note_id, &metadata, body)
+        .expect("write note");
+    vault.load_note(note_id).expect("load note")
+}
+
+fn make_resolved_links(
+    extraction: &MetadataExtraction,
+    note_ids: &HashSet<String>,
+) -> Vec<LinkResolutionRecord> {
+    extraction
+        .wikilinks
+        .iter()
+        .map(|link| {
+            let target = note_ids.contains(&link.target).then(|| link.target.clone());
+            LinkResolutionRecord {
+                raw: link.raw.clone(),
+                target,
+                display: link.display.clone(),
+                heading: link.heading.clone(),
+                reason: if note_ids.contains(&link.target) {
+                    LinkReason::Direct
+                } else {
+                    LinkReason::Unresolved
+                },
+            }
+        })
+        .collect()
 }
 
 async fn call_tool(handler: &HandlerRegistry, name: &str, arguments: Value) -> Value {
@@ -471,6 +607,101 @@ async fn metrics_delete_file_removes_path() {
             .join("Metrics/health.metrics.ndjson")
             .exists(),
         "deleted file should be removed"
+    );
+}
+
+#[tokio::test]
+async fn context_get_note_returns_context_sections() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "context_get_note",
+        json!({ "noteId": "Project Hub" }),
+    )
+    .await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("note")
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
+            .and_then(|activity| activity.get("metrics"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected note context metric activity"
+    );
+}
+
+#[tokio::test]
+async fn context_get_metric_accepts_metric_key() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "context_get_metric",
+        json!({ "metric": "body.weight" }),
+    )
+    .await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("metric")
+    );
+    assert!(
+        structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("sources"))
+            .and_then(Value::as_array)
+            .is_some_and(|sources| sources
+                .iter()
+                .any(|source| source.as_str() == Some("withings"))),
+        "expected metric context sources"
+    );
+}
+
+#[tokio::test]
+async fn context_get_source_returns_metric_keys() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "context_get_source",
+        json!({ "source": "withings" }),
+    )
+    .await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("source")
+    );
+    assert!(
+        structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("metricKeys"))
+            .and_then(Value::as_array)
+            .is_some_and(|keys| keys.iter().any(|key| key.as_str() == Some("body.weight"))),
+        "expected source context metric keys"
     );
 }
 
@@ -939,5 +1170,23 @@ async fn protocol_tools_list_contains_metrics_and_note_tools() {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_delete_file")),
         "tool list should include metrics_delete_file"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_note")),
+        "tool list should include context_get_note"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_metric")),
+        "tool list should include context_get_metric"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_source")),
+        "tool list should include context_get_source"
     );
 }

@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use arrowhead_core::{
-    CreatedMetricFile, DeletedMetricFile, DeletedMetricRecord, LinkEdge, MetadataMap,
-    MetricFileSummary, MetricRecordEntry, NoteRecord, RenamedMetricFile, SearchResult,
+    ContextPayload, CreatedMetricFile, DeletedMetricFile, DeletedMetricRecord, LinkEdge,
+    MetadataMap, MetricFileSummary, MetricRecordEntry, NoteRecord, RenamedMetricFile, SearchResult,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -266,6 +266,46 @@ pub struct MetricFileDeleteParams {
     pub confirm: bool,
 }
 
+/// Parameters for `mcp.context.get_note`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextNoteParams {
+    /// Note identifier.
+    pub note_id: String,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
+/// Parameters for `mcp.context.get_metric`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextMetricParams {
+    /// Metric id (`metric:<id>` or raw id) or metric key.
+    pub metric: String,
+    /// Optional metrics date range filter.
+    pub range: Option<String>,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
+/// Parameters for `mcp.context.get_source`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextSourceParams {
+    /// Metrics source identifier.
+    pub source: String,
+    /// Optional metrics date range filter.
+    pub range: Option<String>,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
 /// Response payload for `mcp.metrics.list_files`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -323,6 +363,9 @@ pub struct MetricsSearchResultsPayload {
     /// Detailed metrics records matching the query.
     pub results: Vec<MetricRecordEntry>,
 }
+
+/// Response payload for `mcp.context.*`.
+pub type ContextResponsePayload = ContextPayload;
 
 /// Parameters for reading a specific note.
 #[derive(Debug, Clone, Deserialize)]

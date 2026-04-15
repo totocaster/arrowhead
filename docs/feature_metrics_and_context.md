@@ -15,9 +15,9 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics indexing model | In progress | Metrics conventions resolution, parser/validator coverage, SQLite persistence, core indexing refresh, and read/search surfaces are now wired; mutation indexing is now refreshed directly after record writes. |
 | Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
-| Context command family | Proposed | New context surfaces should work across days, notes, and metrics. |
+| Context command family | In progress | `context note`, `context metric`, and `context source` are now wired in CLI/MCP; `day`, `week`, and `changed` are still pending. |
 | Proactive linking | Proposed | Explicit and inferred links should be surfaced with reasons. |
-| Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD are now landing; context retrieval is still pending. |
+| Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD plus initial note/metric/source context are now landing; time-window context is still pending. |
 
 ## Accepted Decisions
 
@@ -612,6 +612,7 @@ This should complement the existing Metrics plugin, not compete with it.
 ### Phase 4: Context surfaces
 
 - implement day, week, changed, note, metric, and source context
+- `note`, `metric`, and `source` are now wired in CLI and MCP
 - define stable JSON payloads
 - add human-readable CLI renderers
 - fold existing note-context and related-notes behaviors into the new context

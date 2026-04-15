@@ -25,18 +25,19 @@ use crate::{
     protocol::{ErrorCode, Notification, Params, ProtocolError, Request},
     runtime::McpRuntime,
     tools::{
-        CallToolParams, CallToolResultPayload, DaemonStatusPayload, GraphContextPayload,
-        GraphLinksPayload, GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload,
-        ImplementationDescriptor, InitializeParams, InitializeResultPayload, LinkEdgePayload,
-        MetricCreateParams, MetricDeleteParams, MetricDeletePayload, MetricFileCreateParams,
-        MetricFileCreatePayload, MetricFileDeleteParams, MetricFileDeletePayload,
-        MetricFileRenameParams, MetricFileRenamePayload, MetricReadParams, MetricReadPayload,
-        MetricUpdateParams, MetricsFilesPayload, MetricsSearchResultsPayload, NoteContentPayload,
-        NoteCreateParams, NoteDeleteParams, NoteDeletePayload, NoteListItem, NoteMetadataParams,
-        NoteMetadataPayload, NoteReadParams, NoteUpdateParams, NotesListParams, NotesListPayload,
-        OrphanNotePayload, RelatedNotesParams, SearchParams, SearchResultPayload,
-        SearchResultsPayload, ServerCapabilitiesPayload, ToolCapabilityPayload, ToolDescriptor,
-        ToolsListPayload, VaultStatsParams,
+        CallToolParams, CallToolResultPayload, ContextMetricParams, ContextNoteParams,
+        ContextSourceParams, DaemonStatusPayload, GraphContextPayload, GraphLinksPayload,
+        GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload, ImplementationDescriptor,
+        InitializeParams, InitializeResultPayload, LinkEdgePayload, MetricCreateParams,
+        MetricDeleteParams, MetricDeletePayload, MetricFileCreateParams, MetricFileCreatePayload,
+        MetricFileDeleteParams, MetricFileDeletePayload, MetricFileRenameParams,
+        MetricFileRenamePayload, MetricReadParams, MetricReadPayload, MetricUpdateParams,
+        MetricsFilesPayload, MetricsSearchResultsPayload, NoteContentPayload, NoteCreateParams,
+        NoteDeleteParams, NoteDeletePayload, NoteListItem, NoteMetadataParams, NoteMetadataPayload,
+        NoteReadParams, NoteUpdateParams, NotesListParams, NotesListPayload, OrphanNotePayload,
+        RelatedNotesParams, SearchParams, SearchResultPayload, SearchResultsPayload,
+        ServerCapabilitiesPayload, ToolCapabilityPayload, ToolDescriptor, ToolsListPayload,
+        VaultStatsParams,
     },
     transport::MessageHandler,
 };
@@ -190,6 +191,55 @@ impl HandlerRegistry {
 
         serde_json::to_value(payload).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise unresolved links: {err}"))
+        })
+    }
+
+    async fn handle_context_note(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: ContextNoteParams = request.params.deserialize()?;
+        let payload = self
+            .runtime
+            .context_service()
+            .note(&params.note_id, params.note_limit, params.metric_limit)
+            .await
+            .map_err(map_context_error)?;
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise context payload: {err}"))
+        })
+    }
+
+    async fn handle_context_metric(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: ContextMetricParams = request.params.deserialize()?;
+        let payload = self
+            .runtime
+            .context_service()
+            .metric(
+                &params.metric,
+                params.range.as_deref(),
+                params.note_limit,
+                params.metric_limit,
+            )
+            .await
+            .map_err(map_context_error)?;
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise context payload: {err}"))
+        })
+    }
+
+    async fn handle_context_source(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: ContextSourceParams = request.params.deserialize()?;
+        let payload = self
+            .runtime
+            .context_service()
+            .source(
+                &params.source,
+                params.range.as_deref(),
+                params.note_limit,
+                params.metric_limit,
+            )
+            .await
+            .map_err(map_context_error)?;
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise context payload: {err}"))
         })
     }
 
@@ -806,6 +856,18 @@ impl HandlerRegistry {
                     .map(|path| format!("Deleted metrics file {path}."));
                 CallToolResultPayload::from_value_with_message(result, message)
             }
+            "context_get_note" | "context_get_metric" | "context_get_source" => {
+                let message =
+                    result
+                        .get("summary")
+                        .and_then(Value::as_object)
+                        .and_then(|summary| {
+                            let kind = summary.get("kind")?.as_str()?;
+                            let target = summary.get("target")?.as_str()?;
+                            Some(format!("Loaded {kind} context for {target}."))
+                        });
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
             "vault_status" => {
                 let message = result
                     .get("summary")
@@ -835,6 +897,9 @@ impl HandlerRegistry {
             }
             "mcp.graph.find_orphans" => self.handle_graph_orphans().await,
             "mcp.graph.find_unresolved" => self.handle_graph_unresolved().await,
+            "mcp.context.get_note" => self.handle_context_note(request).await,
+            "mcp.context.get_metric" => self.handle_context_metric(request).await,
+            "mcp.context.get_source" => self.handle_context_source(request).await,
             "mcp.search.fts" => self.handle_search_fts(request).await,
             "mcp.search.semantic" => self.handle_search_semantic(request).await,
             "mcp.search.hybrid" => self.handle_search_hybrid(request).await,
@@ -1140,6 +1205,77 @@ impl HandlerRegistry {
                 }
             },
             "required": ["path"]
+        });
+        let context_note_schema = json!({
+            "type": "object",
+            "description": "Parameters for building note context.",
+            "additionalProperties": false,
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "noteLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for related notes."
+                },
+                "metricLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for metric records."
+                }
+            },
+            "required": ["noteId"]
+        });
+        let context_metric_schema = json!({
+            "type": "object",
+            "description": "Parameters for building metric context from a metric id or key.",
+            "additionalProperties": false,
+            "properties": {
+                "metric": {
+                    "type": "string",
+                    "description": "Metric id (`metric:<id>` or raw id) or metric key."
+                },
+                "range": {
+                    "type": "string",
+                    "description": "Optional metrics date range such as `past30d` or `2026-04-01..2026-04-15`."
+                },
+                "noteLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for related notes."
+                },
+                "metricLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for metric records."
+                }
+            },
+            "required": ["metric"]
+        });
+        let context_source_schema = json!({
+            "type": "object",
+            "description": "Parameters for building source context.",
+            "additionalProperties": false,
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Metrics source identifier."
+                },
+                "range": {
+                    "type": "string",
+                    "description": "Optional metrics date range such as `past30d` or `2026-04-01..2026-04-15`."
+                },
+                "noteLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for related notes."
+                },
+                "metricLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for metric records."
+                }
+            },
+            "required": ["source"]
         });
         let notes_list_schema = json!({
             "type": "object",
@@ -1479,6 +1615,148 @@ impl HandlerRegistry {
                             "type": "integer",
                             "minimum": 0,
                             "description": "Number of non-empty rows that existed before deletion."
+                        }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        });
+        let context_note_item_schema = json!({
+            "type": "object",
+            "description": "Lightweight note summary surfaced by context.",
+            "required": ["noteId"],
+            "properties": {
+                "noteId": note_id_field_schema.clone(),
+                "title": { "type": "string" },
+                "relativePath": path_schema("Optional vault-relative path for the note."),
+                "fileModifiedAt": date_time_schema("Optional note file modification timestamp."),
+                "preview": { "type": "string" },
+                "reason": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+        let context_link_schema = json!({
+            "type": "object",
+            "description": "Relationship surfaced by context aggregation.",
+            "required": ["kind", "from", "to", "reason"],
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["explicit", "structural", "related"]
+                },
+                "from": { "type": "string" },
+                "to": { "type": "string" },
+                "reason": { "type": "string" },
+                "confidence": { "type": "number" }
+            },
+            "additionalProperties": false
+        });
+        let context_attention_item_schema = json!({
+            "type": "object",
+            "description": "Attention item returned by context aggregation.",
+            "required": ["kind", "message"],
+            "properties": {
+                "kind": { "type": "string" },
+                "message": { "type": "string" },
+                "noteId": note_id_field_schema.clone(),
+                "metricId": metric_id_field_schema.clone(),
+                "sourceFile": path_schema("Optional related metrics file path."),
+                "sourceLine": {
+                    "type": "integer",
+                    "minimum": 1
+                }
+            },
+            "additionalProperties": false
+        });
+        let context_payload_schema = json!({
+            "type": "object",
+            "description": "Stable context payload shared by CLI JSON and MCP tools.",
+            "required": ["summary", "history", "activity", "links", "attention", "related"],
+            "properties": {
+                "summary": {
+                    "type": "object",
+                    "required": ["kind", "target", "noteCount", "metricCount", "linkCount", "attentionCount"],
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["note", "metric", "source"]
+                        },
+                        "target": { "type": "string" },
+                        "label": { "type": "string" },
+                        "noteCount": { "type": "integer", "minimum": 0 },
+                        "metricCount": { "type": "integer", "minimum": 0 },
+                        "linkCount": { "type": "integer", "minimum": 0 },
+                        "attentionCount": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                },
+                "history": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "items": context_note_item_schema.clone()
+                        },
+                        "metrics": {
+                            "type": "array",
+                            "items": metric_record_entry_schema.clone()
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "activity": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "items": context_note_item_schema.clone()
+                        },
+                        "metrics": {
+                            "type": "array",
+                            "items": metric_record_entry_schema.clone()
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": metric_file_summary_schema.clone()
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "links": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": context_link_schema.clone()
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "attention": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": context_attention_item_schema.clone()
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "related": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {
+                            "type": "array",
+                            "items": context_note_item_schema.clone()
+                        },
+                        "metricKeys": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "sources": {
+                            "type": "array",
+                            "items": { "type": "string" }
                         }
                     },
                     "additionalProperties": false
@@ -2068,6 +2346,39 @@ impl HandlerRegistry {
                 annotations: Some(json!({ "method": "mcp.graph.find_unresolved" })),
             },
             ToolDescriptor {
+                name: "context_get_note".to_string(),
+                title: Some("Context: Note".to_string()),
+                description: Some(
+                    "Build a context payload around a note using graph structure, related notes, and linked metrics."
+                        .to_string(),
+                ),
+                input_schema: context_note_schema,
+                output_schema: Some(context_payload_schema.clone()),
+                annotations: Some(json!({ "method": "mcp.context.get_note" })),
+            },
+            ToolDescriptor {
+                name: "context_get_metric".to_string(),
+                title: Some("Context: Metric".to_string()),
+                description: Some(
+                    "Build a context payload around a metric id or metric key."
+                        .to_string(),
+                ),
+                input_schema: context_metric_schema,
+                output_schema: Some(context_payload_schema.clone()),
+                annotations: Some(json!({ "method": "mcp.context.get_metric" })),
+            },
+            ToolDescriptor {
+                name: "context_get_source".to_string(),
+                title: Some("Context: Source".to_string()),
+                description: Some(
+                    "Build a context payload around a metrics source."
+                        .to_string(),
+                ),
+                input_schema: context_source_schema,
+                output_schema: Some(context_payload_schema),
+                annotations: Some(json!({ "method": "mcp.context.get_source" })),
+            },
+            ToolDescriptor {
                 name: "search_fts".to_string(),
                 title: Some("Search: Full Text".to_string()),
                 description: Some(
@@ -2403,6 +2714,9 @@ fn resolve_tool_method(name: &str) -> Option<&'static str> {
         "graph_get_forward_links" => Some("mcp.graph.get_forward_links"),
         "graph_find_orphans" => Some("mcp.graph.find_orphans"),
         "graph_find_unresolved" => Some("mcp.graph.find_unresolved"),
+        "context_get_note" => Some("mcp.context.get_note"),
+        "context_get_metric" => Some("mcp.context.get_metric"),
+        "context_get_source" => Some("mcp.context.get_source"),
         "search_fts" => Some("mcp.search.fts"),
         "search_semantic" => Some("mcp.search.semantic"),
         "search_hybrid" => Some("mcp.search.hybrid"),
@@ -2469,6 +2783,21 @@ fn map_metrics_mutation_error(err: Error) -> ProtocolError {
         || message.contains("must live under")
         || message.contains("must be different")
         || message.contains("no metrics files were discovered")
+    {
+        ProtocolError::invalid_params(message)
+    } else {
+        ProtocolError::internal(message)
+    }
+}
+
+fn map_context_error(err: Error) -> ProtocolError {
+    let message = err.to_string();
+    if message.contains("must not be empty")
+        || message.contains("not found")
+        || message.contains("is not indexed")
+        || message.contains("was not found")
+        || message.contains("no metric")
+        || message.contains("source `")
     {
         ProtocolError::invalid_params(message)
     } else {

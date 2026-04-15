@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use arrowhead_core::vault::NoteInventoryEntry;
 use arrowhead_core::{
-    GraphService, InventorySnapshot, MetadataMap, MetricsMutationService, MetricsService,
-    NoteRecord, SearchConfig, SearchService, Vault, VaultConfig, VaultPaths,
+    ContextService, GraphService, InventorySnapshot, MetadataMap, MetricsMutationService,
+    MetricsService, NoteRecord, SearchConfig, SearchService, Vault, VaultConfig, VaultPaths,
     sqlite::IndexDatabase,
     status::{DaemonStatus, IssueSeverity, StatusIssue},
     workspace::WorkspaceKind,
@@ -90,6 +90,7 @@ pub struct McpRuntime {
     vault: Arc<Vault>,
     database: Arc<IndexDatabase>,
     graph: GraphService,
+    context: ContextService,
     metrics: MetricsService,
     metrics_mutation: MetricsMutationService,
     search: SearchService,
@@ -137,6 +138,8 @@ impl McpRuntime {
             SearchConfig::default(),
             embeddings.clone(),
         );
+        let context =
+            ContextService::new(Arc::clone(&vault), Arc::clone(&database), search.clone());
 
         let vault_paths = vault.paths().clone();
         let socket_path = options
@@ -152,6 +155,7 @@ impl McpRuntime {
             vault,
             database,
             graph,
+            context,
             metrics,
             metrics_mutation,
             search,
@@ -177,6 +181,12 @@ impl McpRuntime {
     #[must_use]
     pub fn graph_service(&self) -> &GraphService {
         &self.graph
+    }
+
+    /// Access the context service.
+    #[must_use]
+    pub fn context_service(&self) -> &ContextService {
+        &self.context
     }
 
     /// Access the metrics service.
