@@ -13,10 +13,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value as SqlValue,
+};
 use serde_json::Value;
 use tracing::{debug, info};
 
@@ -24,6 +26,7 @@ use crate::{
     MetadataMap, NoteRecord,
     graph::{LinkResolutionRecord, normalise_link_lookup},
     metadata::MetadataExtraction,
+    metrics::{MetricIssueCode, MetricIssueSeverity, MetricValidationStatus, ParsedMetricRow},
     query::{QueryFilters, parse_absolute_date},
 };
 
@@ -37,7 +40,7 @@ static SQLITE_VEC_REGISTER: Once = Once::new();
 static SQLITE_VEC_STATUS: AtomicI32 = AtomicI32::new(rusqlite::ffi::SQLITE_OK);
 
 /// Current schema version for the Arrowhead index database.
-const INDEX_SCHEMA_VERSION: i32 = 5;
+const INDEX_SCHEMA_VERSION: i32 = 6;
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,15 @@ pub struct NoteIndexState {
     /// Filesystem modification timestamp stored in the index.
     pub file_modified_at: DateTime<Utc>,
     /// When the note was last indexed.
+    pub indexed_at: DateTime<Utc>,
+}
+
+/// Tracks existing index metadata for a metrics file to drive staleness checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricFileState {
+    /// Filesystem modification timestamp stored in the index.
+    pub file_modified_at: DateTime<Utc>,
+    /// When the metrics file was last indexed.
     pub indexed_at: DateTime<Utc>,
 }
 
@@ -189,6 +201,55 @@ impl IndexDatabase {
         Ok(result)
     }
 
+    /// Retrieve existing indexing state for a metrics file.
+    pub fn metric_file_state(&self, relative_path: &str) -> Result<Option<MetricFileState>> {
+        let conn = self.connection()?;
+        let row = conn
+            .query_row(
+                "SELECT file_modified_at, indexed_at FROM metric_files WHERE relative_path = ?1",
+                [relative_path],
+                |row| {
+                    let file_modified: i64 = row.get(0)?;
+                    let indexed: i64 = row.get(1)?;
+                    Ok((file_modified, indexed))
+                },
+            )
+            .optional()
+            .context("failed to query metrics file indexing state")?;
+
+        row.map(|(file_modified, indexed)| -> Result<_> {
+            Ok(MetricFileState {
+                file_modified_at: from_micros(file_modified)?,
+                indexed_at: from_micros(indexed)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Retrieve indexing state for every metrics file as a single lookup table.
+    pub fn metric_file_states(&self) -> Result<HashMap<String, MetricFileState>> {
+        let conn = self.connection()?;
+        let mut stmt =
+            conn.prepare("SELECT relative_path, file_modified_at, indexed_at FROM metric_files")?;
+        let mut rows = stmt.query([])?;
+        let mut result = HashMap::new();
+
+        while let Some(row) = rows.next()? {
+            let relative_path: String = row.get(0)?;
+            let file_modified: i64 = row.get(1)?;
+            let indexed: i64 = row.get(2)?;
+            result.insert(
+                relative_path,
+                MetricFileState {
+                    file_modified_at: from_micros(file_modified)?,
+                    indexed_at: from_micros(indexed)?,
+                },
+            );
+        }
+
+        Ok(result)
+    }
+
     /// List every note identifier stored in the index.
     pub fn list_note_ids(&self) -> Result<Vec<String>> {
         let conn = self.connection()?;
@@ -289,6 +350,196 @@ impl IndexDatabase {
 
         tx.commit()
             .context("failed to commit removal transaction")?;
+        Ok(affected > 0)
+    }
+
+    /// Replace all indexed metrics rows for a single file.
+    pub fn upsert_metrics_file(
+        &self,
+        relative_path: &str,
+        file_modified_at: DateTime<Utc>,
+        rows: &[ParsedMetricRow],
+        indexed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut conn = self.connection_for_thread()?;
+        let tx = conn.transaction().context("failed to start transaction")?;
+        clear_metrics_file_rows(&tx, relative_path)?;
+
+        let record_count = rows
+            .iter()
+            .filter(|row| row.record.is_some() && !row.has_errors())
+            .count() as i64;
+        let warning_count = rows
+            .iter()
+            .flat_map(|row| &row.issues)
+            .filter(|issue| issue.severity == MetricIssueSeverity::Warning)
+            .count() as i64;
+        let error_count = rows
+            .iter()
+            .flat_map(|row| &row.issues)
+            .filter(|issue| issue.severity == MetricIssueSeverity::Error)
+            .count() as i64;
+
+        tx.execute(
+            "INSERT INTO metric_files (
+                relative_path,
+                file_modified_at,
+                indexed_at,
+                row_count,
+                record_count,
+                warning_count,
+                error_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(relative_path) DO UPDATE SET
+                file_modified_at = excluded.file_modified_at,
+                indexed_at = excluded.indexed_at,
+                row_count = excluded.row_count,
+                record_count = excluded.record_count,
+                warning_count = excluded.warning_count,
+                error_count = excluded.error_count",
+            params![
+                relative_path,
+                file_modified_at.timestamp_micros(),
+                indexed_at.timestamp_micros(),
+                rows.len() as i64,
+                record_count,
+                warning_count,
+                error_count,
+            ],
+        )
+        .context("failed to upsert metric file row")?;
+
+        for row in rows {
+            if !row.has_errors() {
+                if let Some(record) = &row.record {
+                    let context_json = record
+                        .context
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .context("failed to serialise metric context")?;
+                    let tags_json = if record.tags.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            serde_json::to_string(&record.tags)
+                                .context("failed to serialise metric tags")?,
+                        )
+                    };
+                    let extra_fields_json = if record.extra_fields.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            serde_json::to_string(&record.extra_fields)
+                                .context("failed to serialise metric extra fields")?,
+                        )
+                    };
+                    let date_micros = record.date.and_then(date_to_micros);
+
+                    tx.execute(
+                        "INSERT INTO metric_records (
+                            source_file,
+                            source_line,
+                            id,
+                            ts,
+                            ts_utc,
+                            key,
+                            value,
+                            source,
+                            date,
+                            date_micros,
+                            unit,
+                            origin_id,
+                            note,
+                            context_json,
+                            tags_json,
+                            raw_line,
+                            validation_status,
+                            extra_fields_json
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                        params![
+                            relative_path,
+                            row.line_number as i64,
+                            &record.id,
+                            record.ts.to_rfc3339(),
+                            record.ts.with_timezone(&Utc).timestamp_micros(),
+                            &record.key,
+                            record.value,
+                            &record.source,
+                            record.date.map(|value| value.to_string()),
+                            date_micros,
+                            record.unit.as_deref(),
+                            record.origin_id.as_deref(),
+                            record.note.as_deref(),
+                            context_json.as_deref(),
+                            tags_json.as_deref(),
+                            &row.raw_line,
+                            metric_validation_status(row),
+                            extra_fields_json.as_deref(),
+                        ],
+                    )
+                    .context("failed to insert metric record row")?;
+                }
+            }
+
+            for (ordinal, issue) in row.issues.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO metric_issues (
+                        source_file,
+                        source_line,
+                        issue_ordinal,
+                        severity,
+                        code,
+                        field,
+                        message
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        relative_path,
+                        row.line_number as i64,
+                        ordinal as i64,
+                        metric_issue_severity(issue.severity),
+                        metric_issue_code(issue.code),
+                        issue.field.as_deref(),
+                        &issue.message,
+                    ],
+                )
+                .context("failed to insert metric issue row")?;
+            }
+        }
+
+        tx.commit()
+            .context("failed to commit metrics indexing transaction")
+    }
+
+    /// Remove a metrics file and associated rows from the index.
+    pub fn remove_metrics_file(&self, relative_path: &str) -> Result<bool> {
+        let mut conn = self.connection_for_thread()?;
+        let tx = conn
+            .transaction()
+            .context("failed to start metrics removal transaction")?;
+        tx.execute(
+            "DELETE FROM metric_links WHERE source_file = ?1",
+            [relative_path],
+        )
+        .context("failed to remove metric links")?;
+        tx.execute(
+            "DELETE FROM metric_issues WHERE source_file = ?1",
+            [relative_path],
+        )
+        .context("failed to remove metric issues")?;
+        tx.execute(
+            "DELETE FROM metric_records WHERE source_file = ?1",
+            [relative_path],
+        )
+        .context("failed to remove metric records")?;
+        let affected = tx
+            .execute(
+                "DELETE FROM metric_files WHERE relative_path = ?1",
+                [relative_path],
+            )
+            .context("failed to remove metric file row")?;
+        tx.commit()
+            .context("failed to commit metrics removal transaction")?;
         Ok(affected > 0)
     }
 
@@ -726,6 +977,74 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             dimension INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS metric_files (
+            relative_path TEXT PRIMARY KEY,
+            file_modified_at INTEGER NOT NULL,
+            indexed_at INTEGER NOT NULL,
+            row_count INTEGER NOT NULL,
+            record_count INTEGER NOT NULL,
+            warning_count INTEGER NOT NULL,
+            error_count INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS metric_records (
+            source_file TEXT NOT NULL,
+            source_line INTEGER NOT NULL,
+            id TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            ts_utc INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value REAL NOT NULL,
+            source TEXT NOT NULL,
+            date TEXT,
+            date_micros INTEGER,
+            unit TEXT,
+            origin_id TEXT,
+            note TEXT,
+            context_json TEXT,
+            tags_json TEXT,
+            raw_line TEXT NOT NULL,
+            validation_status TEXT NOT NULL,
+            extra_fields_json TEXT,
+            PRIMARY KEY (source_file, source_line),
+            FOREIGN KEY(source_file) REFERENCES metric_files(relative_path) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_metric_records_id ON metric_records(id);
+        CREATE INDEX IF NOT EXISTS idx_metric_records_origin_id ON metric_records(origin_id);
+        CREATE INDEX IF NOT EXISTS idx_metric_records_key_ts ON metric_records(key, ts_utc DESC);
+        CREATE INDEX IF NOT EXISTS idx_metric_records_source_ts ON metric_records(source, ts_utc DESC);
+        CREATE INDEX IF NOT EXISTS idx_metric_records_date ON metric_records(date_micros, key);
+
+        CREATE TABLE IF NOT EXISTS metric_issues (
+            source_file TEXT NOT NULL,
+            source_line INTEGER NOT NULL,
+            issue_ordinal INTEGER NOT NULL,
+            severity TEXT NOT NULL,
+            code TEXT NOT NULL,
+            field TEXT,
+            message TEXT NOT NULL,
+            PRIMARY KEY (source_file, source_line, issue_ordinal),
+            FOREIGN KEY(source_file) REFERENCES metric_files(relative_path) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metric_issues_severity ON metric_issues(severity, code);
+
+        CREATE TABLE IF NOT EXISTS metric_links (
+            source_file TEXT NOT NULL,
+            source_line INTEGER NOT NULL,
+            link_kind TEXT NOT NULL,
+            target_kind TEXT NOT NULL,
+            target_value TEXT NOT NULL,
+            reason TEXT,
+            confidence REAL,
+            evidence_json TEXT,
+            PRIMARY KEY (source_file, source_line, link_kind, target_kind, target_value),
+            FOREIGN KEY(source_file, source_line) REFERENCES metric_records(source_file, source_line) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_metric_links_target ON metric_links(target_kind, target_value);
         "#,
     )
     .context("failed to apply schema migrations")?;
@@ -816,6 +1135,74 @@ fn from_micros(micros: i64) -> Result<DateTime<Utc>> {
     Utc.timestamp_opt(seconds, micros_part * 1_000)
         .single()
         .context("invalid timestamp stored in database")
+}
+
+fn clear_metrics_file_rows(tx: &Transaction<'_>, relative_path: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM metric_links WHERE source_file = ?1",
+        [relative_path],
+    )
+    .context("failed to clear metric links")?;
+    tx.execute(
+        "DELETE FROM metric_issues WHERE source_file = ?1",
+        [relative_path],
+    )
+    .context("failed to clear metric issues")?;
+    tx.execute(
+        "DELETE FROM metric_records WHERE source_file = ?1",
+        [relative_path],
+    )
+    .context("failed to clear metric records")?;
+    tx.execute(
+        "DELETE FROM metric_files WHERE relative_path = ?1",
+        [relative_path],
+    )
+    .context("failed to clear metric file row")?;
+    Ok(())
+}
+
+fn date_to_micros(date: NaiveDate) -> Option<i64> {
+    date.and_hms_opt(0, 0, 0)
+        .map(|value| value.and_utc().timestamp_micros())
+}
+
+fn metric_validation_status(row: &ParsedMetricRow) -> &'static str {
+    match row.validation_status() {
+        MetricValidationStatus::Valid => "valid",
+        MetricValidationStatus::Warning => "warning",
+        MetricValidationStatus::Invalid => "invalid",
+    }
+}
+
+fn metric_issue_severity(severity: MetricIssueSeverity) -> &'static str {
+    match severity {
+        MetricIssueSeverity::Warning => "warning",
+        MetricIssueSeverity::Error => "error",
+    }
+}
+
+fn metric_issue_code(code: MetricIssueCode) -> &'static str {
+    match code {
+        MetricIssueCode::InvalidJson => "invalid_json",
+        MetricIssueCode::InvalidRowType => "invalid_row_type",
+        MetricIssueCode::InvalidId => "invalid_id",
+        MetricIssueCode::InvalidTimestamp => "invalid_timestamp",
+        MetricIssueCode::InvalidKey => "invalid_key",
+        MetricIssueCode::InvalidValue => "invalid_value",
+        MetricIssueCode::InvalidSource => "invalid_source",
+        MetricIssueCode::InvalidDate => "invalid_date",
+        MetricIssueCode::InvalidUnit => "invalid_unit",
+        MetricIssueCode::InvalidOriginId => "invalid_origin_id",
+        MetricIssueCode::InvalidNote => "invalid_note",
+        MetricIssueCode::InvalidContext => "invalid_context",
+        MetricIssueCode::InvalidTags => "invalid_tags",
+        MetricIssueCode::UnknownField => "unknown_field",
+        MetricIssueCode::UnknownMetricKey => "unknown_metric_key",
+        MetricIssueCode::UnknownUnit => "unknown_unit",
+        MetricIssueCode::UnitMismatch => "unit_mismatch",
+        MetricIssueCode::DuplicateId => "duplicate_id",
+        MetricIssueCode::DuplicateOriginId => "duplicate_origin_id",
+    }
 }
 
 fn format_content_for_fts(note: &NoteRecord) -> String {
@@ -910,7 +1297,10 @@ fn collect_dates_from_value(key: &str, value: &Value, output: &mut Vec<(String, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::{
+        io::Cursor,
+        path::{Path, PathBuf},
+    };
 
     use chrono::Utc;
     use tempfile::TempDir;
@@ -918,6 +1308,7 @@ mod tests {
     use crate::{
         graph::{LinkReason, LinkResolutionRecord},
         metadata::MetadataExtractor,
+        metrics::parse_metrics_reader,
         vault::{Vault, VaultConfig},
     };
 
@@ -952,6 +1343,11 @@ mod tests {
             .collect()
     }
 
+    fn parse_metric_rows(contents: &str, relative_path: &str) -> Vec<ParsedMetricRow> {
+        parse_metrics_reader(Cursor::new(contents), Path::new(relative_path))
+            .expect("metrics rows parse")
+    }
+
     #[test]
     fn creates_schema_on_open() {
         let dir = TempDir::new().expect("tempdir");
@@ -971,6 +1367,263 @@ mod tests {
         assert!(tables.iter().any(|name| name == "notes"));
         assert!(tables.iter().any(|name| name == "metadata"));
         assert!(tables.iter().any(|name| name == "notes_fts"));
+        assert!(tables.iter().any(|name| name == "metric_files"));
+        assert!(tables.iter().any(|name| name == "metric_records"));
+        assert!(tables.iter().any(|name| name == "metric_issues"));
+        assert!(tables.iter().any(|name| name == "metric_links"));
+    }
+
+    #[test]
+    fn upsert_metrics_file_persists_records_and_issues() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let relative_path = "Metrics/withings.metrics.ndjson";
+        let rows = parse_metric_rows(
+            concat!(
+                r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","date":"2026-04-14","key":"body.weight","value":105.6,"unit":"kg","source":"withings","origin_id":"withings:1","note":"Morning weigh-in","context":{"device":"scale"},"tags":["health","weight"]}"#,
+                "\n",
+                r#"{"id":"01AAB","ts":"2026-04-14T09:00:00+00:00","key":"body.weight","value":105.2,"unit":"kg","source":"withings","extra":"kept"}"#,
+                "\n",
+                r##"{"id":"01AAC","ts":"2026-04-14T10:00:00+00:00","value":104.9,"source":"withings"}"##
+            ),
+            relative_path,
+        );
+        let file_modified_at = Utc::now();
+        let indexed_at = Utc::now();
+
+        db.upsert_metrics_file(relative_path, file_modified_at, &rows, indexed_at)
+            .expect("upsert succeeds");
+
+        let conn = db.connection().expect("connection");
+        let file_row: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT row_count, record_count, warning_count, error_count
+                 FROM metric_files WHERE relative_path = ?1",
+                [relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("fetch metric file row");
+        assert_eq!(file_row, (3, 2, 1, 1));
+
+        let record_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metric_records", [], |row| row.get(0))
+            .expect("count metric records");
+        assert_eq!(record_count, 2);
+
+        let first_record: (String, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT validation_status, tags_json, context_json, extra_fields_json
+                 FROM metric_records
+                 WHERE source_file = ?1 AND source_line = 1",
+                [relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("fetch first metric record");
+        assert_eq!(first_record.0, "valid");
+        assert_eq!(first_record.1.as_deref(), Some(r#"["health","weight"]"#));
+        assert_eq!(first_record.2.as_deref(), Some(r#"{"device":"scale"}"#));
+        assert!(first_record.3.is_none());
+
+        let second_record: (String, Option<String>) = conn
+            .query_row(
+                "SELECT validation_status, extra_fields_json
+                 FROM metric_records
+                 WHERE source_file = ?1 AND source_line = 2",
+                [relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("fetch second metric record");
+        assert_eq!(second_record.0, "warning");
+        assert_eq!(second_record.1.as_deref(), Some(r#"{"extra":"kept"}"#));
+
+        let issues: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source_line, severity, code
+                     FROM metric_issues
+                     WHERE source_file = ?1
+                     ORDER BY source_line, issue_ordinal",
+                )
+                .expect("prepare metric issue query");
+            let rows = stmt
+                .query_map([relative_path], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("iterate metric issues");
+            rows.map(|row| row.expect("issue row")).collect()
+        };
+        assert_eq!(
+            issues,
+            vec![
+                (2, "warning".to_string(), "unknown_field".to_string()),
+                (3, "error".to_string(), "invalid_key".to_string()),
+            ]
+        );
+
+        let state = db
+            .metric_file_state(relative_path)
+            .expect("metric file state query")
+            .expect("metric file state present");
+        assert_eq!(
+            state.file_modified_at.timestamp_micros(),
+            file_modified_at.timestamp_micros()
+        );
+        assert_eq!(
+            state.indexed_at.timestamp_micros(),
+            indexed_at.timestamp_micros()
+        );
+    }
+
+    #[test]
+    fn upsert_metrics_file_replaces_existing_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let relative_path = "Metrics/withings.metrics.ndjson";
+        let initial_rows = parse_metric_rows(
+            r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings","extra":"kept"}"#,
+            relative_path,
+        );
+        db.upsert_metrics_file(relative_path, Utc::now(), &initial_rows, Utc::now())
+            .expect("first upsert succeeds");
+
+        let replacement_rows = parse_metric_rows(
+            r#"{"id":"01BBB","ts":"2026-04-15T08:30:00+00:00","key":"body.weight","value":104.4,"unit":"kg","source":"withings"}"#,
+            relative_path,
+        );
+        db.upsert_metrics_file(relative_path, Utc::now(), &replacement_rows, Utc::now())
+            .expect("second upsert succeeds");
+
+        let conn = db.connection().expect("connection");
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM metric_records
+                     WHERE source_file = ?1
+                     ORDER BY source_line",
+                )
+                .expect("prepare metric record query");
+            let rows = stmt
+                .query_map([relative_path], |row| row.get(0))
+                .expect("iterate metric record ids");
+            rows.map(|row| row.expect("metric record id")).collect()
+        };
+        assert_eq!(ids, vec!["01BBB".to_string()]);
+
+        let issue_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_issues WHERE source_file = ?1",
+                [relative_path],
+                |row| row.get(0),
+            )
+            .expect("count metric issues");
+        assert_eq!(issue_count, 0);
+
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT row_count, record_count, warning_count
+                 FROM metric_files WHERE relative_path = ?1",
+                [relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("fetch metric file counts");
+        assert_eq!(counts, (1, 1, 0));
+    }
+
+    #[test]
+    fn upsert_metrics_file_skips_invalid_duplicate_records() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let relative_path = "Metrics/withings.metrics.ndjson";
+        let rows = parse_metric_rows(
+            concat!(
+                r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings"}"#,
+                "\n",
+                r#"{"id":"01AAA","ts":"2026-04-14T09:00:00+00:00","key":"body.weight","value":105.1,"unit":"kg","source":"withings"}"#
+            ),
+            relative_path,
+        );
+
+        db.upsert_metrics_file(relative_path, Utc::now(), &rows, Utc::now())
+            .expect("upsert succeeds");
+
+        let conn = db.connection().expect("connection");
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT row_count, record_count, error_count
+                 FROM metric_files WHERE relative_path = ?1",
+                [relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("fetch metric file counts");
+        assert_eq!(counts, (2, 0, 2));
+
+        let record_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_records WHERE source_file = ?1",
+                [relative_path],
+                |row| row.get(0),
+            )
+            .expect("count metric records");
+        assert_eq!(record_count, 0);
+    }
+
+    #[test]
+    fn metric_file_states_returns_all_records() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+
+        for (relative_path, record_id) in [
+            ("Metrics/withings.metrics.ndjson", "01AAA"),
+            ("Metrics/whoop.metrics.ndjson", "01AAB"),
+        ] {
+            let rows = parse_metric_rows(
+                &format!(
+                    r#"{{"id":"{record_id}","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings"}}"#
+                ),
+                relative_path,
+            );
+            db.upsert_metrics_file(relative_path, Utc::now(), &rows, Utc::now())
+                .expect("upsert succeeds");
+        }
+
+        let states = db.metric_file_states().expect("metric file states query");
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key("Metrics/withings.metrics.ndjson"));
+        assert!(states.contains_key("Metrics/whoop.metrics.ndjson"));
+    }
+
+    #[test]
+    fn remove_metrics_file_cleans_up_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
+        let relative_path = "Metrics/withings.metrics.ndjson";
+        let rows = parse_metric_rows(
+            r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings","extra":"kept"}"#,
+            relative_path,
+        );
+        db.upsert_metrics_file(relative_path, Utc::now(), &rows, Utc::now())
+            .expect("upsert succeeds");
+
+        assert!(
+            db.remove_metrics_file(relative_path)
+                .expect("remove metrics file")
+        );
+        assert!(
+            !db.remove_metrics_file(relative_path)
+                .expect("second remove returns false")
+        );
+
+        let conn = db.connection().expect("connection");
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metric_files", [], |row| row.get(0))
+            .expect("count metric files");
+        let record_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metric_records", [], |row| row.get(0))
+            .expect("count metric records");
+        let issue_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM metric_issues", [], |row| row.get(0))
+            .expect("count metric issues");
+        assert_eq!((file_count, record_count, issue_count), (0, 0, 0));
     }
 
     #[test]
