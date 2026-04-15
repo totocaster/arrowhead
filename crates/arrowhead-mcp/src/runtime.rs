@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use arrowhead_core::vault::NoteInventoryEntry;
 use arrowhead_core::{
-    GraphService, InventorySnapshot, MetadataMap, MetricsService, NoteRecord, SearchConfig,
-    SearchService, Vault, VaultConfig, VaultPaths,
+    GraphService, InventorySnapshot, MetadataMap, MetricsMutationService, MetricsService,
+    NoteRecord, SearchConfig, SearchService, Vault, VaultConfig, VaultPaths,
     sqlite::IndexDatabase,
     status::{DaemonStatus, IssueSeverity, StatusIssue},
     workspace::WorkspaceKind,
@@ -91,6 +91,7 @@ pub struct McpRuntime {
     database: Arc<IndexDatabase>,
     graph: GraphService,
     metrics: MetricsService,
+    metrics_mutation: MetricsMutationService,
     search: SearchService,
     daemon: DaemonClient,
     semantic_enabled: bool,
@@ -107,6 +108,8 @@ impl McpRuntime {
         let database = Arc::new(IndexDatabase::open(&db_path)?);
         let graph = GraphService::new(Arc::clone(&database));
         let metrics = MetricsService::new(Arc::clone(&database));
+        let metrics_mutation =
+            MetricsMutationService::new(Arc::clone(&vault), Arc::clone(&database));
 
         let embedding_model = options.embedding_model.as_ref().and_then(|value| {
             let trimmed = value.trim();
@@ -150,6 +153,7 @@ impl McpRuntime {
             database,
             graph,
             metrics,
+            metrics_mutation,
             search,
             daemon,
             semantic_enabled,
@@ -179,6 +183,12 @@ impl McpRuntime {
     #[must_use]
     pub fn metrics_service(&self) -> &MetricsService {
         &self.metrics
+    }
+
+    /// Access the metrics mutation service.
+    #[must_use]
+    pub fn metrics_mutation_service(&self) -> &MetricsMutationService {
+        &self.metrics_mutation
     }
 
     /// Access the search service.

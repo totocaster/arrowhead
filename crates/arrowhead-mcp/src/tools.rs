@@ -5,11 +5,12 @@
 use std::path::PathBuf;
 
 use arrowhead_core::{
-    LinkEdge, MetadataMap, MetricFileSummary, MetricRecordEntry, NoteRecord, SearchResult,
+    DeletedMetricRecord, LinkEdge, MetadataMap, MetricFileSummary, MetricRecordEntry, NoteRecord,
+    SearchResult,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Common helper to render link edge data for responses.
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +148,95 @@ pub struct MetricReadParams {
     pub metric_id: String,
 }
 
+/// Parameters for creating a metric record.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricCreateParams {
+    /// Optional explicit target metrics file relative to the vault root.
+    pub file_path: Option<PathBuf>,
+    /// Optional stable metric id. Arrowhead generates one when omitted.
+    pub id: Option<String>,
+    /// RFC 3339 timestamp recorded for the metric event.
+    pub ts: String,
+    /// Metric key.
+    pub key: String,
+    /// Numeric metric value.
+    pub value: f64,
+    /// Source that produced the metric.
+    pub source: String,
+    /// Optional YYYY-MM-DD date bucket.
+    pub date: Option<String>,
+    /// Optional unit string.
+    pub unit: Option<String>,
+    /// Optional provenance id.
+    pub origin_id: Option<String>,
+    /// Optional human-authored note.
+    pub note: Option<String>,
+    /// Optional structured context object.
+    pub context: Option<Map<String, Value>>,
+    #[serde(default)]
+    /// Optional tags attached to the metric row.
+    pub tags: Vec<String>,
+}
+
+/// Parameters for updating a metric record.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricUpdateParams {
+    /// Stable metric id or `metric:<id>` reference.
+    pub metric_id: String,
+    /// Optional replacement RFC 3339 timestamp.
+    pub ts: Option<String>,
+    /// Optional replacement metric key.
+    pub key: Option<String>,
+    /// Optional replacement numeric value.
+    pub value: Option<f64>,
+    /// Optional replacement source.
+    pub source: Option<String>,
+    /// Optional replacement YYYY-MM-DD date.
+    pub date: Option<String>,
+    #[serde(default)]
+    /// Clear the `date` field entirely.
+    pub clear_date: bool,
+    /// Optional replacement unit.
+    pub unit: Option<String>,
+    #[serde(default)]
+    /// Clear the `unit` field entirely.
+    pub clear_unit: bool,
+    /// Optional replacement provenance id.
+    pub origin_id: Option<String>,
+    #[serde(default)]
+    /// Clear the `originId` field entirely.
+    pub clear_origin_id: bool,
+    /// Optional replacement note text.
+    pub note: Option<String>,
+    #[serde(default)]
+    /// Clear the `note` field entirely.
+    pub clear_note: bool,
+    /// Optional replacement context object.
+    pub context: Option<Map<String, Value>>,
+    #[serde(default)]
+    /// Clear the `context` field entirely.
+    pub clear_context: bool,
+    #[serde(default)]
+    /// Replace the entire tag list with these values.
+    pub tags: Vec<String>,
+    #[serde(default)]
+    /// Clear the tag list entirely.
+    pub clear_tags: bool,
+}
+
+/// Parameters for deleting a metric record.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetricDeleteParams {
+    /// Stable metric id or `metric:<id>` reference.
+    pub metric_id: String,
+    #[serde(default)]
+    /// Safety confirmation flag; must be true to delete.
+    pub confirm: bool,
+}
+
 /// Response payload for `mcp.metrics.list_files`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,6 +251,14 @@ pub struct MetricsFilesPayload {
 pub struct MetricReadPayload {
     /// Indexed metric record.
     pub record: MetricRecordEntry,
+}
+
+/// Response payload confirming a metric deletion.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricDeletePayload {
+    /// Deleted metric descriptor.
+    pub deleted: DeletedMetricRecord,
 }
 
 /// Response payload for `mcp.metrics.search`.

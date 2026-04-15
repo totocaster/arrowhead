@@ -10,7 +10,7 @@ use std::io::{IsTerminal, Write as _};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -287,21 +287,31 @@ impl AutoStartManager {
     }
 
     fn start_launchd(&self, manifest: &AutoStartManifest) -> Result<Option<u32>> {
-        let scope = format!("gui/{}", current_uid()?);
-        let label = format!("{}/{}", scope, manifest.unit_name);
+        let scope = launchd_scope()?;
+        let label = launchd_label(&scope, &manifest.unit_name);
 
-        let status = Command::new("launchctl")
-            .arg("kickstart")
-            .arg("-k")
-            .arg(&label)
-            .status()
-            .context("failed to run launchctl kickstart")?;
-        if !status.success() {
-            bail!(
-                "launchctl kickstart failed for {} (exit code {:?})",
-                label,
-                status.code()
-            );
+        let status = kickstart_launchd_label(&label)?;
+        if !status.status.success() {
+            if should_retry_launchd_activation(status.status.code()) {
+                reload_launchd_manifest(&scope, &manifest.unit_path)?;
+                let retry = kickstart_launchd_label(&label)?;
+                if !retry.status.success() {
+                    bail!(
+                        "launchctl kickstart failed for {} even after reloading {} (exit code {:?}): {}",
+                        label,
+                        manifest.unit_path.display(),
+                        retry.status.code(),
+                        launchctl_output_text(&retry)
+                    );
+                }
+            } else {
+                bail!(
+                    "launchctl kickstart failed for {} (exit code {:?}): {}",
+                    label,
+                    status.status.code(),
+                    launchctl_output_text(&status)
+                );
+            }
         }
 
         extract_launchd_pid(&manifest.unit_name)
@@ -616,6 +626,76 @@ fn current_uid() -> Result<u32> {
     }
 }
 
+fn launchd_scope() -> Result<String> {
+    Ok(format!("gui/{}", current_uid()?))
+}
+
+fn launchd_label(scope: &str, unit_name: &str) -> String {
+    format!("{scope}/{unit_name}")
+}
+
+fn kickstart_launchd_label(label: &str) -> Result<Output> {
+    Command::new("launchctl")
+        .arg("kickstart")
+        .arg("-k")
+        .arg(label)
+        .output()
+        .context("failed to run launchctl kickstart")
+}
+
+fn reload_launchd_manifest(scope: &str, unit_path: &Path) -> Result<()> {
+    if !unit_path.exists() {
+        bail!(
+            "launchd manifest points to missing plist {}",
+            unit_path.display()
+        );
+    }
+
+    let bootstrap = Command::new("launchctl")
+        .arg("bootstrap")
+        .arg(scope)
+        .arg(unit_path)
+        .output();
+
+    match bootstrap {
+        Ok(output) if output.status.success() => Ok(()),
+        _ => {
+            let load = Command::new("launchctl")
+                .arg("load")
+                .arg(unit_path)
+                .output()
+                .context("failed to reload launchd agent")?;
+            if !load.status.success() {
+                bail!(
+                    "launchctl failed to reload agent {} (exit code {:?}): {}",
+                    unit_path.display(),
+                    load.status.code(),
+                    launchctl_output_text(&load)
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn launchctl_output_text(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+
+    "no diagnostic output".to_string()
+}
+
+fn should_retry_launchd_activation(exit_code: Option<i32>) -> bool {
+    exit_code == Some(113)
+}
+
 fn extract_launchd_pid(label: &str) -> Result<Option<u32>> {
     #[cfg(target_os = "macos")]
     {
@@ -676,5 +756,26 @@ pub fn prompt_yes_no(question: &str) -> Result<Option<bool>> {
         "y" | "yes" => Ok(Some(true)),
         "n" | "no" => Ok(Some(false)),
         _ => Ok(Some(false)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launchd_label_joins_scope_and_unit_name() {
+        assert_eq!(
+            launchd_label("gui/501", "com.arrowhead.daemon.test"),
+            "gui/501/com.arrowhead.daemon.test"
+        );
+    }
+
+    #[test]
+    fn missing_launchd_service_triggers_reload_retry() {
+        assert!(should_retry_launchd_activation(Some(113)));
+        assert!(!should_retry_launchd_activation(Some(36)));
+        assert!(!should_retry_launchd_activation(Some(1)));
+        assert!(!should_retry_launchd_activation(None));
     }
 }

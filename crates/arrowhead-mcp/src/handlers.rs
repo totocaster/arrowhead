@@ -11,12 +11,13 @@ use std::{
 
 use anyhow::Error;
 use async_trait::async_trait;
+use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_json::{Value, json};
 use tokio::task;
 use tracing::debug;
 
 use arrowhead_core::{
-    MetadataMap, NoteRecord, Vault,
+    MetadataMap, MetricCreateRequest, MetricUpdateRequest, NoteRecord, PatchValue, Vault,
     status::{ActivityState, ActivityStatus, DaemonStatus},
 };
 
@@ -27,7 +28,8 @@ use crate::{
         CallToolParams, CallToolResultPayload, DaemonStatusPayload, GraphContextPayload,
         GraphLinksPayload, GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload,
         ImplementationDescriptor, InitializeParams, InitializeResultPayload, LinkEdgePayload,
-        MetricReadParams, MetricReadPayload, MetricsFilesPayload, MetricsSearchResultsPayload,
+        MetricCreateParams, MetricDeleteParams, MetricDeletePayload, MetricReadParams,
+        MetricReadPayload, MetricUpdateParams, MetricsFilesPayload, MetricsSearchResultsPayload,
         NoteContentPayload, NoteCreateParams, NoteDeleteParams, NoteDeletePayload, NoteListItem,
         NoteMetadataParams, NoteMetadataPayload, NoteReadParams, NoteUpdateParams, NotesListParams,
         NotesListPayload, OrphanNotePayload, RelatedNotesParams, SearchParams, SearchResultPayload,
@@ -308,6 +310,51 @@ impl HandlerRegistry {
         };
         serde_json::to_value(payload).map_err(|err| {
             ProtocolError::internal(format!("failed to serialise metrics search results: {err}"))
+        })
+    }
+
+    async fn handle_metrics_create(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricCreateParams = request.params.deserialize()?;
+        let service = self.runtime.metrics_mutation_service().clone();
+        let record = service
+            .create(build_metric_create_request(params)?)
+            .await
+            .map_err(map_metrics_mutation_error)?;
+        let payload = MetricReadPayload { record };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise created metric record: {err}"))
+        })
+    }
+
+    async fn handle_metrics_update(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricUpdateParams = request.params.deserialize()?;
+        let service = self.runtime.metrics_mutation_service().clone();
+        let record = service
+            .update(build_metric_update_request(params)?)
+            .await
+            .map_err(map_metrics_mutation_error)?;
+        let payload = MetricReadPayload { record };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise updated metric record: {err}"))
+        })
+    }
+
+    async fn handle_metrics_delete(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: MetricDeleteParams = request.params.deserialize()?;
+        if !params.confirm {
+            return Err(ProtocolError::invalid_params(
+                "set `confirm: true` to delete a metric record",
+            ));
+        }
+
+        let service = self.runtime.metrics_mutation_service().clone();
+        let deleted = service
+            .delete(&params.metric_id)
+            .await
+            .map_err(map_metrics_mutation_error)?;
+        let payload = MetricDeletePayload { deleted };
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise deleted metric record: {err}"))
         })
     }
 
@@ -674,6 +721,15 @@ impl HandlerRegistry {
                 });
                 CallToolResultPayload::from_value_with_message(result, message)
             }
+            "metrics_delete" => {
+                let message = result
+                    .get("deleted")
+                    .and_then(Value::as_object)
+                    .and_then(|deleted| deleted.get("metricId"))
+                    .and_then(Value::as_str)
+                    .map(|metric_id| format!("Deleted metric {metric_id}."));
+                CallToolResultPayload::from_value_with_message(result, message)
+            }
             "vault_status" => {
                 let message = result
                     .get("summary")
@@ -709,6 +765,9 @@ impl HandlerRegistry {
             "mcp.metrics.list_files" => self.handle_metrics_list_files().await,
             "mcp.metrics.read" => self.handle_metrics_read(request).await,
             "mcp.metrics.search" => self.handle_metrics_search(request).await,
+            "mcp.metrics.create" => self.handle_metrics_create(request).await,
+            "mcp.metrics.update" => self.handle_metrics_update(request).await,
+            "mcp.metrics.delete" => self.handle_metrics_delete(request).await,
             "mcp.vault.status" => self.handle_vault_status().await,
             "mcp.notes.read" => self.handle_note_read(request).await,
             "mcp.notes.list" => self.handle_note_list(request).await,
@@ -774,6 +833,11 @@ impl HandlerRegistry {
             "description": "Vault-relative note identifier without the .md extension.",
             "examples": note_id_examples
         });
+        let metric_id_field_schema = json!({
+            "type": "string",
+            "description": "Stable metric id or `metric:<id>` reference.",
+            "examples": ["01JV7RK8Q4X60M0E2N0A6QK61V", "metric:01JV7RK8Q4X60M0E2N0A6QK61V"]
+        });
 
         let note_id_schema = json!({
             "type": "object",
@@ -809,10 +873,158 @@ impl HandlerRegistry {
             "description": "Parameters that identify a single metric record.",
             "additionalProperties": false,
             "properties": {
-                "metricId": {
+                "metricId": metric_id_field_schema.clone()
+            },
+            "required": ["metricId"]
+        });
+        let metric_create_schema = json!({
+            "type": "object",
+            "description": "Parameters for creating a metric record in a vault metrics file.",
+            "additionalProperties": false,
+            "properties": {
+                "filePath": path_schema("Optional target metrics file relative to the vault root. Defaults to the resolved metrics write file."),
+                "id": {
                     "type": "string",
-                    "description": "Stable metric id or `metric:<id>` reference.",
-                    "examples": ["01JV7RK8Q4X60M0E2N0A6QK61V", "metric:01JV7RK8Q4X60M0E2N0A6QK61V"]
+                    "description": "Optional stable metric id. Arrowhead generates one when omitted."
+                },
+                "ts": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "RFC 3339 timestamp recorded for the metric event."
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Metric key such as `body.weight`."
+                },
+                "value": {
+                    "type": "number",
+                    "description": "Numeric metric value."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source that produced the metric."
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Optional YYYY-MM-DD date bucket."
+                },
+                "unit": {
+                    "type": "string",
+                    "description": "Optional unit string."
+                },
+                "originId": {
+                    "type": "string",
+                    "description": "Optional provenance id."
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Optional human-authored note."
+                },
+                "context": {
+                    "type": "object",
+                    "description": "Optional structured context object.",
+                    "additionalProperties": true
+                },
+                "tags": {
+                    "type": "array",
+                    "description": "Optional tags attached to the metric row.",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["ts", "key", "value", "source"]
+        });
+        let metric_update_schema = json!({
+            "type": "object",
+            "description": "Parameters for updating a metric record by stable id.",
+            "additionalProperties": false,
+            "properties": {
+                "metricId": metric_id_field_schema.clone(),
+                "ts": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Optional replacement RFC 3339 timestamp."
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Optional replacement metric key."
+                },
+                "value": {
+                    "type": "number",
+                    "description": "Optional replacement numeric value."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Optional replacement source."
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Optional replacement YYYY-MM-DD date."
+                },
+                "clearDate": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Clear the `date` field."
+                },
+                "unit": {
+                    "type": "string",
+                    "description": "Optional replacement unit."
+                },
+                "clearUnit": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Clear the `unit` field."
+                },
+                "originId": {
+                    "type": "string",
+                    "description": "Optional replacement provenance id."
+                },
+                "clearOriginId": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Clear the `originId` field."
+                },
+                "note": {
+                    "type": "string",
+                    "description": "Optional replacement note."
+                },
+                "clearNote": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Clear the `note` field."
+                },
+                "context": {
+                    "type": "object",
+                    "description": "Optional replacement context object.",
+                    "additionalProperties": true
+                },
+                "clearContext": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Clear the `context` field."
+                },
+                "tags": {
+                    "type": "array",
+                    "description": "Replace the tag list with these values.",
+                    "items": { "type": "string" }
+                },
+                "clearTags": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Clear the tag list entirely."
+                }
+            },
+            "required": ["metricId"]
+        });
+        let metric_delete_schema = json!({
+            "type": "object",
+            "description": "Parameters for deleting a metric record.",
+            "additionalProperties": false,
+            "properties": {
+                "metricId": metric_id_field_schema.clone(),
+                "confirm": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Safety confirmation flag; must be true to delete."
                 }
             },
             "required": ["metricId"]
@@ -1079,6 +1291,31 @@ impl HandlerRegistry {
                 "results": {
                     "type": "array",
                     "items": metric_record_entry_schema.clone()
+                }
+            },
+            "additionalProperties": false
+        });
+        let metric_delete_payload_schema = json!({
+            "type": "object",
+            "description": "Confirmation that a metric record was deleted.",
+            "required": ["deleted"],
+            "properties": {
+                "deleted": {
+                    "type": "object",
+                    "required": ["metricId", "sourceFile", "sourceLine"],
+                    "properties": {
+                        "metricId": {
+                            "type": "string",
+                            "description": "Stable id of the deleted metric."
+                        },
+                        "sourceFile": path_schema("Vault-relative metrics file that contained the deleted record."),
+                        "sourceLine": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "1-based line number of the deleted record before removal."
+                        }
+                    },
+                    "additionalProperties": false
                 }
             },
             "additionalProperties": false
@@ -1715,7 +1952,7 @@ impl HandlerRegistry {
                         .to_string(),
                 ),
                 input_schema: metric_id_schema,
-                output_schema: Some(metric_read_payload_schema),
+                output_schema: Some(metric_read_payload_schema.clone()),
                 annotations: Some(json!({ "method": "mcp.metrics.read" })),
             },
             ToolDescriptor {
@@ -1725,9 +1962,42 @@ impl HandlerRegistry {
                     "Search indexed metrics records using free text plus `key:`, `source:`, `file:`, `date:`, and `note:` filters."
                         .to_string(),
                 ),
-                input_schema: search_schema,
+                input_schema: search_schema.clone(),
                 output_schema: Some(metrics_search_results_payload_schema),
                 annotations: Some(json!({ "method": "mcp.metrics.search" })),
+            },
+            ToolDescriptor {
+                name: "metrics_create".to_string(),
+                title: Some("Metrics: Create".to_string()),
+                description: Some(
+                    "Create a metric record in the canonical NDJSON file and refresh the metrics index."
+                        .to_string(),
+                ),
+                input_schema: metric_create_schema,
+                output_schema: Some(metric_read_payload_schema.clone()),
+                annotations: Some(json!({ "method": "mcp.metrics.create" })),
+            },
+            ToolDescriptor {
+                name: "metrics_update".to_string(),
+                title: Some("Metrics: Update".to_string()),
+                description: Some(
+                    "Update an existing metric record by stable id and refresh the metrics index."
+                        .to_string(),
+                ),
+                input_schema: metric_update_schema,
+                output_schema: Some(metric_read_payload_schema.clone()),
+                annotations: Some(json!({ "method": "mcp.metrics.update" })),
+            },
+            ToolDescriptor {
+                name: "metrics_delete".to_string(),
+                title: Some("Metrics: Delete".to_string()),
+                description: Some(
+                    "Delete a metric record by stable id after explicit confirmation."
+                        .to_string(),
+                ),
+                input_schema: metric_delete_schema,
+                output_schema: Some(metric_delete_payload_schema),
+                annotations: Some(json!({ "method": "mcp.metrics.delete" })),
             },
             ToolDescriptor {
                 name: "vault_status".to_string(),
@@ -1940,6 +2210,9 @@ fn resolve_tool_method(name: &str) -> Option<&'static str> {
         "metrics_list_files" => Some("mcp.metrics.list_files"),
         "metrics_read" => Some("mcp.metrics.read"),
         "metrics_search" => Some("mcp.metrics.search"),
+        "metrics_create" => Some("mcp.metrics.create"),
+        "metrics_update" => Some("mcp.metrics.update"),
+        "metrics_delete" => Some("mcp.metrics.delete"),
         "vault_status" => Some("mcp.vault.status"),
         "notes_read" => Some("mcp.notes.read"),
         "notes_list" => Some("mcp.notes.list"),
@@ -1980,6 +2253,23 @@ fn map_metrics_search_error(err: Error) -> ProtocolError {
     }
 }
 
+fn map_metrics_mutation_error(err: Error) -> ProtocolError {
+    let message = err.to_string();
+    if message.contains("must not be empty")
+        || message.contains("invalid metrics")
+        || message.contains("requires at least one field change")
+        || message.contains("was not found")
+        || message.contains("already exists")
+        || message.contains("ambiguous")
+        || message.contains("cannot use `--")
+        || message.contains("metric row is invalid")
+    {
+        ProtocolError::invalid_params(message)
+    } else {
+        ProtocolError::internal(message)
+    }
+}
+
 fn map_note_load_error(err: Error, note_id: &str) -> ProtocolError {
     if err
         .chain()
@@ -1999,6 +2289,134 @@ fn map_note_write_error(err: Error, note_id: &str) -> ProtocolError {
         ProtocolError::invalid_params(format!("invalid note id {note_id}"))
     } else {
         ProtocolError::internal(err.to_string())
+    }
+}
+
+fn build_metric_create_request(
+    params: MetricCreateParams,
+) -> Result<MetricCreateRequest, ProtocolError> {
+    Ok(MetricCreateRequest {
+        file: params.file_path,
+        id: params.id,
+        ts: parse_metric_timestamp(&params.ts)?,
+        key: params.key,
+        value: params.value,
+        source: params.source,
+        date: params.date.as_deref().map(parse_metric_date).transpose()?,
+        unit: params.unit,
+        origin_id: params.origin_id,
+        note: params.note,
+        context: params.context,
+        tags: params.tags,
+        extra_fields: Default::default(),
+    })
+}
+
+fn build_metric_update_request(
+    params: MetricUpdateParams,
+) -> Result<MetricUpdateRequest, ProtocolError> {
+    Ok(MetricUpdateRequest {
+        metric_id: params.metric_id,
+        ts: params
+            .ts
+            .as_deref()
+            .map(parse_metric_timestamp)
+            .transpose()?,
+        key: params.key,
+        value: params.value,
+        source: params.source,
+        date: parse_metric_date_patch(params.date.as_deref(), params.clear_date)?,
+        unit: parse_string_patch(params.unit, params.clear_unit, "unit")?,
+        origin_id: parse_string_patch(params.origin_id, params.clear_origin_id, "originId")?,
+        note: parse_string_patch(params.note, params.clear_note, "note")?,
+        context: parse_context_patch(params.context, params.clear_context, "context")?,
+        tags: parse_tags_patch(params.tags, params.clear_tags)?,
+    })
+}
+
+fn parse_metric_timestamp(input: &str) -> Result<DateTime<FixedOffset>, ProtocolError> {
+    DateTime::parse_from_rfc3339(input.trim()).map_err(|err| {
+        ProtocolError::invalid_params(format!(
+            "invalid metrics timestamp `{}`: {err}",
+            input.trim()
+        ))
+    })
+}
+
+fn parse_metric_date(input: &str) -> Result<NaiveDate, ProtocolError> {
+    NaiveDate::parse_from_str(input.trim(), "%Y-%m-%d").map_err(|err| {
+        ProtocolError::invalid_params(format!("invalid metrics date `{}`: {err}", input.trim()))
+    })
+}
+
+fn parse_metric_date_patch(
+    input: Option<&str>,
+    clear: bool,
+) -> Result<PatchValue<NaiveDate>, ProtocolError> {
+    if clear && input.is_some() {
+        return Err(ProtocolError::invalid_params(
+            "cannot set `date` and `clearDate` together",
+        ));
+    }
+    if clear {
+        return Ok(PatchValue::Clear);
+    }
+    Ok(input
+        .map(parse_metric_date)
+        .transpose()?
+        .map(PatchValue::Set)
+        .unwrap_or(PatchValue::Unchanged))
+}
+
+fn parse_string_patch(
+    input: Option<String>,
+    clear: bool,
+    field_name: &str,
+) -> Result<PatchValue<String>, ProtocolError> {
+    if clear && input.is_some() {
+        return Err(ProtocolError::invalid_params(format!(
+            "cannot set `{field_name}` and clear it together"
+        )));
+    }
+    if clear {
+        Ok(PatchValue::Clear)
+    } else {
+        Ok(input.map(PatchValue::Set).unwrap_or(PatchValue::Unchanged))
+    }
+}
+
+fn parse_context_patch(
+    input: Option<serde_json::Map<String, Value>>,
+    clear: bool,
+    field_name: &str,
+) -> Result<PatchValue<serde_json::Map<String, Value>>, ProtocolError> {
+    if clear && input.is_some() {
+        return Err(ProtocolError::invalid_params(format!(
+            "cannot set `{field_name}` and clear it together"
+        )));
+    }
+    if clear {
+        Ok(PatchValue::Clear)
+    } else {
+        Ok(input.map(PatchValue::Set).unwrap_or(PatchValue::Unchanged))
+    }
+}
+
+fn parse_tags_patch(
+    input: Vec<String>,
+    clear: bool,
+) -> Result<PatchValue<Vec<String>>, ProtocolError> {
+    if clear && !input.is_empty() {
+        return Err(ProtocolError::invalid_params(
+            "cannot set `tags` and `clearTags` together",
+        ));
+    }
+    if clear {
+        Ok(PatchValue::Clear)
+    } else if input.is_empty() {
+        Ok(PatchValue::Unchanged)
+    } else {
+        Ok(PatchValue::Set(input))
     }
 }
 

@@ -263,6 +263,109 @@ async fn metrics_search_returns_matches() {
 }
 
 #[tokio::test]
+async fn metrics_create_returns_indexed_record() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_create",
+        json!({
+            "id": "01MCPCREATE00000000000000",
+            "ts": "2026-04-15T08:30:00+04:00",
+            "key": "body.weight",
+            "value": 105.6,
+            "unit": "kg",
+            "source": "withings",
+            "tags": ["health"]
+        }),
+    )
+    .await;
+
+    let record = structured
+        .get("record")
+        .and_then(Value::as_object)
+        .expect("record payload present");
+    assert_eq!(
+        record
+            .get("record")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str),
+        Some("01MCPCREATE00000000000000")
+    );
+    assert_eq!(
+        record.get("sourceFile").and_then(Value::as_str),
+        Some("Metrics/All.metrics.ndjson")
+    );
+}
+
+#[tokio::test]
+async fn metrics_update_mutates_existing_record() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_update",
+        json!({
+            "metricId": "01AAA",
+            "value": 104.9,
+            "note": "Updated by MCP"
+        }),
+    )
+    .await;
+
+    let record = structured
+        .get("record")
+        .and_then(Value::as_object)
+        .expect("record payload present");
+    let payload = record
+        .get("record")
+        .and_then(Value::as_object)
+        .expect("metric record present");
+    assert_eq!(payload.get("value").and_then(Value::as_f64), Some(104.9));
+    assert_eq!(
+        payload.get("note").and_then(Value::as_str),
+        Some("Updated by MCP")
+    );
+}
+
+#[tokio::test]
+async fn metrics_delete_requires_confirmation() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let err = call_tool_error(&handler, "metrics_delete", json!({ "metricId": "01AAA" })).await;
+    assert!(matches!(err, ProtocolError::InvalidParams { .. }));
+}
+
+#[tokio::test]
+async fn metrics_delete_removes_record() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler_with_metrics(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "metrics_delete",
+        json!({ "metricId": "01AAA", "confirm": true }),
+    )
+    .await;
+
+    let deleted = structured
+        .get("deleted")
+        .and_then(Value::as_object)
+        .expect("delete payload present");
+    assert_eq!(
+        deleted.get("metricId").and_then(Value::as_str),
+        Some("01AAA")
+    );
+
+    let err = call_tool_error(&handler, "metrics_read", json!({ "metricId": "01AAA" })).await;
+    assert!(matches!(err, ProtocolError::InvalidParams { .. }));
+}
+
+#[tokio::test]
 async fn vault_status_returns_cached_status_when_daemon_unreachable() {
     let temp_dir = copy_fixture();
     let status_path = temp_dir.path().join("status.json");
@@ -691,5 +794,23 @@ async fn protocol_tools_list_contains_metrics_and_note_tools() {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_search")),
         "tool list should include metrics_search"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_create")),
+        "tool list should include metrics_create"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_update")),
+        "tool list should include metrics_update"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("metrics_delete")),
+        "tool list should include metrics_delete"
     );
 }
