@@ -454,6 +454,26 @@ impl Vault {
         Some(relative)
     }
 
+    /// Normalise a filesystem path to a vault-relative metrics file path.
+    pub fn resolve_relative_metrics_path<P: AsRef<Path>>(&self, path: P) -> Option<PathBuf> {
+        let relative = self.normalise_path(path.as_ref())?;
+        if !relative.starts_with(&self.metrics.root) {
+            return None;
+        }
+
+        let path_value = relative.to_string_lossy();
+        if self
+            .metrics
+            .extensions
+            .iter()
+            .any(|suffix| path_value.ends_with(suffix))
+        {
+            Some(relative)
+        } else {
+            None
+        }
+    }
+
     /// Normalise a path and return its note identifier alongside the relative path.
     pub fn normalise_note_path<P: AsRef<Path>>(&self, path: P) -> Option<(NoteId, PathBuf)> {
         let relative = self.resolve_relative_note_path(path)?;
@@ -500,6 +520,35 @@ impl Vault {
             absolute_path,
             file_modified_at: modified,
             created_at: created,
+        }))
+    }
+
+    /// Construct a metrics file entry for the supplied path if the file exists.
+    pub fn metrics_entry_for_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<Option<MetricsFileEntry>> {
+        let relative_path = match self.resolve_relative_metrics_path(path.as_ref()) {
+            Some(path) => path,
+            None => return Ok(None),
+        };
+
+        let absolute_path = self.note_path(&relative_path);
+        let meta = match fs::metadata(&absolute_path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect metrics file {}", absolute_path.display())
+                });
+            }
+        };
+
+        let modified = system_time_to_utc(meta.modified().unwrap_or_else(|_| SystemTime::now()))?;
+        Ok(Some(MetricsFileEntry {
+            relative_path,
+            absolute_path,
+            file_modified_at: modified,
         }))
     }
 
@@ -1114,6 +1163,61 @@ mod tests {
                 PathBuf::from("Health/daily.health.ndjson"),
                 PathBuf::from("Health/nested/other.health.ndjson"),
             ]
+        );
+    }
+
+    #[test]
+    fn metrics_entry_for_path_resolves_existing_and_missing_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".arrowhead")).expect("arrowhead dir");
+        fs::create_dir_all(dir.path().join("Health")).expect("metrics dir");
+        fs::write(
+            dir.path().join(".arrowhead").join(WORKSPACE_CONFIG_FILE),
+            toml::to_string_pretty(&WorkspaceFile {
+                metrics: Some(MetricsConfigFile {
+                    root: Some("Health".to_string()),
+                    extensions: vec![".health.ndjson".to_string()],
+                    ..MetricsConfigFile::default()
+                }),
+                ..WorkspaceFile::default()
+            })
+            .expect("serialise workspace"),
+        )
+        .expect("write workspace file");
+        fs::write(
+            dir.path().join("Health").join("daily.health.ndjson"),
+            "{}\n",
+        )
+        .expect("write metrics file");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let existing = vault.note_path("Health/daily.health.ndjson");
+        let entry = vault
+            .metrics_entry_for_path(&existing)
+            .expect("metrics entry lookup")
+            .expect("metrics entry present");
+        assert_eq!(
+            entry.relative_path,
+            PathBuf::from("Health/daily.health.ndjson")
+        );
+
+        let missing = vault.note_path("Health/missing.health.ndjson");
+        assert_eq!(
+            vault.resolve_relative_metrics_path(&missing),
+            Some(PathBuf::from("Health/missing.health.ndjson"))
+        );
+        assert!(
+            vault
+                .metrics_entry_for_path(&missing)
+                .expect("missing metrics entry lookup")
+                .is_none()
+        );
+        assert!(
+            vault
+                .resolve_relative_metrics_path(vault.note_path("Note.md"))
+                .is_none()
         );
     }
 }

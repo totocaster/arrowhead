@@ -460,6 +460,12 @@ impl DaemonRuntime {
             if let Some((_, relative)) = self.config.vault.normalise_note_path(&path) {
                 let absolute = self.config.vault.note_path(&relative);
                 targets.insert(absolute);
+                continue;
+            }
+
+            if let Some(relative) = self.config.vault.resolve_relative_metrics_path(&path) {
+                let absolute = self.config.vault.note_path(&relative);
+                targets.insert(absolute);
             }
         }
 

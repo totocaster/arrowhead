@@ -17,11 +17,12 @@ use tokio::{
 use tracing::{debug, error, info};
 
 use crate::{
-    IndexingStats, NoteRecord, Vault,
+    IndexingStats, MetricsFileEntry, NoteRecord, Vault,
     embeddings::{EmbeddingPipeline, EmbeddingRecord},
     graph::{LinkReason, LinkResolutionRecord, normalise_link_lookup},
     metadata::{MetadataExtraction, MetadataExtractor, WikiLink},
-    sqlite::{IndexDatabase, LinkResolutionMaps, NoteIndexState},
+    metrics::parse_metrics_file,
+    sqlite::{IndexDatabase, LinkResolutionMaps, MetricFileState, NoteIndexState},
     vault::NoteInventoryEntry,
     vault::{normalise_relative_path, normalise_relative_str},
 };
@@ -61,6 +62,14 @@ enum WriteAck {
 enum WriterResult {
     Upsert { embedding: Option<EmbeddingRecord> },
     Remove { existed: bool },
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MetricPassStats {
+    indexed: u64,
+    skipped: u64,
+    removed: u64,
+    errors: u64,
 }
 
 /// Configuration options shared by the indexing pipeline.
@@ -233,6 +242,36 @@ impl Indexer {
             info!(removed = pruned.len(), "pruned stale notes from index");
         }
 
+        let metric_inventory = self.vault.metrics_files()?;
+        let known_metric_paths: HashSet<String> = metric_inventory
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().into_owned())
+            .collect();
+        let metric_stats = self.index_metrics_inventory(&metric_inventory).await?;
+        let pruned_metrics = self.prune_missing_metrics(&known_metric_paths).await?;
+        if !pruned_metrics.is_empty() {
+            info!(
+                removed = pruned_metrics.len(),
+                "pruned stale metrics files from index"
+            );
+        }
+        if metric_stats.indexed > 0
+            || metric_stats.skipped > 0
+            || metric_stats.removed > 0
+            || !pruned_metrics.is_empty()
+            || metric_stats.errors > 0
+        {
+            info!(
+                total = metric_inventory.len(),
+                indexed = metric_stats.indexed,
+                skipped = metric_stats.skipped,
+                removed = metric_stats.removed + pruned_metrics.len() as u64,
+                errors = metric_stats.errors,
+                "completed metrics indexing pass"
+            );
+        }
+        stats.errors += metric_stats.errors;
+
         info!(
             total = stats.total_notes,
             indexed = stats.indexed,
@@ -302,15 +341,21 @@ impl Indexer {
     /// Incrementally reindex the supplied filesystem paths.
     pub async fn reindex_paths(&self, paths: &[PathBuf]) -> Result<IndexingStats> {
         let mut targets: HashMap<String, PathBuf> = HashMap::new();
+        let mut metric_targets: Vec<PathBuf> = Vec::new();
         for path in paths {
             if let Some((note_id, relative)) = self.vault.normalise_note_path(path) {
                 let absolute = self.vault.note_path(&relative);
                 targets.insert(note_id, absolute);
+                continue;
+            }
+
+            if self.vault.resolve_relative_metrics_path(path).is_some() {
+                metric_targets.push(path.clone());
             }
         }
 
-        if targets.is_empty() {
-            debug!("reindex_paths called with no resolvable markdown notes");
+        if targets.is_empty() && metric_targets.is_empty() {
+            debug!("reindex_paths called with no resolvable note or metrics paths");
             return Ok(IndexingStats::default());
         }
 
@@ -438,6 +483,24 @@ impl Indexer {
             .await
             .map_err(|err| anyhow!("writer task aborted: {err}"))??;
 
+        if !metric_targets.is_empty() {
+            let metric_stats = self.reindex_metric_paths(&metric_targets).await?;
+            if metric_stats.indexed > 0
+                || metric_stats.skipped > 0
+                || metric_stats.removed > 0
+                || metric_stats.errors > 0
+            {
+                info!(
+                    indexed = metric_stats.indexed,
+                    skipped = metric_stats.skipped,
+                    removed = metric_stats.removed,
+                    errors = metric_stats.errors,
+                    "completed targeted metrics reindex"
+                );
+            }
+            stats.errors += metric_stats.errors;
+        }
+
         Ok(stats)
     }
 
@@ -499,6 +562,99 @@ impl Indexer {
         Ok(removed)
     }
 
+    async fn index_metrics_inventory(
+        &self,
+        inventory: &[MetricsFileEntry],
+    ) -> Result<MetricPassStats> {
+        let state_table = Arc::new(self.database.metric_file_states()?);
+        let mut stats = MetricPassStats::default();
+
+        for entry in inventory {
+            match self
+                .run_single_metrics(entry.clone(), Arc::clone(&state_table))
+                .await
+            {
+                Ok(MetricFileProcessing::Indexed) => stats.indexed += 1,
+                Ok(MetricFileProcessing::Skipped) => stats.skipped += 1,
+                Ok(MetricFileProcessing::Removed) => stats.removed += 1,
+                Err(err) => {
+                    stats.errors += 1;
+                    error!(
+                        path = %entry.relative_path.display(),
+                        error = ?err,
+                        "failed to index metrics file"
+                    );
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    async fn reindex_metric_paths(&self, paths: &[PathBuf]) -> Result<MetricPassStats> {
+        let state_table = Arc::new(self.database.metric_file_states()?);
+        let mut seen = HashSet::new();
+        let mut stats = MetricPassStats::default();
+
+        for path in paths {
+            let Some(relative_path) = self.vault.resolve_relative_metrics_path(path) else {
+                continue;
+            };
+            if !seen.insert(relative_path.clone()) {
+                continue;
+            }
+
+            match self.vault.metrics_entry_for_path(path)? {
+                Some(entry) => match self
+                    .run_single_metrics(entry, Arc::clone(&state_table))
+                    .await
+                {
+                    Ok(MetricFileProcessing::Indexed) => stats.indexed += 1,
+                    Ok(MetricFileProcessing::Skipped) => stats.skipped += 1,
+                    Ok(MetricFileProcessing::Removed) => stats.removed += 1,
+                    Err(err) => {
+                        stats.errors += 1;
+                        error!(
+                            path = %relative_path.display(),
+                            error = ?err,
+                            "failed to reindex metrics file"
+                        );
+                    }
+                },
+                None => match self.remove_metrics_path(relative_path.clone()).await? {
+                    MetricFileProcessing::Removed => stats.removed += 1,
+                    MetricFileProcessing::Skipped => stats.skipped += 1,
+                    MetricFileProcessing::Indexed => {
+                        unreachable!("metrics removal should not produce indexed outcome")
+                    }
+                },
+            }
+        }
+
+        Ok(stats)
+    }
+
+    async fn prune_missing_metrics(
+        &self,
+        known_inventory: &HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let indexed_paths = self.database.metric_file_states()?;
+        let mut removed = Vec::new();
+
+        for relative_path in indexed_paths.keys() {
+            if !known_inventory.contains(relative_path)
+                && self
+                    .remove_metrics_path(PathBuf::from(relative_path))
+                    .await?
+                    == MetricFileProcessing::Removed
+            {
+                removed.push(relative_path.clone());
+            }
+        }
+
+        Ok(removed)
+    }
+
     fn collect_resolution_maps(
         &self,
         inventory: &[NoteInventoryEntry],
@@ -534,6 +690,22 @@ impl Indexer {
         })
         .await
         .context("indexing task panicked")?
+    }
+
+    async fn run_single_metrics(
+        &self,
+        entry: MetricsFileEntry,
+        index_states: Arc<HashMap<String, MetricFileState>>,
+    ) -> Result<MetricFileProcessing> {
+        let indexer = self.clone();
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                indexer.process_metrics_file(&entry, &index_states)
+            })
+        })
+        .await
+        .context("metrics indexing task panicked")?
     }
 
     fn process_note(
@@ -621,6 +793,80 @@ impl Indexer {
             }
         }
     }
+
+    fn process_metrics_file(
+        &self,
+        entry: &MetricsFileEntry,
+        index_states: &HashMap<String, MetricFileState>,
+    ) -> Result<MetricFileProcessing> {
+        let relative_path = entry.relative_path.to_string_lossy().into_owned();
+        let state = index_states.get(&relative_path).cloned();
+        let is_stale = if self.config.force {
+            true
+        } else if let Some(state) = state {
+            state.file_modified_at < entry.file_modified_at
+        } else {
+            true
+        };
+
+        if !is_stale {
+            debug!(
+                path = %entry.relative_path.display(),
+                "metrics file unchanged since last index; skipping"
+            );
+            return Ok(MetricFileProcessing::Skipped);
+        }
+
+        let rows = parse_metrics_file(&entry.absolute_path).with_context(|| {
+            format!(
+                "failed to parse metrics file {}",
+                entry.absolute_path.display()
+            )
+        })?;
+        let indexed_at = Utc::now();
+        let valid_records = rows
+            .iter()
+            .filter(|row| row.record.is_some() && !row.has_errors())
+            .count();
+        let issue_count = rows.iter().map(|row| row.issues.len()).sum::<usize>();
+
+        self.database
+            .upsert_metrics_file(&relative_path, entry.file_modified_at, &rows, indexed_at)
+            .with_context(|| {
+                format!(
+                    "failed to persist metrics file {}",
+                    entry.relative_path.display()
+                )
+            })?;
+        info!(
+            path = %entry.relative_path.display(),
+            rows = rows.len(),
+            records = valid_records,
+            issues = issue_count,
+            "indexed metrics file"
+        );
+        Ok(MetricFileProcessing::Indexed)
+    }
+
+    async fn remove_metrics_path(&self, relative_path: PathBuf) -> Result<MetricFileProcessing> {
+        let relative_key = relative_path.to_string_lossy().into_owned();
+        let display_path = relative_path.display().to_string();
+        let database = Arc::clone(&self.database);
+        let existed = task::spawn_blocking(move || database.remove_metrics_file(&relative_key))
+            .await
+            .context("metrics removal task panicked")??;
+
+        if existed {
+            info!(path = display_path, "removed metrics file from index");
+            Ok(MetricFileProcessing::Removed)
+        } else {
+            debug!(
+                path = display_path,
+                "remove_metrics_path called for metrics file not present in index"
+            );
+            Ok(MetricFileProcessing::Skipped)
+        }
+    }
 }
 
 /// Progress event emitted during indexing.
@@ -638,6 +884,13 @@ pub struct IndexProgressEvent {
 
 #[derive(Debug)]
 enum NoteProcessing {
+    Indexed,
+    Skipped,
+    Removed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MetricFileProcessing {
     Indexed,
     Skipped,
     Removed,
@@ -953,6 +1206,28 @@ mod tests {
         (vault, database, canonical_note_path)
     }
 
+    fn temp_vault_with_metrics() -> (Arc<Vault>, Arc<IndexDatabase>, PathBuf) {
+        let temp_dir = TempDir::new().expect("temp vault");
+        let vault_dir = temp_dir.path().to_path_buf();
+        Box::leak(Box::new(temp_dir));
+        fs::create_dir_all(vault_dir.join(".obsidian"))
+            .expect("create obsidian directory for settings");
+        fs::create_dir_all(vault_dir.join("Metrics")).expect("create metrics directory");
+
+        let raw_metrics_path = vault_dir.join("Metrics").join("health.metrics.ndjson");
+        fs::write(
+            &raw_metrics_path,
+            r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":105.6,"unit":"kg","source":"withings"}"#,
+        )
+        .expect("write metrics file");
+
+        let vault =
+            Arc::new(Vault::new(VaultConfig::new(vault_dir.clone())).expect("vault initialises"));
+        let database = temp_db();
+        let canonical_metrics_path = vault.note_path("Metrics/health.metrics.ndjson");
+        (vault, database, canonical_metrics_path)
+    }
+
     fn temp_vault_with_alias() -> (Arc<Vault>, Arc<IndexDatabase>) {
         let temp_dir = TempDir::new().expect("temp vault");
         let vault_dir = temp_dir.path().to_path_buf();
@@ -1159,6 +1434,118 @@ mod tests {
         assert!(
             database
                 .note_state("Sample")
+                .expect("state query")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn index_all_persists_metrics_files() {
+        let (vault, database, metrics_path) = temp_vault_with_metrics();
+        let indexer = Indexer::new(vault, Arc::clone(&database), IndexerConfig::default(), None);
+
+        indexer.index_all().await.expect("index succeeds");
+
+        let relative_path = "Metrics/health.metrics.ndjson";
+        assert!(
+            database
+                .metric_file_state(relative_path)
+                .expect("metrics state query")
+                .is_some()
+        );
+
+        let conn = database.connection().expect("connection");
+        let record_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metric_records WHERE source_file = ?1",
+                [relative_path],
+                |row| row.get(0),
+            )
+            .expect("count metric records");
+        assert_eq!(record_count, 1);
+        assert!(metrics_path.exists());
+    }
+
+    #[tokio::test]
+    async fn reindex_paths_updates_modified_metrics_file() {
+        let (vault, database, metrics_path) = temp_vault_with_metrics();
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+
+        indexer.index_all().await.expect("initial index");
+        let before = database
+            .metric_file_state("Metrics/health.metrics.ndjson")
+            .expect("state query")
+            .expect("state present")
+            .indexed_at;
+
+        sleep(Duration::from_millis(10)).await;
+        fs::write(
+            &metrics_path,
+            r#"{"id":"01AAB","ts":"2026-04-15T08:30:00+00:00","key":"body.weight","value":104.4,"unit":"kg","source":"withings"}"#,
+        )
+        .expect("update metrics file");
+
+        let stats = indexer
+            .reindex_paths(std::slice::from_ref(&metrics_path))
+            .await
+            .expect("targeted reindex");
+        assert_eq!(stats.total_notes, 0);
+
+        let after = database
+            .metric_file_state("Metrics/health.metrics.ndjson")
+            .expect("state query")
+            .expect("state present")
+            .indexed_at;
+        assert!(after >= before);
+
+        let conn = database.connection().expect("connection");
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM metric_records
+                     WHERE source_file = 'Metrics/health.metrics.ndjson'
+                     ORDER BY source_line",
+                )
+                .expect("prepare metric record query");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("iterate metric ids");
+            rows.map(|row| row.expect("metric id")).collect()
+        };
+        assert_eq!(ids, vec!["01AAB".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn reindex_paths_removes_deleted_metrics_file() {
+        let (vault, database, metrics_path) = temp_vault_with_metrics();
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+
+        indexer.index_all().await.expect("initial index");
+
+        fs::remove_file(&metrics_path).expect("remove metrics file");
+
+        assert!(vault.resolve_relative_metrics_path(&metrics_path).is_some());
+
+        let stats = indexer
+            .reindex_paths(std::slice::from_ref(&metrics_path))
+            .await
+            .expect("targeted reindex");
+        assert_eq!(stats.total_notes, 0);
+        assert_eq!(stats.errors, 0);
+
+        assert!(
+            database
+                .metric_file_state("Metrics/health.metrics.ndjson")
                 .expect("state query")
                 .is_none()
         );
