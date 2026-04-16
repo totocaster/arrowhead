@@ -232,6 +232,7 @@ arrowhead context note "Project Hub"
 arrowhead notes similar "Photography Equipment"
 arrowhead notes surprise "Project Hub" --limit 3 --json
 arrowhead context metric body.weight
+arrowhead context metric body.weight --range past30d
 arrowhead context source withings --range past30d
 arrowhead metrics search "key:nutrition.energy_intake date:past7d" --aggregate sum
 

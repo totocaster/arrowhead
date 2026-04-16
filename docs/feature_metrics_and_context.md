@@ -17,7 +17,7 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
 | Context command family | Accepted | `context day|week|month|changed|note|metric|source` are now wired in CLI/MCP, human output is now lead-first instead of count-first, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
 | Proactive linking | In progress | Metric, note, and source context now share an internal evidence model that prefers explicit refs or source mentions, then structural day alignment, then inferred key-text matches; day context also emits explicit day↔note and day↔metric relationships. Broader inferred-link confidence work is still pending. |
-| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, and the first shared evidence-driven linking slice across note/metric/source are now in; broader proactive linking and MCP discovery consolidation are still pending. |
+| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, the first shared evidence-driven linking slice across note/metric/source, and rollup-driven trend leads in metric/month context are now in; broader proactive linking and MCP discovery consolidation are still pending. |
 
 ## Accepted Decisions
 
@@ -652,6 +652,9 @@ This should complement the existing Metrics plugin, not compete with it.
 - add structural and inferred link generation
   - same-day structural links now outrank loose metric-key text matches in note, metric, and source context
   - day context now emits day↔note and day↔metric relationships for agent-facing JSON
+- reuse metrics rollups inside context
+  - `context metric` now surfaces daily trend rollups for the target metric
+  - `context month` now surfaces top source-specific metric trends plus aggregate follow-up pivots
 - expose reasons and confidence in CLI and MCP
 
 ### Phase 6: Polish and hardening

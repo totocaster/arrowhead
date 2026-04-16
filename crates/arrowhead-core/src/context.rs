@@ -1,7 +1,7 @@
 //! Context aggregation across notes, metrics, and sources.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -180,6 +180,42 @@ pub struct ContextMetricItem {
     pub reason: Option<String>,
 }
 
+/// Aggregated per-day metric trend surfaced by context responses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextMetricRollup {
+    /// Metric key such as `body.weight`.
+    pub key: String,
+    /// Optional source when the trend is source-specific.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Optional unit associated with the rollup values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Number of active day buckets represented by the full rollup.
+    pub active_day_count: usize,
+    /// Number of individual records folded into the rollup.
+    pub matching_record_count: usize,
+    /// Optional explanation for why the rollup is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Most recent daily buckets for this trend.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<ContextMetricRollupBucket>,
+}
+
+/// One day bucket within a context metric rollup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextMetricRollupBucket {
+    /// Calendar day for the bucket.
+    pub date: NaiveDate,
+    /// Aggregated value for the bucket.
+    pub value: f64,
+    /// Number of records folded into the bucket.
+    pub record_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ContextEvidenceKind {
     Explicit,
@@ -270,6 +306,9 @@ pub struct ContextRelated {
     /// Metrics adjacent to the target.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<ContextMetricItem>,
+    /// Aggregated metric rollups adjacent to the target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_rollups: Vec<ContextMetricRollup>,
     /// Metric keys adjacent to the target.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metric_keys: Vec<String>,
@@ -514,6 +553,7 @@ impl ContextService {
                 days: pivot_days,
                 notes: related_notes,
                 metrics: related_metric_items,
+                metric_rollups: Vec::new(),
                 metric_keys: unique_metric_keys(&metrics),
                 sources: unique_metric_sources(&metrics),
             },
@@ -537,12 +577,12 @@ impl ContextService {
         }
 
         let exact_record = self.metrics.read_record(target).await?;
-        let (mut metrics, target_value, label) = if let Some(record) = exact_record {
+        let (mut all_metrics, target_value, label) = if let Some(record) = exact_record {
             let mut records = self
                 .metrics
                 .search(
                     &build_metrics_field_query("key", &record.record.key, range),
-                    Some(metric_limit),
+                    None,
                 )
                 .await?;
             prepend_metric_record(&mut records, record.clone());
@@ -560,10 +600,7 @@ impl ContextService {
             }
             let records = self
                 .metrics
-                .search(
-                    &build_metrics_field_query("key", target, range),
-                    Some(metric_limit),
-                )
+                .search(&build_metrics_field_query("key", target, range), None)
                 .await?;
             if records.is_empty() {
                 bail!("metric key `{target}` was not found in the index");
@@ -581,6 +618,10 @@ impl ContextService {
             )
         };
 
+        sort_metric_records(&mut all_metrics);
+        let metric_rollups =
+            metric_rollups_for_metric_target(&all_metrics, metric_limit.clamp(1, 5));
+        let mut metrics = all_metrics.clone();
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
@@ -648,6 +689,8 @@ impl ContextService {
             &related_notes,
             &related_days,
             &related_metric_items,
+            &metric_rollups,
+            range,
         );
 
         Ok(ContextPayload {
@@ -678,6 +721,7 @@ impl ContextService {
                 days: related_days,
                 notes: related_notes,
                 metrics: related_metric_items,
+                metric_rollups,
                 metric_keys: related_metric_keys,
                 sources: unique_metric_sources(&metrics),
             },
@@ -792,6 +836,7 @@ impl ContextService {
                 days: related_days,
                 notes: related_notes,
                 metrics: related_metric_items,
+                metric_rollups: Vec::new(),
                 metric_keys: unique_metric_keys(&metrics),
                 sources: vec![source.to_string()],
             },
@@ -917,6 +962,7 @@ impl ContextService {
                 days: related_days,
                 notes: backlink_notes,
                 metrics: Vec::new(),
+                metric_rollups: Vec::new(),
                 metric_keys: unique_metric_keys(&metrics),
                 sources: unique_metric_sources(&metrics),
             },
@@ -1037,6 +1083,7 @@ impl ContextService {
                 days: active_days,
                 notes: related_notes,
                 metrics: Vec::new(),
+                metric_rollups: Vec::new(),
                 metric_keys: unique_metric_keys(&metrics),
                 sources: unique_metric_sources(&metrics),
             },
@@ -1074,7 +1121,7 @@ impl ContextService {
         trim_note_items(&mut history_notes, note_limit);
         trim_note_items(&mut created_notes, note_limit);
         trim_note_items(&mut updated_notes, note_limit);
-        let mut metrics = self
+        let all_metrics = self
             .metrics
             .search(
                 &format!(
@@ -1082,9 +1129,16 @@ impl ContextService {
                     start.format("%Y-%m-%d"),
                     end.format("%Y-%m-%d")
                 ),
-                Some(metric_limit),
+                None,
             )
             .await?;
+        let metric_rollups = metric_rollups_for_window(
+            &all_metrics,
+            metric_limit.clamp(1, 4),
+            metric_limit.clamp(1, 5),
+            Some("Daily trend inside the requested month".to_string()),
+        );
+        let mut metrics = all_metrics.clone();
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
@@ -1096,7 +1150,7 @@ impl ContextService {
             ],
             note_limit,
         );
-        let files = self.metric_files_for_records(&metrics).await?;
+        let files = self.metric_files_for_records(&all_metrics).await?;
         let mut activity_links = self
             .note_links_for_notes(
                 &created_notes,
@@ -1112,10 +1166,10 @@ impl ContextService {
         );
         dedup_context_links(&mut activity_links);
         trim_context_links(&mut activity_links, note_limit.saturating_mul(2).max(1));
-        let active_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
+        let active_days = active_days_from_notes_and_metrics(&related_notes, &all_metrics)
             .into_iter()
             .collect::<Vec<_>>();
-        let attention = attention_items_for_metrics(&metrics);
+        let attention = attention_items_for_metrics(&all_metrics);
         let links = build_window_links(
             &format!("month:{}..{}", start, end),
             "Requested month contains note activity",
@@ -1123,7 +1177,14 @@ impl ContextService {
             "Requested month contains metric activity",
             &metrics,
         );
-        let pivots = build_day_pivots(&start.to_string(), &related_notes, &metrics, &active_days);
+        let month_range_label = format!("{start}..{end}");
+        let pivots = build_month_pivots(
+            &month_range_label,
+            &related_notes,
+            &metrics,
+            &active_days,
+            &metric_rollups,
+        );
 
         Ok(ContextPayload {
             summary: ContextSummary {
@@ -1157,8 +1218,9 @@ impl ContextService {
                 days: active_days,
                 notes: related_notes,
                 metrics: Vec::new(),
-                metric_keys: unique_metric_keys(&metrics),
-                sources: unique_metric_sources(&metrics),
+                metric_rollups,
+                metric_keys: unique_metric_keys(&all_metrics),
+                sources: unique_metric_sources(&all_metrics),
             },
             pivots,
         })
@@ -1287,6 +1349,7 @@ impl ContextService {
                 days: active_days,
                 notes: related_notes,
                 metrics: Vec::new(),
+                metric_rollups: Vec::new(),
                 metric_keys: unique_metric_keys(&metrics),
                 sources: unique_metric_sources(&metrics),
             },
@@ -2226,6 +2289,160 @@ fn metric_items_from_records_dedup_by_key(
     items
 }
 
+fn metric_rollups_for_metric_target(
+    records: &[MetricRecordEntry],
+    bucket_limit: usize,
+) -> Vec<ContextMetricRollup> {
+    if records.is_empty() || bucket_limit == 0 {
+        return Vec::new();
+    }
+
+    let sources = records
+        .iter()
+        .map(|record| record.record.source.clone())
+        .collect::<BTreeSet<_>>();
+    if sources.len() <= 1 {
+        return build_metric_rollup(
+            records,
+            None,
+            Some("Daily trend for the requested metric".to_string()),
+            bucket_limit,
+        )
+        .into_iter()
+        .collect();
+    }
+
+    let mut grouped = Vec::new();
+    for source in sources {
+        let source_records = records
+            .iter()
+            .filter(|record| record.record.source == source)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(rollup) = build_metric_rollup(
+            &source_records,
+            Some(source.clone()),
+            Some(format!("Daily trend for source `{source}`")),
+            bucket_limit,
+        ) {
+            grouped.push(rollup);
+        }
+    }
+    sort_context_metric_rollups(&mut grouped);
+    grouped
+}
+
+fn metric_rollups_for_window(
+    records: &[MetricRecordEntry],
+    rollup_limit: usize,
+    bucket_limit: usize,
+    reason: Option<String>,
+) -> Vec<ContextMetricRollup> {
+    if records.is_empty() || rollup_limit == 0 || bucket_limit == 0 {
+        return Vec::new();
+    }
+
+    let mut grouped = HashMap::<(String, String), Vec<MetricRecordEntry>>::new();
+    for record in records.iter().cloned() {
+        grouped
+            .entry((record.record.key.clone(), record.record.source.clone()))
+            .or_default()
+            .push(record);
+    }
+
+    let mut rollups = grouped
+        .into_iter()
+        .filter_map(|((_key, source), group)| {
+            build_metric_rollup(&group, Some(source), reason.clone(), bucket_limit)
+        })
+        .collect::<Vec<_>>();
+    sort_context_metric_rollups(&mut rollups);
+    if rollups.len() > rollup_limit {
+        rollups.truncate(rollup_limit);
+    }
+    rollups
+}
+
+fn build_metric_rollup(
+    records: &[MetricRecordEntry],
+    source: Option<String>,
+    reason: Option<String>,
+    bucket_limit: usize,
+) -> Option<ContextMetricRollup> {
+    if records.is_empty() || bucket_limit == 0 {
+        return None;
+    }
+
+    let key = records.first()?.record.key.clone();
+    if records.iter().any(|record| record.record.key != key) {
+        return None;
+    }
+
+    let units = records
+        .iter()
+        .map(|record| record.record.unit.clone())
+        .collect::<BTreeSet<_>>();
+    if units.len() > 1 {
+        return None;
+    }
+
+    let unit = records
+        .first()
+        .and_then(|record| record.record.unit.clone());
+    let mut totals = BTreeMap::new();
+    for record in records {
+        let bucket_date = record
+            .record
+            .date
+            .unwrap_or_else(|| record.record.ts.date_naive());
+        let entry = totals.entry(bucket_date).or_insert((0.0_f64, 0_usize));
+        entry.0 += record.record.value;
+        entry.1 += 1;
+    }
+
+    let active_day_count = totals.len();
+    let mut buckets = totals
+        .into_iter()
+        .map(|(date, (value, record_count))| ContextMetricRollupBucket {
+            date,
+            value,
+            record_count,
+        })
+        .collect::<Vec<_>>();
+    buckets.sort_by(|left, right| right.date.cmp(&left.date));
+    if buckets.len() > bucket_limit {
+        buckets.truncate(bucket_limit);
+    }
+
+    Some(ContextMetricRollup {
+        key,
+        source,
+        unit,
+        active_day_count,
+        matching_record_count: records.len(),
+        reason,
+        buckets,
+    })
+}
+
+fn sort_context_metric_rollups(rollups: &mut [ContextMetricRollup]) {
+    rollups.sort_by(|left, right| {
+        right
+            .active_day_count
+            .cmp(&left.active_day_count)
+            .then_with(|| right.matching_record_count.cmp(&left.matching_record_count))
+            .then_with(|| {
+                right
+                    .buckets
+                    .first()
+                    .map(|bucket| bucket.date)
+                    .cmp(&left.buckets.first().map(|bucket| bucket.date))
+            })
+            .then_with(|| left.key.cmp(&right.key))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+}
+
 fn metric_reasons_from_evidence(
     evidence: &[MetricRecordEvidence],
 ) -> std::collections::HashMap<String, String> {
@@ -2436,6 +2653,8 @@ fn build_metric_pivots(
     related_notes: &[ContextNoteItem],
     related_days: &[String],
     related_metrics: &[ContextMetricItem],
+    metric_rollups: &[ContextMetricRollup],
+    range: Option<&str>,
 ) -> Vec<ContextPivot> {
     let mut pivots = Vec::new();
     let mut seen = HashSet::new();
@@ -2491,6 +2710,41 @@ fn build_metric_pivots(
             "Inspect the day containing the latest record.",
         );
     }
+    if let Some(rollup) = metric_rollups.first() {
+        push_pivot(
+            &mut pivots,
+            &mut seen,
+            "metrics_aggregate",
+            rollup.key.clone(),
+            metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), range),
+            "Inspect the daily trend for this metric.",
+        );
+    }
+    pivots
+}
+
+fn build_month_pivots(
+    month_range: &str,
+    notes: &[ContextNoteItem],
+    metrics: &[MetricRecordEntry],
+    active_days: &[String],
+    metric_rollups: &[ContextMetricRollup],
+) -> Vec<ContextPivot> {
+    let mut pivots = build_day_pivots(month_range, notes, metrics, active_days);
+    let mut seen = pivots
+        .iter()
+        .map(|pivot| pivot.command.clone())
+        .collect::<HashSet<_>>();
+    if let Some(rollup) = metric_rollups.first() {
+        push_pivot(
+            &mut pivots,
+            &mut seen,
+            "metrics_aggregate",
+            rollup.key.clone(),
+            metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), Some(month_range)),
+            "Inspect the strongest metric trend in this month.",
+        );
+    }
     pivots
 }
 
@@ -2538,6 +2792,24 @@ fn build_source_pivots(
         );
     }
     pivots
+}
+
+fn metrics_aggregate_command(key: &str, source: Option<&str>, range: Option<&str>) -> String {
+    let mut query = format!("key:{key}");
+    if let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) {
+        query.push(' ');
+        query.push_str("source:");
+        query.push_str(source);
+    }
+    if let Some(range) = range.map(str::trim).filter(|value| !value.is_empty()) {
+        query.push(' ');
+        query.push_str("date:");
+        query.push_str(range);
+    }
+    format!(
+        "arrowhead metrics search {} --aggregate sum",
+        shell_quote(&query)
+    )
 }
 
 fn note_item_from_note_record(note: &NoteRecord, reason: Option<String>) -> ContextNoteItem {
@@ -3350,6 +3622,14 @@ mod tests {
                 .any(|note| note.note_id == "Project Hub"),
             "expected textual note match"
         );
+        assert!(
+            payload
+                .related
+                .metric_rollups
+                .iter()
+                .any(|rollup| rollup.key == "body.weight" && rollup.active_day_count == 2),
+            "expected daily metric rollup for the target key"
+        );
     }
 
     #[tokio::test]
@@ -3647,6 +3927,22 @@ mod tests {
                 .iter()
                 .any(|day| day == "2026-04-14" || day == "2026-04-15"),
             "expected active days inside requested month"
+        );
+        assert!(
+            payload
+                .related
+                .metric_rollups
+                .iter()
+                .any(|rollup| rollup.key == "body.weight"
+                    && rollup.source.as_deref() == Some("withings")),
+            "expected month context to surface source-specific metric trends"
+        );
+        assert!(
+            payload
+                .pivots
+                .iter()
+                .any(|pivot| pivot.kind == "metrics_aggregate"),
+            "expected month context to suggest a trend-following aggregate pivot"
         );
     }
 

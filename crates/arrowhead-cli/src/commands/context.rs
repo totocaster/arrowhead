@@ -11,10 +11,10 @@ use tracing::warn;
 use super::CommandContext;
 use crate::logging;
 use arrowhead_core::{
-    ContextAttentionItem, ContextLink, ContextMetricItem, ContextPayload, ContextPivot,
-    ContextService, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT,
-    MonthContextSelector, SearchConfig, SearchService, Vault, VaultConfig, WeekContextSelector,
-    embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
+    ContextAttentionItem, ContextLink, ContextMetricItem, ContextMetricRollup, ContextPayload,
+    ContextPivot, ContextService, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT,
+    DEFAULT_CONTEXT_NOTE_LIMIT, MonthContextSelector, SearchConfig, SearchService, Vault,
+    VaultConfig, WeekContextSelector, embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
 };
 
 /// Controls whether note-context flows should try to load embeddings.
@@ -484,6 +484,13 @@ fn render_window_context(payload: &ContextPayload) {
         }
     }
 
+    if !payload.related.metric_rollups.is_empty() {
+        println!("\nMetric Trends");
+        for rollup in &payload.related.metric_rollups {
+            print_metric_rollup(rollup);
+        }
+    }
+
     if !payload.activity.links.is_empty() {
         println!("\nLinks In Notes Changed In This Window");
         for link in &payload.activity.links {
@@ -589,6 +596,13 @@ fn render_metric_context_with_range(payload: &ContextPayload, metric_range: Opti
         println!("\nLatest Records");
         for metric in &payload.activity.metrics {
             print_metric_line(metric);
+        }
+    }
+
+    if !payload.related.metric_rollups.is_empty() {
+        println!("\nMetric Trends");
+        for rollup in &payload.related.metric_rollups {
+            print_metric_rollup(rollup);
         }
     }
 
@@ -723,6 +737,52 @@ fn print_metric_lead_line(metric: &ContextMetricItem) {
         "- Metric: {} = {}{} from {}{}{}",
         metric.key, metric.value, unit_suffix, metric.source, date_suffix, reason_suffix
     );
+}
+
+fn print_metric_rollup(rollup: &ContextMetricRollup) {
+    let source_suffix = rollup
+        .source
+        .as_deref()
+        .map(|source| format!(" from {source}"))
+        .unwrap_or_default();
+    let reason_suffix = rollup
+        .reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    println!(
+        "- Trend: {}{} ({} active day{}, {} record{}){}",
+        rollup.key,
+        source_suffix,
+        rollup.active_day_count,
+        if rollup.active_day_count == 1 {
+            ""
+        } else {
+            "s"
+        },
+        rollup.matching_record_count,
+        if rollup.matching_record_count == 1 {
+            ""
+        } else {
+            "s"
+        },
+        reason_suffix
+    );
+    let unit_suffix = rollup
+        .unit
+        .as_deref()
+        .map(|unit| format!(" {unit}"))
+        .unwrap_or_default();
+    for bucket in &rollup.buckets {
+        println!(
+            "  {}  {}{}  ({} record{})",
+            bucket.date,
+            bucket.value,
+            unit_suffix,
+            bucket.record_count,
+            if bucket.record_count == 1 { "" } else { "s" }
+        );
+    }
 }
 
 fn print_link_line(link: &ContextLink) {
