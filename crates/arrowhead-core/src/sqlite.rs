@@ -55,6 +55,23 @@ pub struct NoteIndexState {
     pub indexed_at: DateTime<Utc>,
 }
 
+/// Indexed note row with timestamps useful for exploratory context queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedNoteRecord {
+    /// Stable note identifier.
+    pub id: String,
+    /// Optional note title.
+    pub title: Option<String>,
+    /// Vault-relative note path.
+    pub relative_path: String,
+    /// Filesystem modification timestamp stored in the index.
+    pub file_modified_at: DateTime<Utc>,
+    /// When the note was last indexed.
+    pub indexed_at: DateTime<Utc>,
+    /// Filesystem creation timestamp when known.
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// Tracks existing index metadata for a metrics file to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricFileState {
@@ -203,6 +220,99 @@ impl IndexDatabase {
         }
 
         Ok(result)
+    }
+
+    /// List indexed notes whose creation timestamp falls inside the supplied inclusive range.
+    pub fn notes_created_between(
+        &self,
+        start_micros: i64,
+        end_micros: i64,
+    ) -> Result<Vec<IndexedNoteRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, relative_path, file_modified_at, indexed_at, created_at
+             FROM notes
+             WHERE created_at IS NOT NULL
+               AND created_at >= ?1
+               AND created_at <= ?2
+             ORDER BY created_at DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![start_micros, end_micros], |row| {
+                let file_modified_at: i64 = row.get(3)?;
+                let indexed_at: i64 = row.get(4)?;
+                let created_at: Option<i64> = row.get(5)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    file_modified_at,
+                    indexed_at,
+                    created_at,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(id, title, relative_path, file_modified_at, indexed_at, created_at)| -> Result<_> {
+                    Ok(IndexedNoteRecord {
+                        id,
+                        title,
+                        relative_path,
+                        file_modified_at: from_micros(file_modified_at)?,
+                        indexed_at: from_micros(indexed_at)?,
+                        created_at: created_at.map(from_micros).transpose()?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// List indexed notes whose modification timestamp falls inside the supplied inclusive range.
+    pub fn notes_modified_between(
+        &self,
+        start_micros: i64,
+        end_micros: i64,
+    ) -> Result<Vec<IndexedNoteRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, title, relative_path, file_modified_at, indexed_at, created_at
+             FROM notes
+             WHERE file_modified_at >= ?1
+               AND file_modified_at <= ?2
+             ORDER BY file_modified_at DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![start_micros, end_micros], |row| {
+                let file_modified_at: i64 = row.get(3)?;
+                let indexed_at: i64 = row.get(4)?;
+                let created_at: Option<i64> = row.get(5)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    file_modified_at,
+                    indexed_at,
+                    created_at,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(id, title, relative_path, file_modified_at, indexed_at, created_at)| -> Result<_> {
+                    Ok(IndexedNoteRecord {
+                        id,
+                        title,
+                        relative_path,
+                        file_modified_at: from_micros(file_modified_at)?,
+                        indexed_at: from_micros(indexed_at)?,
+                        created_at: created_at.map(from_micros).transpose()?,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Retrieve existing indexing state for a metrics file.

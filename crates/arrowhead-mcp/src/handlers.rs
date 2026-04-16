@@ -1763,7 +1763,27 @@ impl HandlerRegistry {
                 "title": { "type": "string" },
                 "relativePath": path_schema("Optional vault-relative path for the note."),
                 "fileModifiedAt": date_time_schema("Optional note file modification timestamp."),
+                "createdAt": date_time_schema("Optional note file creation timestamp."),
                 "preview": { "type": "string" },
+                "reason": { "type": "string" }
+            },
+            "additionalProperties": false
+        });
+        let context_metric_item_schema = json!({
+            "type": "object",
+            "description": "Lightweight metric lead surfaced by context.",
+            "required": ["metricId", "key", "value", "source", "ts"],
+            "properties": {
+                "metricId": metric_id_field_schema.clone(),
+                "key": { "type": "string" },
+                "value": { "type": "number" },
+                "unit": { "type": "string" },
+                "source": { "type": "string" },
+                "date": {
+                    "type": "string",
+                    "description": "Optional metric date in YYYY-MM-DD format."
+                },
+                "ts": date_time_schema("Metric timestamp."),
                 "reason": { "type": "string" }
             },
             "additionalProperties": false
@@ -1798,6 +1818,18 @@ impl HandlerRegistry {
                     "type": "integer",
                     "minimum": 1
                 }
+            },
+            "additionalProperties": false
+        });
+        let context_pivot_schema = json!({
+            "type": "object",
+            "description": "Suggested next command or read for continuing exploration.",
+            "required": ["kind", "target", "command", "reason"],
+            "properties": {
+                "kind": { "type": "string" },
+                "target": { "type": "string" },
+                "command": { "type": "string" },
+                "reason": { "type": "string" }
             },
             "additionalProperties": false
         });
@@ -1844,9 +1876,21 @@ impl HandlerRegistry {
                             "type": "array",
                             "items": context_note_item_schema.clone()
                         },
+                        "notesCreated": {
+                            "type": "array",
+                            "items": context_note_item_schema.clone()
+                        },
+                        "notesUpdated": {
+                            "type": "array",
+                            "items": context_note_item_schema.clone()
+                        },
                         "metrics": {
                             "type": "array",
                             "items": metric_record_entry_schema.clone()
+                        },
+                        "links": {
+                            "type": "array",
+                            "items": context_link_schema.clone()
                         },
                         "files": {
                             "type": "array",
@@ -1889,6 +1933,10 @@ impl HandlerRegistry {
                             "type": "array",
                             "items": context_note_item_schema.clone()
                         },
+                        "metrics": {
+                            "type": "array",
+                            "items": context_metric_item_schema.clone()
+                        },
                         "metricKeys": {
                             "type": "array",
                             "items": { "type": "string" }
@@ -1899,6 +1947,10 @@ impl HandlerRegistry {
                         }
                     },
                     "additionalProperties": false
+                },
+                "pivots": {
+                    "type": "array",
+                    "items": context_pivot_schema
                 }
             },
             "additionalProperties": false

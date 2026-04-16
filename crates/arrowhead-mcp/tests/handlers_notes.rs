@@ -22,6 +22,7 @@ use arrowhead_mcp::{
     runtime::{McpRuntime, RuntimeOptions},
     stdio::MessageHandler,
 };
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -171,18 +172,24 @@ fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
             "Project Hub",
             Some("Project Hub"),
             "Track body.weight in [[2026-04-14]] and metric:01AAA from withings.",
+            Some(ts(2026, 4, 10, 9, 0)),
+            ts(2026, 4, 14, 9, 15),
         ),
         build_context_note(
             vault,
             "2026-04-14",
             Some("2026-04-14"),
             "Daily note for body.weight updates.",
+            Some(ts(2026, 4, 14, 8, 30)),
+            ts(2026, 4, 14, 8, 30),
         ),
         build_context_note(
             vault,
             "Related Note",
             Some("Related Note"),
             "See [[Project Hub]] for the latest withings import.",
+            Some(ts(2026, 4, 15, 10, 0)),
+            ts(2026, 4, 15, 10, 0),
         ),
     ];
     let note_ids = notes
@@ -196,7 +203,7 @@ fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
             .expect("extract metadata");
         let resolved_links = make_resolved_links(&extraction, &note_ids);
         database
-            .upsert_note(&note, &extraction, &resolved_links, chrono::Utc::now())
+            .upsert_note(&note, &extraction, &resolved_links, note.file_modified_at)
             .expect("upsert note");
     }
 
@@ -204,6 +211,8 @@ fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
         Cursor::new(
             concat!(
                 r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","date":"2026-04-14","key":"body.weight","value":105.6,"unit":"kg","source":"withings","note":"Morning weigh-in"}"#,
+                "\n",
+                r#"{"id":"01AAC","ts":"2026-04-14T08:31:00+00:00","date":"2026-04-14","key":"body.fat_percentage","value":24.4,"unit":"%","source":"withings","note":"Body composition"}"#,
                 "\n",
                 r#"{"id":"01AAB","ts":"2026-04-15T08:30:00+00:00","date":"2026-04-15","key":"body.weight","value":105.2,"unit":"kg","source":"withings","note":"Follow-up weigh-in"}"#
             ),
@@ -214,14 +223,27 @@ fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
     database
         .upsert_metrics_file(
             "Metrics/All.metrics.ndjson",
-            chrono::Utc::now(),
+            ts(2026, 4, 15, 8, 30),
             &rows,
-            chrono::Utc::now(),
+            ts(2026, 4, 15, 8, 30),
         )
         .expect("upsert context metrics");
 }
 
-fn build_context_note(vault: &Vault, note_id: &str, title: Option<&str>, body: &str) -> NoteRecord {
+fn ts(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .single()
+        .expect("valid timestamp")
+}
+
+fn build_context_note(
+    vault: &Vault,
+    note_id: &str,
+    title: Option<&str>,
+    body: &str,
+    created_at: Option<DateTime<Utc>>,
+    file_modified_at: DateTime<Utc>,
+) -> NoteRecord {
     let mut metadata = MetadataMap::default();
     if let Some(title) = title {
         metadata.insert("title".to_string(), Value::String(title.to_string()));
@@ -229,7 +251,10 @@ fn build_context_note(vault: &Vault, note_id: &str, title: Option<&str>, body: &
     vault
         .write_note(note_id, &metadata, body)
         .expect("write note");
-    vault.load_note(note_id).expect("load note")
+    let mut note = vault.load_note(note_id).expect("load note");
+    note.created_at = created_at;
+    note.file_modified_at = file_modified_at;
+    note
 }
 
 fn make_resolved_links(
@@ -630,10 +655,44 @@ async fn context_get_day_returns_context_sections() {
         structured
             .get("activity")
             .and_then(Value::as_object)
+            .and_then(|activity| activity.get("notesCreated"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected day context created-note activity"
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
+            .and_then(|activity| activity.get("notesUpdated"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected day context updated-note activity"
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
             .and_then(|activity| activity.get("metrics"))
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty()),
         "expected day context metric activity"
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
+            .and_then(|activity| activity.get("links"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected day context link activity"
+    );
+    assert!(
+        structured
+            .get("pivots")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected day context pivots"
     );
 }
 
@@ -684,10 +743,19 @@ async fn context_get_changed_returns_recent_activity() {
         structured
             .get("activity")
             .and_then(Value::as_object)
-            .and_then(|activity| activity.get("notes"))
+            .and_then(|activity| activity.get("notesUpdated"))
             .and_then(Value::as_array)
             .is_some_and(|notes| !notes.is_empty()),
         "expected changed context note activity"
+    );
+    assert!(
+        structured
+            .get("activity")
+            .and_then(Value::as_object)
+            .and_then(|activity| activity.get("links"))
+            .and_then(Value::as_array)
+            .is_some_and(|links| !links.is_empty()),
+        "expected changed context link activity"
     );
 }
 
@@ -713,12 +781,28 @@ async fn context_get_note_returns_context_sections() {
     );
     assert!(
         structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("metrics"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected note context metric leads"
+    );
+    assert!(
+        structured
             .get("activity")
             .and_then(Value::as_object)
             .and_then(|activity| activity.get("metrics"))
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty()),
         "expected note context metric activity"
+    );
+    assert!(
+        structured
+            .get("pivots")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected note context pivots"
     );
 }
 
@@ -741,6 +825,15 @@ async fn context_get_metric_accepts_metric_key() {
             .and_then(|summary| summary.get("kind"))
             .and_then(Value::as_str),
         Some("metric")
+    );
+    assert!(
+        structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("metrics"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected metric context related metric leads"
     );
     assert!(
         structured
@@ -774,6 +867,15 @@ async fn context_get_source_returns_metric_keys() {
             .and_then(|summary| summary.get("kind"))
             .and_then(Value::as_str),
         Some("source")
+    );
+    assert!(
+        structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("metrics"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty()),
+        "expected source context metric leads"
     );
     assert!(
         structured

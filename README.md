@@ -222,6 +222,7 @@ arrowhead graph backlinks "Project Hub" --format ids
 # CRUD helpers + graph analytics
 arrowhead notes list --json
 arrowhead graph context "Project Hub"
+# Exploration-oriented context leads
 arrowhead context day 2026-04-14
 arrowhead context week --this
 arrowhead context changed --days 3
@@ -254,6 +255,7 @@ arrowhead --mcp-server --generate-token
 ```
 
 Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available. Graph listings pick up the same pipe-friendly `--format ids` option for backlinks, forward-links, orphans, and unresolved link reports.
+Context commands are exploration-first: day views emphasise notes created or edited, metrics recorded, link activity in changed notes, adjacent days, and concrete next pivots instead of count-heavy summaries.
 
 ## Alfred Workflow Integration
 

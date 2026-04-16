@@ -11,9 +11,10 @@ use tracing::warn;
 use super::CommandContext;
 use crate::logging;
 use arrowhead_core::{
-    ContextAttentionItem, ContextLink, ContextPayload, ContextService, ContextTargetKind,
-    DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT, SearchConfig, SearchService, Vault,
-    VaultConfig, WeekContextSelector, embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
+    ContextAttentionItem, ContextLink, ContextMetricItem, ContextPayload, ContextPivot,
+    ContextService, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT,
+    SearchConfig, SearchService, Vault, VaultConfig, WeekContextSelector,
+    embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
 };
 
 /// Controls whether note-context flows should try to load embeddings.
@@ -299,83 +300,25 @@ pub(crate) fn render_context_payload(payload: &ContextPayload) {
         render_target_kind(payload.summary.kind),
         payload.summary.target
     );
-    if let Some(label) = payload.summary.label.as_deref() {
+    if let Some(label) = payload
+        .summary
+        .label
+        .as_deref()
+        .filter(|label| *label != payload.summary.target)
+    {
         println!("{label}");
     }
 
-    println!(
-        "\nSummary\n- notes: {}\n- metrics: {}\n- links: {}\n- attention: {}",
-        payload.summary.note_count,
-        payload.summary.metric_count,
-        payload.summary.link_count,
-        payload.summary.attention_count
-    );
-
-    if !payload.history.notes.is_empty() || !payload.history.metrics.is_empty() {
-        println!("\nHistory");
-        for note in &payload.history.notes {
-            print_note_line(note);
-        }
-        for metric in &payload.history.metrics {
-            print_metric_line(metric);
-        }
+    match payload.summary.kind {
+        ContextTargetKind::Day => render_day_context(payload),
+        ContextTargetKind::Week | ContextTargetKind::Changed => render_window_context(payload),
+        ContextTargetKind::Note => render_note_context(payload),
+        ContextTargetKind::Metric => render_metric_context(payload),
+        ContextTargetKind::Source => render_source_context(payload),
     }
 
-    if !payload.activity.notes.is_empty()
-        || !payload.activity.metrics.is_empty()
-        || !payload.activity.files.is_empty()
-    {
-        println!("\nActivity");
-        for note in &payload.activity.notes {
-            print_note_line(note);
-        }
-        for metric in &payload.activity.metrics {
-            print_metric_line(metric);
-        }
-        for file in &payload.activity.files {
-            println!(
-                "- File: {} (records {}, warnings {}, errors {})",
-                file.relative_path.display(),
-                file.record_count,
-                file.warning_count,
-                file.error_count
-            );
-        }
-    }
-
-    if !payload.links.items.is_empty() {
-        println!("\nLinks");
-        for link in &payload.links.items {
-            print_link_line(link);
-        }
-    }
-
-    if !payload.attention.items.is_empty() {
-        println!("\nAttention");
-        for item in &payload.attention.items {
-            print_attention_line(item);
-        }
-    }
-
-    if !payload.related.days.is_empty()
-        || !payload.related.notes.is_empty()
-        || !payload.related.metric_keys.is_empty()
-        || !payload.related.sources.is_empty()
-    {
-        println!("\nRelated");
-        for day in &payload.related.days {
-            println!("- Day: {day}");
-        }
-        for note in &payload.related.notes {
-            print_note_line(note);
-        }
-        for key in &payload.related.metric_keys {
-            println!("- Metric key: {key}");
-        }
-        for source in &payload.related.sources {
-            println!("- Source: {source}");
-        }
-    }
+    render_attention(payload);
+    render_next_pivots(&payload.pivots);
 }
 
 fn render_target_kind(kind: ContextTargetKind) -> &'static str {
@@ -401,6 +344,227 @@ fn resolve_week_selector(args: &WeekArgs) -> Result<WeekContextSelector> {
     Ok(WeekContextSelector::ThisWeek)
 }
 
+fn render_day_context(payload: &ContextPayload) {
+    if !payload.history.notes.is_empty() {
+        println!("\nDaily Note");
+        for note in &payload.history.notes {
+            print_note_line(note);
+        }
+    }
+
+    if !payload.activity.notes_created.is_empty() {
+        println!("\nNotes Created");
+        for note in &payload.activity.notes_created {
+            print_note_line(note);
+            print_optional_timestamp("created", note.created_at);
+        }
+    }
+
+    if !payload.activity.notes_updated.is_empty() {
+        println!("\nNotes Updated");
+        for note in &payload.activity.notes_updated {
+            print_note_line(note);
+            print_optional_timestamp("updated", note.file_modified_at);
+        }
+    }
+
+    if !payload.related.notes.is_empty() {
+        println!("\nBacklinks Into This Day");
+        for note in &payload.related.notes {
+            print_note_line(note);
+        }
+    }
+
+    if !payload.activity.metrics.is_empty() {
+        println!("\nMetrics Recorded");
+        for metric in &payload.activity.metrics {
+            print_metric_line(metric);
+        }
+    }
+
+    if !payload.activity.links.is_empty() {
+        println!("\nLinks In Notes Changed That Day");
+        for link in &payload.activity.links {
+            print_link_line(link);
+        }
+    }
+
+    if !payload.related.days.is_empty() {
+        println!("\nAdjacent Days Worth Comparing");
+        for day in &payload.related.days {
+            println!("- Day: {day}");
+        }
+    }
+}
+
+fn render_window_context(payload: &ContextPayload) {
+    if !payload.activity.notes_created.is_empty() {
+        println!("\nNotes Created");
+        for note in &payload.activity.notes_created {
+            print_note_line(note);
+            print_optional_timestamp("created", note.created_at);
+        }
+    }
+
+    if !payload.activity.notes_updated.is_empty() {
+        println!("\nNotes Updated");
+        for note in &payload.activity.notes_updated {
+            print_note_line(note);
+            print_optional_timestamp("updated", note.file_modified_at);
+        }
+    }
+
+    if !payload.activity.metrics.is_empty() {
+        println!("\nMetrics Recorded");
+        for metric in &payload.activity.metrics {
+            print_metric_line(metric);
+        }
+    }
+
+    if !payload.activity.links.is_empty() {
+        println!("\nLinks In Notes Changed In This Window");
+        for link in &payload.activity.links {
+            print_link_line(link);
+        }
+    }
+
+    if !payload.related.days.is_empty() {
+        println!("\nActive Days");
+        for day in &payload.related.days {
+            println!("- Day: {day}");
+        }
+    }
+}
+
+fn render_note_context(payload: &ContextPayload) {
+    println!("\nLeads");
+    if !payload.related.days.is_empty() {
+        println!("Days");
+        for day in &payload.related.days {
+            println!("- Day: {day}");
+        }
+    }
+    if !payload.related.notes.is_empty() {
+        println!("Related Notes");
+        for note in &payload.related.notes {
+            print_note_line(note);
+        }
+    }
+    if !payload.related.metrics.is_empty() {
+        println!("Metrics Tied To This Note");
+        for metric in &payload.related.metrics {
+            print_metric_lead_line(metric);
+        }
+    }
+    if payload.related.days.is_empty()
+        && payload.related.notes.is_empty()
+        && payload.related.metrics.is_empty()
+    {
+        println!("- none");
+    }
+
+    if !payload.activity.notes_updated.is_empty() {
+        println!("\nFreshness");
+        for note in &payload.activity.notes_updated {
+            print_note_line(note);
+            print_optional_timestamp("updated", note.file_modified_at);
+        }
+    }
+
+    if !payload.links.items.is_empty() {
+        println!("\nRelationships");
+        for link in &payload.links.items {
+            print_link_line(link);
+        }
+    }
+}
+
+fn render_metric_context(payload: &ContextPayload) {
+    if !payload.activity.metrics.is_empty() {
+        println!("\nLatest Records");
+        for metric in &payload.activity.metrics {
+            print_metric_line(metric);
+        }
+    }
+
+    if !payload.related.days.is_empty() {
+        println!("\nRelated Days");
+        for day in &payload.related.days {
+            println!("- Day: {day}");
+        }
+    }
+
+    if !payload.related.notes.is_empty() {
+        println!("\nRelated Notes");
+        for note in &payload.related.notes {
+            print_note_line(note);
+        }
+    }
+
+    if !payload.related.metrics.is_empty() {
+        println!("\nNearby Metrics");
+        for metric in &payload.related.metrics {
+            print_metric_lead_line(metric);
+        }
+    }
+}
+
+fn render_source_context(payload: &ContextPayload) {
+    if !payload.activity.metrics.is_empty() {
+        println!("\nMetrics");
+        for metric in &payload.activity.metrics {
+            print_metric_line(metric);
+        }
+    }
+
+    if !payload.related.notes.is_empty() {
+        println!("\nRelated Notes");
+        for note in &payload.related.notes {
+            print_note_line(note);
+        }
+    }
+
+    if !payload.related.days.is_empty() {
+        println!("\nActive Days");
+        for day in &payload.related.days {
+            println!("- Day: {day}");
+        }
+    }
+
+    if !payload.related.metrics.is_empty() {
+        println!("\nMetric Themes");
+        for metric in &payload.related.metrics {
+            print_metric_lead_line(metric);
+        }
+    } else if !payload.related.metric_keys.is_empty() {
+        println!("\nMetric Themes");
+        for key in &payload.related.metric_keys {
+            println!("- Metric: {key}");
+        }
+    }
+}
+
+fn render_attention(payload: &ContextPayload) {
+    println!("\nAttention");
+    if payload.attention.items.is_empty() {
+        println!("- none");
+        return;
+    }
+    for item in &payload.attention.items {
+        print_attention_line(item);
+    }
+}
+
+fn render_next_pivots(pivots: &[ContextPivot]) {
+    if pivots.is_empty() {
+        return;
+    }
+    println!("\nNext Pivots");
+    for pivot in pivots {
+        println!("- {} ({})", pivot.command, pivot.reason);
+    }
+}
+
 fn print_note_line(note: &arrowhead_core::ContextNoteItem) {
     let label = note.title.as_deref().unwrap_or(&note.note_id);
     let path = note
@@ -416,6 +580,12 @@ fn print_note_line(note: &arrowhead_core::ContextNoteItem) {
     println!("- Note: {}{}{}", label, path, reason);
 }
 
+fn print_optional_timestamp(label: &str, value: Option<chrono::DateTime<chrono::Utc>>) {
+    if let Some(timestamp) = value {
+        println!("  {}: {}", label, timestamp.to_rfc3339());
+    }
+}
+
 fn print_metric_line(record: &arrowhead_core::MetricRecordEntry) {
     let unit_suffix = record
         .record
@@ -426,6 +596,27 @@ fn print_metric_line(record: &arrowhead_core::MetricRecordEntry) {
     println!(
         "- Metric: {} {}{} from {} ({})",
         record.record.id, record.record.value, unit_suffix, record.record.source, record.record.key
+    );
+}
+
+fn print_metric_lead_line(metric: &ContextMetricItem) {
+    let unit_suffix = metric
+        .unit
+        .as_deref()
+        .map(|unit| format!(" {unit}"))
+        .unwrap_or_default();
+    let date_suffix = metric
+        .date
+        .map(|date| format!(" on {date}"))
+        .unwrap_or_default();
+    let reason_suffix = metric
+        .reason
+        .as_deref()
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    println!(
+        "- Metric: {} = {}{} from {}{}{}",
+        metric.key, metric.value, unit_suffix, metric.source, date_suffix, reason_suffix
     );
 }
 

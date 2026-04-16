@@ -7,7 +7,7 @@ metrics data and richer context retrieval across notes, days, and metrics.
 
 > **Status:** In progress.
 >
-> **Last updated:** 2026-04-15
+> **Last updated:** 2026-04-16
 
 | Area | Status | Notes |
 | --- | --- | --- |
@@ -15,7 +15,7 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics indexing model | In progress | Metrics conventions resolution, parser/validator coverage, SQLite persistence, core indexing refresh, and read/search surfaces are now wired; mutation indexing is now refreshed directly after record writes. |
 | Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
-| Context command family | In progress | `context day|week|changed|note|metric|source` are now wired in CLI/MCP, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
+| Context command family | Accepted | `context day|week|changed|note|metric|source` are now wired in CLI/MCP, human output is now lead-first instead of count-first, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
 | Proactive linking | Proposed | Explicit and inferred links should be surfaced with reasons. |
 | Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD plus full time-window and entity context are now landing; CLI compatibility aliasing is in, while proactive linking and MCP discovery consolidation are still pending. |
 
@@ -435,25 +435,29 @@ Every context response should be organized into predictable sections:
 
 - `summary`
   - target entity or time window
-  - totals and high-signal counts
+  - stable metadata for machine consumers
 - `history`
   - recent notes linked to the target
   - recent metric activity linked to the target
   - prior adjacent days or recurring patterns when relevant
 - `activity`
-  - notes created or modified
+  - notes created
+  - notes modified
   - metrics recorded
+  - note links surfaced from notes changed in the window
   - metrics files modified
 - `links`
-  - explicit and inferred relationships
+  - explicit and inferred relationships when they add useful structure
 - `attention`
   - validation warnings or errors
   - missing linked records
   - ambiguous references
 - `related`
-  - adjacent days
+  - adjacent days worth comparing
   - related notes
-  - related metric keys or sources
+  - related metric leads
+- `pivots`
+  - concrete follow-up reads or commands derived from the strongest leads
 
 This structure should stay stable across CLI JSON and MCP responses.
 
@@ -538,34 +542,40 @@ compact context cards rather than raw dumps.
 
 Suggested layout:
 
-1. Header summary
-2. History section
+1. Target header
+2. Typed exploratory leads
 3. Activity section
-4. Linked items section
+4. Relationship section when useful
 5. Attention section
-6. Suggested next commands
+6. Concrete next pivots
 
 Example shape:
 
 ```text
-Context: 2026-04-14
+Context: day 2026-04-14
 
-Summary
-- 3 notes modified
-- 12 metric records logged
-- 2 linked daily-note references
+Notes Created
+- Note: 2026-04-14
 
-Activity
-- Note: Project Hub (modified 09:14)
-- Metric: body.weight 105.6 kg from withings (08:30)
+Notes Updated
+- Note: Project Hub
 
-Links
-- 2026-04-14 <-> body.weight (same day)
-- Project Hub <-> metric:01JV... (explicit reference)
-- Project Hub <-> body.weight (inferred, confidence 0.67, recurring co-occurrence)
+Metrics Recorded
+- Metric: body.weight 105.6 kg from withings
+
+Links In Notes Changed That Day
+- note:Project Hub -> note:2026-04-14 (Source note was updated on the requested day; WikiLink direct match)
+
+Adjacent Days Worth Comparing
+- Day: 2026-04-13
+- Day: 2026-04-15
 
 Attention
-- 1 record has a warning: unknown unit
+- none
+
+Next Pivots
+- arrowhead context note "Project Hub" (Inspect the strongest note tied to this day.)
+- arrowhead context metric body.weight (Inspect the strongest metric recorded on this day.)
 ```
 
 ### JSON and MCP output
