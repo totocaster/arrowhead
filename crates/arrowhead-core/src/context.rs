@@ -713,30 +713,13 @@ impl ContextService {
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
-        let mut related_notes = self
-            .note_items_for_metric_dates(&metrics, "Same day as metric activity")
+        let note_evidence = self
+            .source_note_evidence(source, &metrics, note_limit)
             .await?;
-        let mut seen_note_ids = related_notes
+        let related_notes = note_evidence
             .iter()
-            .map(|item| item.note_id.clone())
-            .collect::<HashSet<_>>();
-        trim_note_items(&mut related_notes, note_limit);
-        if related_notes.len() < note_limit {
-            let search_notes = self
-                .search_notes_by_literal_phrase(
-                    source,
-                    note_limit * 3,
-                    &seen_note_ids,
-                    "Note text matches source",
-                )
-                .await?;
-            merge_note_items(
-                &mut related_notes,
-                search_notes,
-                note_limit,
-                &mut seen_note_ids,
-            );
-        }
+            .map(|evidence| evidence.note.clone())
+            .collect::<Vec<_>>();
 
         let mut links = metrics
             .iter()
@@ -748,16 +731,13 @@ impl ContextService {
                 confidence: None,
             })
             .collect::<Vec<_>>();
-        for note in &related_notes {
+        for evidence in &note_evidence {
             links.push(ContextLink {
-                kind: ContextLinkKind::Related,
-                from: format!("note:{}", note.note_id),
+                kind: context_evidence_link_kind(evidence.kind),
+                from: format!("note:{}", evidence.note.note_id),
                 to: format!("source:{source}"),
-                reason: note
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "Related note".to_string()),
-                confidence: None,
+                reason: evidence.link_reason.clone(),
+                confidence: evidence.confidence,
             });
         }
 
@@ -1674,6 +1654,95 @@ impl ContextService {
                     confidence: Some(0.35),
                 },
             );
+        }
+
+        let mut evidence = evidence_by_note.into_values().collect::<Vec<_>>();
+        sort_note_metric_evidence(&mut evidence);
+        if evidence.len() > note_limit {
+            evidence.truncate(note_limit);
+        }
+        Ok(evidence)
+    }
+
+    async fn source_note_evidence(
+        &self,
+        source: &str,
+        metric_records: &[MetricRecordEntry],
+        note_limit: usize,
+    ) -> Result<Vec<NoteMetricEvidence>> {
+        if metric_records.is_empty() || note_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut evidence_by_note = HashMap::new();
+        let empty_excludes = HashSet::new();
+        let source_phrase_reason = format!("Note explicitly mentions source `{source}`");
+        let source_mentions = self
+            .search_notes_by_literal_phrase(
+                source,
+                note_limit.saturating_mul(4).max(1),
+                &empty_excludes,
+                "Note text matches source",
+            )
+            .await?;
+        for note in source_mentions {
+            upsert_note_metric_evidence(
+                &mut evidence_by_note,
+                NoteMetricEvidence {
+                    note,
+                    kind: ContextEvidenceKind::Explicit,
+                    link_reason: source_phrase_reason.clone(),
+                    confidence: None,
+                },
+            );
+        }
+
+        let date_notes = self
+            .note_items_for_metric_dates(metric_records, "Same day as source metric activity")
+            .await?;
+        for note in date_notes {
+            let reason = note
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Same day as source metric activity".to_string());
+            upsert_note_metric_evidence(
+                &mut evidence_by_note,
+                NoteMetricEvidence {
+                    note,
+                    kind: ContextEvidenceKind::Structural,
+                    link_reason: reason,
+                    confidence: None,
+                },
+            );
+        }
+
+        let metric_keys = metric_records
+            .iter()
+            .map(|record| record.record.key.clone())
+            .collect::<BTreeSet<_>>();
+        for metric_key in metric_keys {
+            let text_matches = self
+                .search_notes_by_literal_phrase(
+                    &metric_key,
+                    note_limit.saturating_mul(3).max(1),
+                    &empty_excludes,
+                    "Note text matches source metric key",
+                )
+                .await?;
+            for note in text_matches {
+                let reason = format!(
+                    "Note text mentions metric key `{metric_key}` emitted by source `{source}`"
+                );
+                upsert_note_metric_evidence(
+                    &mut evidence_by_note,
+                    NoteMetricEvidence {
+                        note,
+                        kind: ContextEvidenceKind::Inferred,
+                        link_reason: reason,
+                        confidence: Some(0.3),
+                    },
+                );
+            }
         }
 
         let mut evidence = evidence_by_note.into_values().collect::<Vec<_>>();
@@ -3424,6 +3493,62 @@ mod tests {
         assert!(
             payload.summary.metric_count >= 1,
             "expected metrics for source context"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_context_prefers_explicit_and_structural_note_evidence() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Weight Lexicon",
+            Some("Weight Lexicon"),
+            "body.weight is one of the health metrics tracked in this vault.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+
+        let payload = service
+            .source("withings", None, Some(6), Some(5))
+            .await
+            .expect("source context");
+
+        let note_ids = payload
+            .related
+            .notes
+            .iter()
+            .map(|note| note.note_id.as_str())
+            .collect::<Vec<_>>();
+        let explicit_position = note_ids
+            .iter()
+            .position(|note_id| *note_id == "Related Note")
+            .expect("explicit source note present");
+        let daily_note_position = note_ids
+            .iter()
+            .position(|note_id| *note_id == "2026-04-14")
+            .expect("same-day note present");
+        let inferred_position = note_ids
+            .iter()
+            .position(|note_id| *note_id == "Weight Lexicon")
+            .expect("inferred note present");
+
+        assert!(
+            explicit_position < inferred_position,
+            "expected explicit source mentions to outrank inferred metric-key notes"
+        );
+        assert!(
+            daily_note_position < inferred_position,
+            "expected same-day source notes to outrank inferred metric-key notes"
+        );
+        assert_eq!(
+            payload
+                .links
+                .items
+                .iter()
+                .find(|link| link.from == "note:Related Note" && link.to == "source:withings")
+                .map(|link| link.kind),
+            Some(ContextLinkKind::Explicit),
+            "expected explicit source note links to be classified explicitly"
         );
     }
 

@@ -16,8 +16,8 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
 | Context command family | Accepted | `context day|week|month|changed|note|metric|source` are now wired in CLI/MCP, human output is now lead-first instead of count-first, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
-| Proactive linking | In progress | Metric and note context now share an internal evidence model that prefers explicit refs, then structural day alignment, then inferred key-text matches; day context also emits explicit day↔note and day↔metric relationships. Broader inferred-link confidence work is still pending. |
-| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, and the first shared evidence-driven linking slice are now in; broader proactive linking and MCP discovery consolidation are still pending. |
+| Proactive linking | In progress | Metric, note, and source context now share an internal evidence model that prefers explicit refs or source mentions, then structural day alignment, then inferred key-text matches; day context also emits explicit day↔note and day↔metric relationships. Broader inferred-link confidence work is still pending. |
+| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, and the first shared evidence-driven linking slice across note/metric/source are now in; broader proactive linking and MCP discovery consolidation are still pending. |
 
 ## Accepted Decisions
 
@@ -648,8 +648,9 @@ This should complement the existing Metrics plugin, not compete with it.
 
 - detect explicit note-to-metric references
   - note and metric context now use explicit refs before weaker signals
+  - source context now prefers exact source mentions before weaker signals
 - add structural and inferred link generation
-  - same-day structural links now outrank loose metric-key text matches in note and metric context
+  - same-day structural links now outrank loose metric-key text matches in note, metric, and source context
   - day context now emits day↔note and day↔metric relationships for agent-facing JSON
 - expose reasons and confidence in CLI and MCP
 
