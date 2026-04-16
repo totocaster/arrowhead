@@ -31,6 +31,11 @@ static METRIC_REFERENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
 static DATE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\d{4}-\d{2}-\d{2})(?:$|[-_])").expect("valid date prefix regex")
 });
+static ABSOLUTE_DATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d{4}-\d{2}-\d{2}\b").expect("valid absolute date regex"));
+static METRIC_KEY_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+\b").expect("valid metric key regex")
+});
 
 /// Context target classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,7 +181,7 @@ pub struct ContextMetricItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum NoteMetricEvidenceKind {
+enum ContextEvidenceKind {
     Explicit,
     Structural,
     Inferred,
@@ -185,7 +190,15 @@ enum NoteMetricEvidenceKind {
 #[derive(Debug, Clone)]
 struct NoteMetricEvidence {
     note: ContextNoteItem,
-    kind: NoteMetricEvidenceKind,
+    kind: ContextEvidenceKind,
+    link_reason: String,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct MetricRecordEvidence {
+    record: MetricRecordEntry,
+    kind: ContextEvidenceKind,
     link_reason: String,
     confidence: Option<f32>,
 }
@@ -426,9 +439,25 @@ impl ContextService {
 
         let explicit_metric_ids = extract_metric_references(&note);
         let note_dates = extract_note_dates(&note);
-        let (mut metrics, mut links) = self
-            .note_metric_links(&note.id, &explicit_metric_ids, &note_dates, metric_limit)
+        let metric_evidence = self
+            .note_metric_record_evidence(&note, &explicit_metric_ids, &note_dates, metric_limit)
             .await?;
+        let metric_reasons = metric_reasons_from_evidence(&metric_evidence);
+        let metrics = metric_evidence
+            .iter()
+            .map(|evidence| evidence.record.clone())
+            .collect::<Vec<_>>();
+        let mut links = metric_evidence
+            .iter()
+            .map(|evidence| ContextLink {
+                kind: context_evidence_link_kind(evidence.kind),
+                from: format!("note:{}", note.id),
+                to: format!("metric:{}", evidence.record.record.id),
+                reason: evidence.link_reason.clone(),
+                confidence: evidence.confidence,
+            })
+            .collect::<Vec<_>>();
+        links.extend(note_day_links(&note.id, &note_dates));
 
         let mut attention = attention_items_for_metrics(&metrics);
         attention.extend(attention_items_for_unresolved_links(&unresolved_links));
@@ -441,12 +470,12 @@ impl ContextService {
             .map(context_link_from_graph_edge)
             .collect::<Vec<_>>();
         links.extend(graph_links);
-
-        sort_metric_records(&mut metrics);
-        trim_metric_records(&mut metrics, metric_limit);
-        let metric_reasons = metric_reason_map(&links);
-        let related_metric_items =
-            metric_items_from_records(&metrics, Some(&metric_reasons), metric_limit);
+        dedup_context_links(&mut links);
+        let related_metric_items = metric_items_from_records_dedup_by_key_with_reasons(
+            &metrics,
+            Some(&metric_reasons),
+            metric_limit,
+        );
         let pivot_days = note_dates
             .iter()
             .map(ToString::to_string)
@@ -575,7 +604,7 @@ impl ContextService {
         }
         for evidence in &note_evidence {
             links.push(ContextLink {
-                kind: note_metric_evidence_link_kind(evidence.kind),
+                kind: context_evidence_link_kind(evidence.kind),
                 from: format!("note:{}", evidence.note.note_id),
                 to: target_value.clone(),
                 reason: evidence.link_reason.clone(),
@@ -846,10 +875,24 @@ impl ContextService {
         );
         dedup_context_links(&mut activity_links);
         trim_context_links(&mut activity_links, note_limit.saturating_mul(2).max(1));
+        let mut links = build_day_relationship_links(
+            &day.to_string(),
+            &history_notes,
+            &backlink_notes,
+            &metrics,
+        );
+        links.extend(activity_links.clone());
+        dedup_context_links(&mut links);
+        trim_context_links(
+            &mut links,
+            note_limit
+                .saturating_mul(3)
+                .saturating_add(metric_limit)
+                .max(1),
+        );
         let related_days = self.adjacent_active_days(day).await?;
         let files = self.metric_files_for_records(&metrics).await?;
         let mut attention = attention_items_for_metrics(&metrics);
-        let links = activity_links.clone();
         attention.sort_by(|left, right| left.message.cmp(&right.message));
         let note_leads = merged_note_items(
             vec![
@@ -1582,7 +1625,7 @@ impl ContextService {
                     &mut evidence_by_note,
                     NoteMetricEvidence {
                         note,
-                        kind: NoteMetricEvidenceKind::Explicit,
+                        kind: ContextEvidenceKind::Explicit,
                         link_reason: reason,
                         confidence: None,
                     },
@@ -1602,7 +1645,7 @@ impl ContextService {
                 &mut evidence_by_note,
                 NoteMetricEvidence {
                     note,
-                    kind: NoteMetricEvidenceKind::Structural,
+                    kind: ContextEvidenceKind::Structural,
                     link_reason: reason,
                     confidence: None,
                 },
@@ -1626,7 +1669,7 @@ impl ContextService {
                 &mut evidence_by_note,
                 NoteMetricEvidence {
                     note,
-                    kind: NoteMetricEvidenceKind::Inferred,
+                    kind: ContextEvidenceKind::Inferred,
                     link_reason: reason,
                     confidence: Some(0.35),
                 },
@@ -1681,52 +1724,92 @@ impl ContextService {
         Ok(items)
     }
 
-    async fn note_metric_links(
+    async fn note_metric_record_evidence(
         &self,
-        note_id: &str,
+        note: &NoteRecord,
         explicit_metric_ids: &[String],
         note_dates: &BTreeSet<NaiveDate>,
         metric_limit: usize,
-    ) -> Result<(Vec<MetricRecordEntry>, Vec<ContextLink>)> {
-        let mut metrics = Vec::new();
-        let mut links = Vec::new();
-        let mut seen = HashSet::new();
+    ) -> Result<Vec<MetricRecordEvidence>> {
+        if metric_limit == 0 {
+            return Ok(Vec::new());
+        }
 
+        let mut evidence_by_metric = HashMap::new();
         for metric_id in explicit_metric_ids {
             if let Some(record) = self.metrics.read_record(metric_id).await? {
-                if seen.insert(record.record.id.clone()) {
-                    links.push(ContextLink {
-                        kind: ContextLinkKind::Explicit,
-                        from: format!("note:{note_id}"),
-                        to: format!("metric:{}", record.record.id),
-                        reason: "Note contains explicit metric reference".to_string(),
+                upsert_metric_record_evidence(
+                    &mut evidence_by_metric,
+                    MetricRecordEvidence {
+                        record,
+                        kind: ContextEvidenceKind::Explicit,
+                        link_reason: "Note contains explicit metric reference".to_string(),
                         confidence: None,
-                    });
-                    metrics.push(record);
-                }
+                    },
+                );
             }
         }
 
         for date in note_dates {
             let results = self
                 .metrics
-                .search(&format!("date:{date}"), Some(metric_limit * 2))
+                .search(
+                    &format!("date:{date}"),
+                    Some(metric_limit.saturating_mul(2).max(1)),
+                )
                 .await?;
             for record in results {
-                if seen.insert(record.record.id.clone()) {
-                    links.push(ContextLink {
-                        kind: ContextLinkKind::Structural,
-                        from: format!("note:{note_id}"),
-                        to: format!("metric:{}", record.record.id),
-                        reason: format!("Note date matches metric date {date}"),
+                upsert_metric_record_evidence(
+                    &mut evidence_by_metric,
+                    MetricRecordEvidence {
+                        record,
+                        kind: ContextEvidenceKind::Structural,
+                        link_reason: format!("Note references day {date} with recorded metrics"),
                         confidence: None,
-                    });
-                    metrics.push(record);
-                }
+                    },
+                );
             }
         }
 
-        Ok((metrics, links))
+        let stronger_keys = evidence_by_metric
+            .values()
+            .filter(|evidence| evidence.kind != ContextEvidenceKind::Inferred)
+            .map(|evidence| evidence.record.record.key.clone())
+            .collect::<HashSet<_>>();
+        for metric_key in extract_metric_key_mentions(note) {
+            if stronger_keys.contains(&metric_key) {
+                continue;
+            }
+            let mut results = self
+                .metrics
+                .search(
+                    &build_metrics_field_query("key", &metric_key, None),
+                    Some(metric_limit.saturating_mul(2).max(1)),
+                )
+                .await?;
+            if results.is_empty() {
+                continue;
+            }
+            sort_metric_records(&mut results);
+            if let Some(record) = results.into_iter().next() {
+                upsert_metric_record_evidence(
+                    &mut evidence_by_metric,
+                    MetricRecordEvidence {
+                        record,
+                        kind: ContextEvidenceKind::Inferred,
+                        link_reason: format!("Note text mentions metric key `{metric_key}`"),
+                        confidence: Some(0.35),
+                    },
+                );
+            }
+        }
+
+        let mut evidence = evidence_by_metric.into_values().collect::<Vec<_>>();
+        sort_metric_record_evidence(&mut evidence);
+        if evidence.len() > metric_limit {
+            evidence.truncate(metric_limit);
+        }
+        Ok(evidence)
     }
 
     async fn metric_files_for_records(
@@ -2035,7 +2118,7 @@ fn context_metric_item_from_record(
     }
 }
 
-fn metric_items_from_records(
+fn metric_items_from_records_dedup_by_key_with_reasons(
     records: &[MetricRecordEntry],
     reasons: Option<&std::collections::HashMap<String, String>>,
     limit: usize,
@@ -2046,7 +2129,7 @@ fn metric_items_from_records(
         if items.len() >= limit {
             break;
         }
-        if seen.insert(record.record.id.clone()) {
+        if seen.insert(record.record.key.clone()) {
             items.push(context_metric_item_from_record(
                 record,
                 reasons.and_then(|map| map.get(&record.record.id).cloned()),
@@ -2074,16 +2157,72 @@ fn metric_items_from_records_dedup_by_key(
     items
 }
 
-fn metric_reason_map(links: &[ContextLink]) -> std::collections::HashMap<String, String> {
-    let mut reasons = std::collections::HashMap::new();
-    for link in links {
-        if let Some(metric_id) = link.to.strip_prefix("metric:") {
-            reasons
-                .entry(metric_id.to_string())
-                .or_insert_with(|| link.reason.clone());
+fn metric_reasons_from_evidence(
+    evidence: &[MetricRecordEvidence],
+) -> std::collections::HashMap<String, String> {
+    evidence
+        .iter()
+        .map(|evidence| {
+            (
+                evidence.record.record.id.clone(),
+                evidence.link_reason.clone(),
+            )
+        })
+        .collect()
+}
+
+fn note_day_links(note_id: &str, dates: &BTreeSet<NaiveDate>) -> Vec<ContextLink> {
+    dates
+        .iter()
+        .map(|date| ContextLink {
+            kind: ContextLinkKind::Structural,
+            from: format!("note:{note_id}"),
+            to: format!("day:{date}"),
+            reason: format!("Note references day {date}"),
+            confidence: None,
+        })
+        .collect()
+}
+
+fn build_day_relationship_links(
+    day: &str,
+    history_notes: &[ContextNoteItem],
+    backlink_notes: &[ContextNoteItem],
+    metrics: &[MetricRecordEntry],
+) -> Vec<ContextLink> {
+    let mut links = history_notes
+        .iter()
+        .map(|note| ContextLink {
+            kind: ContextLinkKind::Structural,
+            from: format!("day:{day}"),
+            to: format!("note:{}", note.note_id),
+            reason: note
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Daily note for requested day".to_string()),
+            confidence: None,
+        })
+        .collect::<Vec<_>>();
+    links.extend(backlink_notes.iter().map(|note| {
+        ContextLink {
+            kind: ContextLinkKind::Structural,
+            from: format!("note:{}", note.note_id),
+            to: format!("day:{day}"),
+            reason: note
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Links to this day".to_string()),
+            confidence: None,
         }
-    }
-    reasons
+    }));
+    links.extend(metrics.iter().map(|metric| ContextLink {
+        kind: ContextLinkKind::Structural,
+        from: format!("day:{day}"),
+        to: format!("metric:{}", metric.record.id),
+        reason: format!("Metric recorded on {day}"),
+        confidence: None,
+    }));
+    links
 }
 
 fn push_pivot(
@@ -2410,6 +2549,25 @@ fn upsert_note_metric_evidence(
     }
 }
 
+fn upsert_metric_record_evidence(
+    target: &mut HashMap<String, MetricRecordEvidence>,
+    incoming: MetricRecordEvidence,
+) {
+    match target.get_mut(&incoming.record.record.id) {
+        Some(existing) => {
+            let incoming_is_stronger = incoming.kind < existing.kind
+                || (incoming.kind == existing.kind
+                    && incoming.record.record.ts > existing.record.record.ts);
+            if incoming_is_stronger {
+                *existing = incoming;
+            }
+        }
+        None => {
+            target.insert(incoming.record.record.id.clone(), incoming);
+        }
+    }
+}
+
 fn sort_note_metric_evidence(evidence: &mut [NoteMetricEvidence]) {
     evidence.sort_by(|left, right| {
         left.kind
@@ -2419,11 +2577,21 @@ fn sort_note_metric_evidence(evidence: &mut [NoteMetricEvidence]) {
     });
 }
 
-fn note_metric_evidence_link_kind(kind: NoteMetricEvidenceKind) -> ContextLinkKind {
+fn sort_metric_record_evidence(evidence: &mut [MetricRecordEvidence]) {
+    evidence.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| right.record.record.ts.cmp(&left.record.record.ts))
+            .then_with(|| left.record.record.key.cmp(&right.record.record.key))
+            .then_with(|| left.record.record.id.cmp(&right.record.record.id))
+    });
+}
+
+fn context_evidence_link_kind(kind: ContextEvidenceKind) -> ContextLinkKind {
     match kind {
-        NoteMetricEvidenceKind::Explicit => ContextLinkKind::Explicit,
-        NoteMetricEvidenceKind::Structural => ContextLinkKind::Structural,
-        NoteMetricEvidenceKind::Inferred => ContextLinkKind::Related,
+        ContextEvidenceKind::Explicit => ContextLinkKind::Explicit,
+        ContextEvidenceKind::Structural => ContextLinkKind::Structural,
+        ContextEvidenceKind::Inferred => ContextLinkKind::Related,
     }
 }
 
@@ -2598,7 +2766,36 @@ fn extract_note_dates(note: &NoteRecord) -> BTreeSet<NaiveDate> {
         }
     }
 
+    let metadata_json = serde_json::to_string(&note.metadata).unwrap_or_default();
+    let haystack = format!(
+        "{}\n{}\n{}\n{}",
+        note.id,
+        note.title.clone().unwrap_or_default(),
+        note.content,
+        metadata_json
+    );
+    for matched in ABSOLUTE_DATE_RE.find_iter(&haystack) {
+        if let Ok(date) = NaiveDate::parse_from_str(matched.as_str(), "%Y-%m-%d") {
+            dates.insert(date);
+        }
+    }
+
     dates
+}
+
+fn extract_metric_key_mentions(note: &NoteRecord) -> BTreeSet<String> {
+    let metadata_json = serde_json::to_string(&note.metadata).unwrap_or_default();
+    let haystack = format!(
+        "{}\n{}\n{}\n{}",
+        note.id,
+        note.title.clone().unwrap_or_default(),
+        note.content,
+        metadata_json
+    );
+    METRIC_KEY_TOKEN_RE
+        .find_iter(&haystack)
+        .map(|matched| matched.as_str().to_ascii_lowercase())
+        .collect()
 }
 
 fn related_note_search_terms(note: &NoteRecord) -> Vec<String> {
@@ -2942,6 +3139,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_context_uses_structural_and_inferred_metric_evidence() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Weight Review",
+            Some("Weight Review"),
+            "Compare [[2026-04-15]] against the latest body.weight trend.",
+            Some(ts(2026, 4, 16, 7, 0)),
+            ts(2026, 4, 16, 7, 30),
+        );
+
+        let payload = service
+            .note("Weight Review", Some(5), Some(5))
+            .await
+            .expect("note context");
+
+        assert!(
+            payload.related.days.iter().any(|day| day == "2026-04-15"),
+            "expected literal date mention to surface as a related day"
+        );
+        assert!(
+            payload
+                .activity
+                .metrics
+                .iter()
+                .any(|metric| metric.record.id == "01AAB"),
+            "expected same-day metric evidence from the referenced day"
+        );
+        assert!(
+            payload.links.items.iter().any(|link| {
+                link.from == "note:Weight Review"
+                    && link.to == "day:2026-04-15"
+                    && link.kind == ContextLinkKind::Structural
+            }),
+            "expected note-to-day structural link"
+        );
+        assert!(
+            payload.links.items.iter().any(|link| {
+                link.from == "note:Weight Review"
+                    && link.to == "metric:01AAB"
+                    && link.kind == ContextLinkKind::Structural
+            }),
+            "expected same-day metric evidence to classify structurally"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_context_surfaces_inferred_metric_key_evidence() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Weight Lexicon",
+            Some("Weight Lexicon"),
+            "body.weight is the main trend I want to keep an eye on.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+
+        let payload = service
+            .note("Weight Lexicon", Some(5), Some(5))
+            .await
+            .expect("note context");
+
+        assert!(
+            payload
+                .activity
+                .metrics
+                .iter()
+                .any(|metric| metric.record.key == "body.weight"),
+            "expected inferred metric-key evidence to surface matching records"
+        );
+        assert!(
+            payload.links.items.iter().any(|link| {
+                link.from == "note:Weight Lexicon"
+                    && link.to.starts_with("metric:")
+                    && link.kind == ContextLinkKind::Related
+                    && link.confidence.is_some()
+            }),
+            "expected inferred note-to-metric links to stay marked as related"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_context_deduplicates_metric_leads_by_key() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Weight Summary",
+            Some("Weight Summary"),
+            "Compare body.weight between 2026-04-14 and 2026-04-15.",
+            Some(ts(2026, 4, 16, 9, 0)),
+            ts(2026, 4, 16, 9, 15),
+        );
+
+        let payload = service
+            .note("Weight Summary", Some(5), Some(5))
+            .await
+            .expect("note context");
+
+        let body_weight_count = payload
+            .related
+            .metrics
+            .iter()
+            .filter(|metric| metric.key == "body.weight")
+            .count();
+        assert_eq!(
+            body_weight_count, 1,
+            "expected note metric leads to collapse duplicate keys"
+        );
+        assert!(
+            payload.activity.metrics.len() >= 2,
+            "expected raw metric activity to keep the underlying records"
+        );
+    }
+
+    #[tokio::test]
     async fn metric_context_accepts_key_targets() {
         let (_dir, service) = build_service();
         let payload = service
@@ -3140,6 +3453,22 @@ mod tests {
         assert!(
             payload.related.days.iter().any(|day| day == "2026-04-15"),
             "expected adjacent active day"
+        );
+        assert!(
+            payload.links.items.iter().any(|link| {
+                link.from == "day:2026-04-14"
+                    && link.to == "metric:01AAA"
+                    && link.kind == ContextLinkKind::Structural
+            }),
+            "expected day-to-metric structural relationships in day context links"
+        );
+        assert!(
+            payload.links.items.iter().any(|link| {
+                link.from == "note:Project Hub"
+                    && link.to == "day:2026-04-14"
+                    && link.kind == ContextLinkKind::Structural
+            }),
+            "expected backlinks into the day to be represented as relationships"
         );
     }
 
