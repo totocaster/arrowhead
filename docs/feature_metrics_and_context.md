@@ -402,6 +402,7 @@ This should answer questions like:
 ```text
 arrowhead context day
 arrowhead context week
+arrowhead context month
 arrowhead context changed
 arrowhead context note
 arrowhead context metric
@@ -413,6 +414,7 @@ Representative examples:
 ```bash
 arrowhead context day 2026-04-14
 arrowhead context week --this
+arrowhead context month --this
 arrowhead context changed --days 3
 arrowhead context note "Project Hub"
 arrowhead context metric body.weight

@@ -13,7 +13,7 @@ use crate::logging;
 use arrowhead_core::{
     ContextAttentionItem, ContextLink, ContextMetricItem, ContextPayload, ContextPivot,
     ContextService, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT,
-    SearchConfig, SearchService, Vault, VaultConfig, WeekContextSelector,
+    MonthContextSelector, SearchConfig, SearchService, Vault, VaultConfig, WeekContextSelector,
     embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
 };
 
@@ -41,6 +41,8 @@ pub enum ContextAction {
     Day(DayArgs),
     /// Show context for a calendar week.
     Week(WeekArgs),
+    /// Show context for a calendar month.
+    Month(MonthArgs),
     /// Show recently changed notes and metrics.
     Changed(ChangedArgs),
     /// Show context around a note.
@@ -77,6 +79,29 @@ pub struct WeekArgs {
     #[arg(long, conflicts_with = "last")]
     pub this: bool,
     /// Inspect the previous week.
+    #[arg(long, conflicts_with = "this")]
+    pub last: bool,
+    /// Maximum number of related notes to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_NOTE_LIMIT)]
+    pub note_limit: usize,
+    /// Maximum number of metric records to surface.
+    #[arg(long, default_value_t = DEFAULT_CONTEXT_METRIC_LIMIT)]
+    pub metric_limit: usize,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `arrowhead context month`.
+#[derive(Debug, Args, Clone, PartialEq)]
+pub struct MonthArgs {
+    /// Optional day inside the month to inspect in YYYY-MM-DD format.
+    #[arg(conflicts_with_all = ["this", "last"])]
+    pub day: Option<String>,
+    /// Inspect the current month.
+    #[arg(long, conflicts_with = "last")]
+    pub this: bool,
+    /// Inspect the previous month.
     #[arg(long, conflicts_with = "this")]
     pub last: bool,
     /// Maximum number of related notes to surface.
@@ -182,6 +207,7 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
         ContextAction::Note(_) => SemanticContextMode::Preferred,
         ContextAction::Day(_)
         | ContextAction::Week(_)
+        | ContextAction::Month(_)
         | ContextAction::Changed(_)
         | ContextAction::Metric(_)
         | ContextAction::Source(_) => SemanticContextMode::Disabled,
@@ -198,6 +224,15 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
             service
                 .week(
                     resolve_week_selector(args)?,
+                    Some(args.note_limit),
+                    Some(args.metric_limit),
+                )
+                .await?
+        }
+        ContextAction::Month(args) => {
+            service
+                .month(
+                    resolve_month_selector(args)?,
                     Some(args.note_limit),
                     Some(args.metric_limit),
                 )
@@ -242,6 +277,7 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
     let json = match &command.action {
         ContextAction::Day(args) => args.json,
         ContextAction::Week(args) => args.json,
+        ContextAction::Month(args) => args.json,
         ContextAction::Changed(args) => args.json,
         ContextAction::Note(args) => args.json,
         ContextAction::Metric(args) => args.json,
@@ -311,7 +347,9 @@ pub(crate) fn render_context_payload(payload: &ContextPayload) {
 
     match payload.summary.kind {
         ContextTargetKind::Day => render_day_context(payload),
-        ContextTargetKind::Week | ContextTargetKind::Changed => render_window_context(payload),
+        ContextTargetKind::Week | ContextTargetKind::Month | ContextTargetKind::Changed => {
+            render_window_context(payload)
+        }
         ContextTargetKind::Note => render_note_context(payload),
         ContextTargetKind::Metric => render_metric_context(payload),
         ContextTargetKind::Source => render_source_context(payload),
@@ -325,6 +363,7 @@ fn render_target_kind(kind: ContextTargetKind) -> &'static str {
     match kind {
         ContextTargetKind::Day => "day",
         ContextTargetKind::Week => "week",
+        ContextTargetKind::Month => "month",
         ContextTargetKind::Changed => "changed",
         ContextTargetKind::Note => "note",
         ContextTargetKind::Metric => "metric",
@@ -342,6 +381,18 @@ fn resolve_week_selector(args: &WeekArgs) -> Result<WeekContextSelector> {
         return Ok(WeekContextSelector::ContainingDay(parsed));
     }
     Ok(WeekContextSelector::ThisWeek)
+}
+
+fn resolve_month_selector(args: &MonthArgs) -> Result<MonthContextSelector> {
+    if args.last {
+        return Ok(MonthContextSelector::LastMonth);
+    }
+    if let Some(day) = args.day.as_deref() {
+        let parsed = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d")
+            .with_context(|| format!("invalid month day `{}`", day.trim()))?;
+        return Ok(MonthContextSelector::ContainingDay(parsed));
+    }
+    Ok(MonthContextSelector::ThisMonth)
 }
 
 fn render_day_context(payload: &ContextPayload) {

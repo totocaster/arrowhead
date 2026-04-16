@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Months, NaiveDate, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +40,8 @@ pub enum ContextTargetKind {
     Day,
     /// Week-oriented context.
     Week,
+    /// Month-oriented context.
+    Month,
     /// Recently changed context.
     Changed,
     /// Note-centric context.
@@ -301,6 +303,17 @@ pub enum WeekContextSelector {
     /// Week preceding the current day.
     LastWeek,
     /// Week containing the supplied day.
+    ContainingDay(NaiveDate),
+}
+
+/// Selects which month should be inspected by `ContextService::month`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonthContextSelector {
+    /// Month containing the current day.
+    ThisMonth,
+    /// Month preceding the current day.
+    LastMonth,
+    /// Month containing the supplied day.
     ContainingDay(NaiveDate),
 }
 
@@ -1032,6 +1045,126 @@ impl ContextService {
         })
     }
 
+    /// Build context around a calendar month.
+    pub async fn month(
+        &self,
+        selector: MonthContextSelector,
+        note_limit: Option<usize>,
+        metric_limit: Option<usize>,
+    ) -> Result<ContextPayload> {
+        let note_limit = note_limit.unwrap_or(DEFAULT_CONTEXT_NOTE_LIMIT).max(1);
+        let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
+        let (start, end) = month_bounds(selector)?;
+        let month_range = date_range_for_span(start, end);
+        let note_dates = dates_in_range(&month_range)?;
+
+        let mut history_notes = self
+            .note_items_for_dates(&note_dates, "Daily note in requested month")
+            .await?;
+        let mut created_notes = self
+            .note_items_for_created_range(&month_range, "Created during requested month")
+            .await?;
+        let created_ids = created_notes
+            .iter()
+            .map(|note| note.note_id.clone())
+            .collect::<HashSet<_>>();
+        let mut updated_notes = self
+            .note_items_for_modified_range(&month_range, "Modified during requested month")
+            .await?;
+        updated_notes.retain(|note| !created_ids.contains(&note.note_id));
+        trim_note_items(&mut history_notes, note_limit);
+        trim_note_items(&mut created_notes, note_limit);
+        trim_note_items(&mut updated_notes, note_limit);
+        let mut metrics = self
+            .metrics
+            .search(
+                &format!(
+                    "date:{}..{}",
+                    start.format("%Y-%m-%d"),
+                    end.format("%Y-%m-%d")
+                ),
+                Some(metric_limit),
+            )
+            .await?;
+        sort_metric_records(&mut metrics);
+        trim_metric_records(&mut metrics, metric_limit);
+
+        let related_notes = merged_note_items(
+            vec![
+                history_notes.clone(),
+                created_notes.clone(),
+                updated_notes.clone(),
+            ],
+            note_limit,
+        );
+        let files = self.metric_files_for_records(&metrics).await?;
+        let mut activity_links = self
+            .note_links_for_notes(
+                &created_notes,
+                "Source note was created during the requested month",
+            )
+            .await?;
+        activity_links.extend(
+            self.note_links_for_notes(
+                &updated_notes,
+                "Source note was updated during the requested month",
+            )
+            .await?,
+        );
+        dedup_context_links(&mut activity_links);
+        trim_context_links(&mut activity_links, note_limit.saturating_mul(2).max(1));
+        let active_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let attention = attention_items_for_metrics(&metrics);
+        let links = build_window_links(
+            &format!("month:{}..{}", start, end),
+            "Requested month contains note activity",
+            &related_notes,
+            "Requested month contains metric activity",
+            &metrics,
+        );
+        let pivots = build_day_pivots(&start.to_string(), &related_notes, &metrics, &active_days);
+
+        Ok(ContextPayload {
+            summary: ContextSummary {
+                kind: ContextTargetKind::Month,
+                target: format!("{start}..{end}"),
+                label: Some(start.format("%B %Y").to_string()),
+                note_count: unique_note_count([
+                    history_notes.as_slice(),
+                    created_notes.as_slice(),
+                    updated_notes.as_slice(),
+                ]),
+                metric_count: metrics.len(),
+                link_count: links.len(),
+                attention_count: attention.len(),
+            },
+            history: ContextHistory {
+                notes: history_notes,
+                metrics: metrics.clone(),
+            },
+            activity: ContextActivity {
+                notes: related_notes.clone(),
+                notes_created: created_notes,
+                notes_updated: updated_notes,
+                metrics: metrics.clone(),
+                links: activity_links,
+                files,
+            },
+            links: ContextLinks { items: links },
+            attention: ContextAttention { items: attention },
+            related: ContextRelated {
+                days: active_days,
+                notes: related_notes,
+                metrics: Vec::new(),
+                metric_keys: unique_metric_keys(&metrics),
+                sources: unique_metric_sources(&metrics),
+            },
+            pivots,
+        })
+    }
+
     /// Build context around recently changed notes and metrics.
     pub async fn changed(
         &self,
@@ -1647,6 +1780,25 @@ fn week_bounds(selector: WeekContextSelector) -> (NaiveDate, NaiveDate) {
     let start = anchor - Duration::days(weekday_offset);
     let end = start + Duration::days(6);
     (start, end)
+}
+
+fn month_bounds(selector: MonthContextSelector) -> Result<(NaiveDate, NaiveDate)> {
+    let anchor = match selector {
+        MonthContextSelector::ThisMonth => Utc::now().date_naive(),
+        MonthContextSelector::LastMonth => Utc::now()
+            .date_naive()
+            .checked_sub_months(Months::new(1))
+            .context("failed to resolve previous month")?,
+        MonthContextSelector::ContainingDay(day) => day,
+    };
+    let start = anchor
+        .with_day(1)
+        .context("failed to resolve start of month")?;
+    let end = start
+        .checked_add_months(Months::new(1))
+        .context("failed to resolve end of month")?
+        - Duration::days(1);
+    Ok((start, end))
 }
 
 fn range_contains_timestamp(range: &DateRange, timestamp: DateTime<Utc>) -> bool {
@@ -2710,6 +2862,33 @@ mod tests {
                 .iter()
                 .any(|day| day == "2026-04-14" || day == "2026-04-15"),
             "expected active days inside requested week"
+        );
+    }
+
+    #[tokio::test]
+    async fn month_context_accepts_anchor_day() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .month(
+                MonthContextSelector::ContainingDay(
+                    NaiveDate::from_ymd_opt(2026, 4, 14).expect("date"),
+                ),
+                Some(5),
+                Some(5),
+            )
+            .await
+            .expect("month context");
+
+        assert_eq!(payload.summary.kind, ContextTargetKind::Month);
+        assert_eq!(payload.summary.target, "2026-04-01..2026-04-30");
+        assert_eq!(payload.summary.label.as_deref(), Some("April 2026"));
+        assert!(
+            payload
+                .related
+                .days
+                .iter()
+                .any(|day| day == "2026-04-14" || day == "2026-04-15"),
+            "expected active days inside requested month"
         );
     }
 

@@ -220,11 +220,12 @@ arrowhead graph orphans --format ids | head -20
 arrowhead graph backlinks "Project Hub" --format ids
 
 # CRUD helpers + graph analytics
-arrowhead notes list --json
+arrowhead notes list --category project --limit 20
 arrowhead graph context "Project Hub"
 # Exploration-oriented context leads
 arrowhead context day 2026-04-14
 arrowhead context week --this
+arrowhead context month --this
 arrowhead context changed --days 3
 arrowhead context note "Project Hub"
 # Compatibility aliases and richer context views
@@ -232,6 +233,7 @@ arrowhead notes similar "Photography Equipment"
 arrowhead notes surprise "Project Hub" --limit 3 --json
 arrowhead context metric body.weight
 arrowhead context source withings --range past30d
+arrowhead metrics search "key:nutrition.energy_intake date:past7d" --aggregate sum
 
 # Tail structured logs
 tail -f /path/to/vault/.arrowhead/logs/cli.log

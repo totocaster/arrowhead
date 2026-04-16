@@ -419,7 +419,7 @@ impl IndexDatabase {
     pub fn search_metric_records(
         &self,
         query: &MetricsQuery,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<Vec<MetricRecordEntry>> {
         let conn = self.connection()?;
         let mut sql = String::from(
@@ -478,9 +478,12 @@ impl IndexDatabase {
         }
 
         sql.push_str(
-            " ORDER BY COALESCE(date_micros, ts_utc) DESC, source_file ASC, source_line ASC LIMIT ?",
+            " ORDER BY COALESCE(date_micros, ts_utc) DESC, source_file ASC, source_line ASC",
         );
-        params.push(SqlValue::from(limit.max(1) as i64));
+        if let Some(limit) = limit {
+            sql.push_str(" LIMIT ?");
+            params.push(SqlValue::from(limit.max(1) as i64));
+        }
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params.iter()), |row| {

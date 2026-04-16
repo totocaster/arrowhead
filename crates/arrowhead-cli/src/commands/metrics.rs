@@ -1,10 +1,15 @@
 //! `arrowhead metrics` command family.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, FixedOffset, NaiveDate};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tracing::info;
 
@@ -115,12 +120,42 @@ pub struct ReadArgs {
 pub struct SearchArgs {
     /// Search query supporting `key:`, `source:`, `file:`, `date:`, and `note:` filters.
     pub query: String,
-    /// Maximum number of records to return.
+    /// Maximum number of records or aggregate buckets to return.
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
+    /// Aggregate matching records into daily roll-ups.
+    #[arg(long, value_enum)]
+    pub aggregate: Option<MetricSearchAggregate>,
     /// Emit structured JSON instead of human-readable output.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Supported aggregate modes for `arrowhead metrics search`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricSearchAggregate {
+    /// Sum the matching metric values per day.
+    Sum,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricAggregateBucket {
+    date: NaiveDate,
+    value: f64,
+    record_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricAggregateSummary {
+    aggregate: MetricSearchAggregate,
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit: Option<String>,
+    matching_record_count: usize,
+    buckets: Vec<MetricAggregateBucket>,
 }
 
 /// Arguments for `arrowhead metrics create`.
@@ -375,10 +410,33 @@ pub async fn run(ctx: &CommandContext, command: &MetricsCommand) -> Result<()> {
             info!(
                 query = args.query.as_str(),
                 limit = args.limit,
+                aggregate = ?args.aggregate,
                 json = args.json,
                 "searching indexed metrics records"
             );
             ensure_metrics_index_available(vault.as_ref(), &read_service).await?;
+            if let Some(aggregate) = args.aggregate {
+                let results = read_service.search_all(&args.query).await?;
+                if results.is_empty() {
+                    println!("No metric records matched `{}`.", args.query);
+                    return Ok(());
+                }
+
+                let summary = aggregate_metric_records(&results, aggregate, args.limit)?;
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "query": args.query,
+                            "aggregate": summary,
+                        }))?
+                    );
+                } else {
+                    print_metric_aggregate(&summary);
+                }
+                return Ok(());
+            }
+
             let results = read_service.search(&args.query, Some(args.limit)).await?;
 
             if args.json {
@@ -759,6 +817,123 @@ fn print_assigned_metric_ids_summary(summary: &AssignedMetricIdsSummary) {
     }
 }
 
+fn aggregate_metric_records(
+    records: &[MetricRecordEntry],
+    aggregate: MetricSearchAggregate,
+    limit: usize,
+) -> Result<MetricAggregateSummary> {
+    if records.is_empty() {
+        bail!("cannot aggregate an empty metrics result set");
+    }
+
+    let keys = records
+        .iter()
+        .map(|record| record.record.key.clone())
+        .collect::<BTreeSet<_>>();
+    if keys.len() != 1 {
+        bail!(
+            "aggregate {} requires a single metric key, but matched: {}",
+            aggregate_label(aggregate),
+            keys.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    let units = records
+        .iter()
+        .map(|record| record.record.unit.clone())
+        .collect::<BTreeSet<_>>();
+    if units.len() > 1 {
+        let rendered = units
+            .into_iter()
+            .map(|unit| unit.unwrap_or_else(|| "(no unit)".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "aggregate {} requires a single unit, but matched: {}",
+            aggregate_label(aggregate),
+            rendered
+        );
+    }
+
+    let key = keys.into_iter().next().expect("single key present");
+    let unit = records
+        .first()
+        .and_then(|record| record.record.unit.clone());
+    let mut totals = BTreeMap::new();
+    for record in records {
+        let bucket_date = record
+            .record
+            .date
+            .unwrap_or_else(|| record.record.ts.date_naive());
+        let entry = totals.entry(bucket_date).or_insert((0.0_f64, 0_usize));
+        match aggregate {
+            MetricSearchAggregate::Sum => {
+                entry.0 += record.record.value;
+            }
+        }
+        entry.1 += 1;
+    }
+
+    let mut buckets = totals
+        .into_iter()
+        .map(|(date, (value, record_count))| MetricAggregateBucket {
+            date,
+            value,
+            record_count,
+        })
+        .collect::<Vec<_>>();
+    buckets.sort_by(|left, right| right.date.cmp(&left.date));
+    let limit = limit.max(1);
+    if buckets.len() > limit {
+        buckets.truncate(limit);
+    }
+
+    Ok(MetricAggregateSummary {
+        aggregate,
+        key,
+        unit,
+        matching_record_count: records.len(),
+        buckets,
+    })
+}
+
+fn aggregate_label(aggregate: MetricSearchAggregate) -> &'static str {
+    match aggregate {
+        MetricSearchAggregate::Sum => "sum",
+    }
+}
+
+fn print_metric_aggregate(summary: &MetricAggregateSummary) {
+    let unit_suffix = summary
+        .unit
+        .as_deref()
+        .map(|unit| format!(" {unit}"))
+        .unwrap_or_default();
+
+    println!(
+        "{} by day for {}{}\n  matched: {} record{}",
+        aggregate_label(summary.aggregate),
+        summary.key,
+        unit_suffix,
+        summary.matching_record_count,
+        if summary.matching_record_count == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    for bucket in &summary.buckets {
+        println!(
+            "  {}  {}{}  ({} record{})",
+            bucket.date,
+            bucket.value,
+            unit_suffix,
+            bucket.record_count,
+            if bucket.record_count == 1 { "" } else { "s" }
+        );
+    }
+}
+
 fn metric_validation_label(record: &MetricRecordEntry) -> &'static str {
     match record.validation_status {
         arrowhead_core::MetricValidationStatus::Valid => "valid",
@@ -788,5 +963,116 @@ fn issue_code_label(issue: &arrowhead_core::MetricValidationIssue) -> &'static s
         arrowhead_core::MetricIssueCode::UnitMismatch => "unit_mismatch",
         arrowhead_core::MetricIssueCode::DuplicateId => "duplicate_id",
         arrowhead_core::MetricIssueCode::DuplicateOriginId => "duplicate_origin_id",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metric_record(
+        id: &str,
+        key: &str,
+        value: f64,
+        unit: Option<&str>,
+        date: Option<NaiveDate>,
+        ts: &str,
+    ) -> MetricRecordEntry {
+        MetricRecordEntry {
+            source_file: PathBuf::from("Metrics/health.metrics.ndjson"),
+            source_line: 1,
+            record: arrowhead_core::MetricRecord {
+                id: id.to_string(),
+                ts: DateTime::parse_from_rfc3339(ts).expect("valid ts"),
+                key: key.to_string(),
+                value,
+                source: "manual".to_string(),
+                date,
+                unit: unit.map(str::to_string),
+                origin_id: None,
+                note: None,
+                context: None,
+                tags: Vec::new(),
+                extra_fields: BTreeMap::new(),
+            },
+            raw_line: String::new(),
+            validation_status: arrowhead_core::MetricValidationStatus::Valid,
+            issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn aggregate_metric_records_rolls_up_by_day() {
+        let records = vec![
+            metric_record(
+                "01AAA",
+                "nutrition.energy_intake",
+                800.0,
+                Some("kcal"),
+                NaiveDate::from_ymd_opt(2026, 4, 14),
+                "2026-04-14T08:30:00+00:00",
+            ),
+            metric_record(
+                "01AAB",
+                "nutrition.energy_intake",
+                1200.0,
+                Some("kcal"),
+                NaiveDate::from_ymd_opt(2026, 4, 14),
+                "2026-04-14T18:00:00+00:00",
+            ),
+            metric_record(
+                "01AAC",
+                "nutrition.energy_intake",
+                900.0,
+                Some("kcal"),
+                None,
+                "2026-04-15T09:00:00+00:00",
+            ),
+        ];
+
+        let summary =
+            aggregate_metric_records(&records, MetricSearchAggregate::Sum, 10).expect("aggregate");
+
+        assert_eq!(summary.key, "nutrition.energy_intake");
+        assert_eq!(summary.unit.as_deref(), Some("kcal"));
+        assert_eq!(summary.matching_record_count, 3);
+        assert_eq!(summary.buckets.len(), 2);
+        assert_eq!(
+            summary.buckets[0].date,
+            NaiveDate::from_ymd_opt(2026, 4, 15).unwrap()
+        );
+        assert_eq!(summary.buckets[0].value, 900.0);
+        assert_eq!(
+            summary.buckets[1].date,
+            NaiveDate::from_ymd_opt(2026, 4, 14).unwrap()
+        );
+        assert_eq!(summary.buckets[1].value, 2000.0);
+        assert_eq!(summary.buckets[1].record_count, 2);
+    }
+
+    #[test]
+    fn aggregate_metric_records_rejects_mixed_units() {
+        let records = vec![
+            metric_record(
+                "01AAA",
+                "nutrition.energy_intake",
+                800.0,
+                Some("kcal"),
+                NaiveDate::from_ymd_opt(2026, 4, 14),
+                "2026-04-14T08:30:00+00:00",
+            ),
+            metric_record(
+                "01AAB",
+                "nutrition.energy_intake",
+                0.8,
+                Some("MJ"),
+                NaiveDate::from_ymd_opt(2026, 4, 14),
+                "2026-04-14T12:00:00+00:00",
+            ),
+        ];
+
+        let err = aggregate_metric_records(&records, MetricSearchAggregate::Sum, 10)
+            .expect_err("mixed units should fail");
+        assert!(err.to_string().contains("single unit"));
     }
 }

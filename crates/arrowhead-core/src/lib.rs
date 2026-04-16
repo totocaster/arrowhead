@@ -33,7 +33,8 @@ pub use context::{
     ContextActivity, ContextAttention, ContextAttentionItem, ContextHistory, ContextLink,
     ContextLinkKind, ContextMetricItem, ContextNoteItem, ContextPayload, ContextPivot,
     ContextRelated, ContextService, ContextSummary, ContextTargetKind,
-    DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT, WeekContextSelector,
+    DEFAULT_CONTEXT_METRIC_LIMIT, DEFAULT_CONTEXT_NOTE_LIMIT, MonthContextSelector,
+    WeekContextSelector,
 };
 pub use graph::{GraphContext, GraphService, LinkEdge, LinkReason, LinkResolutionRecord};
 pub use indexer::IndexProgressEvent;

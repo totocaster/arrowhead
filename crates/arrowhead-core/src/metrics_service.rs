@@ -274,7 +274,16 @@ impl MetricsService {
         let parsed = parse_metrics_query(query)?;
         let database = Arc::clone(&self.database);
         let limit = limit.unwrap_or(self.default_limit).max(1);
-        task::spawn_blocking(move || database.search_metric_records(&parsed, limit))
+        task::spawn_blocking(move || database.search_metric_records(&parsed, Some(limit)))
+            .await
+            .context("metrics search task aborted")?
+    }
+
+    /// Search indexed metrics records without applying a result limit.
+    pub async fn search_all(&self, query: &str) -> Result<Vec<MetricRecordEntry>> {
+        let parsed = parse_metrics_query(query)?;
+        let database = Arc::clone(&self.database);
+        task::spawn_blocking(move || database.search_metric_records(&parsed, None))
             .await
             .context("metrics search task aborted")?
     }
@@ -353,6 +362,24 @@ mod tests {
             .expect("search by text");
         assert_eq!(by_text.len(), 1);
         assert_eq!(by_text[0].record.id, "01AAB");
+    }
+
+    #[tokio::test]
+    async fn search_all_returns_every_matching_record() {
+        let mut rows = Vec::new();
+        for index in 0..12 {
+            rows.push(format!(
+                r#"{{"id":"01A{index:02}","ts":"2026-04-14T08:{index:02}:00+00:00","key":"nutrition.energy_intake","value":{value},"unit":"kcal","source":"manual","date":"2026-04-14"}}"#,
+                value = 100 + index
+            ));
+        }
+        let service = build_service(&rows.join("\n"), "Metrics/health.metrics.ndjson");
+
+        let results = service
+            .search_all("key:nutrition.energy_intake")
+            .await
+            .expect("search all");
+        assert_eq!(results.len(), 12);
     }
 
     #[tokio::test]

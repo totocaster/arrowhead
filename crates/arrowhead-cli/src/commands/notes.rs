@@ -1,8 +1,9 @@
 //! `arrowhead notes` command family.
 
-use std::{fs, sync::Arc};
+use std::{collections::BTreeSet, fs, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{Duration, NaiveDate, Utc};
 use clap::{Args, Subcommand};
 use serde_json::Value as JsonValue;
 use tracing::info;
@@ -13,7 +14,12 @@ use super::{
 };
 use crate::logging;
 use arrowhead_core::{
-    DEFAULT_CONTEXT_METRIC_LIMIT, MetadataMap, Vault, VaultConfig, sqlite::IndexDatabase,
+    DEFAULT_CONTEXT_METRIC_LIMIT, MetadataMap, Vault, VaultConfig,
+    query::{
+        DateRange, DateRangeBound, parse_absolute_date, parse_relative_range, range_from_lower,
+        range_from_parsed_date, range_from_upper,
+    },
+    sqlite::IndexDatabase,
 };
 
 /// CRUD operations for notes.
@@ -55,6 +61,18 @@ pub struct ListArgs {
     /// Only return note identifiers.
     #[arg(long)]
     pub ids_only: bool,
+    /// Filter notes by the `category` metadata field.
+    #[arg(long)]
+    pub category: Option<String>,
+    /// Filter notes by the `status` metadata field.
+    #[arg(long)]
+    pub status: Option<String>,
+    /// Filter notes whose frontmatter date or YYYY-MM-DD id prefix falls inside this range.
+    #[arg(long, value_name = "RANGE")]
+    pub date_range: Option<String>,
+    /// Maximum number of notes to return.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 /// Arguments for creating a note.
@@ -144,8 +162,15 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
             Ok(())
         }
         NoteAction::List(args) => {
-            info!(ids_only = args.ids_only, "listing notes");
-            let items = collect_note_list(vault.as_ref(), args.ids_only)?;
+            info!(
+                ids_only = args.ids_only,
+                category = ?args.category,
+                status = ?args.status,
+                date_range = ?args.date_range,
+                limit = ?args.limit,
+                "listing notes"
+            );
+            let items = collect_note_list(vault.as_ref(), args)?;
             for (id, title) in items {
                 if let Some(title) = title {
                     println!("{id}\t{title}");
@@ -201,17 +226,188 @@ fn read_note_raw(vault: &Vault, note_id: &str) -> Result<String> {
     Ok(content)
 }
 
-fn collect_note_list(vault: &Vault, ids_only: bool) -> Result<Vec<(String, Option<String>)>> {
+fn collect_note_list(vault: &Vault, args: &ListArgs) -> Result<Vec<(String, Option<String>)>> {
+    let filters = NoteListFilters::from_args(args)?;
     let mut results = Vec::new();
     for note_id in vault.list_note_ids()? {
-        if ids_only {
+        if args.ids_only && !filters.has_metadata_filters() {
             results.push((note_id, None));
         } else {
             let note = vault.load_note(&note_id)?;
-            results.push((note_id, note.title.clone()));
+            if !filters.matches(&note) {
+                continue;
+            }
+            if args.ids_only {
+                results.push((note_id, None));
+            } else {
+                results.push((note_id, note.title.clone()));
+            }
+        }
+        if let Some(limit) = filters.limit {
+            if results.len() >= limit {
+                break;
+            }
         }
     }
     Ok(results)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NoteListFilters {
+    category: Option<String>,
+    status: Option<String>,
+    date_range: Option<DateRange>,
+    limit: Option<usize>,
+}
+
+impl NoteListFilters {
+    fn from_args(args: &ListArgs) -> Result<Self> {
+        if matches!(args.limit, Some(0)) {
+            bail!("`--limit` must be at least 1");
+        }
+
+        Ok(Self {
+            category: args.category.as_deref().map(normalise_filter_value),
+            status: args.status.as_deref().map(normalise_filter_value),
+            date_range: args
+                .date_range
+                .as_deref()
+                .map(parse_note_date_filter)
+                .transpose()?,
+            limit: args.limit,
+        })
+    }
+
+    fn has_metadata_filters(&self) -> bool {
+        self.category.is_some() || self.status.is_some() || self.date_range.is_some()
+    }
+
+    fn matches(&self, note: &arrowhead_core::NoteRecord) -> bool {
+        if let Some(category) = self.category.as_deref() {
+            if !metadata_string_matches(note, "category", category) {
+                return false;
+            }
+        }
+
+        if let Some(status) = self.status.as_deref() {
+            if !metadata_string_matches(note, "status", status) {
+                return false;
+            }
+        }
+
+        if let Some(range) = self.date_range.as_ref() {
+            let note_dates = extract_note_dates(note);
+            if note_dates.is_empty()
+                || !note_dates
+                    .iter()
+                    .any(|date| date_range_contains(range, *date))
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn normalise_filter_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn metadata_string_matches(note: &arrowhead_core::NoteRecord, key: &str, expected: &str) -> bool {
+    note.metadata
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(normalise_filter_value)
+        .is_some_and(|value| value == expected)
+}
+
+fn extract_note_dates(note: &arrowhead_core::NoteRecord) -> BTreeSet<NaiveDate> {
+    let mut dates = BTreeSet::new();
+    if let Some(prefix) = note.id.get(..10) {
+        if let Ok(date) = NaiveDate::parse_from_str(prefix, "%Y-%m-%d") {
+            dates.insert(date);
+        }
+    }
+    if let Some(value) = note.metadata.get("date").and_then(|value| value.as_str()) {
+        if let Ok(date) = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d") {
+            dates.insert(date);
+        }
+    }
+    dates
+}
+
+fn parse_note_date_filter(input: &str) -> Result<DateRange> {
+    let trimmed = input.trim();
+    if let Some(range) = parse_relative_range(trimmed, Utc::now())? {
+        return Ok(range);
+    }
+
+    if let Some((lower, upper)) = trimmed.split_once("..") {
+        let lower = lower.trim();
+        let upper = upper.trim();
+
+        if lower.is_empty() && upper.is_empty() {
+            bail!("date range `{trimmed}` must include at least one bound");
+        }
+        if lower.is_empty() {
+            let parsed = parse_absolute_date(upper)
+                .with_context(|| format!("invalid date range `{trimmed}`"))?;
+            return Ok(range_from_upper(DateRangeBound {
+                value: parsed.instant,
+                inclusive: true,
+            }));
+        }
+        if upper.is_empty() {
+            let parsed = parse_absolute_date(lower)
+                .with_context(|| format!("invalid date range `{trimmed}`"))?;
+            return Ok(range_from_lower(DateRangeBound {
+                value: parsed.instant,
+                inclusive: true,
+            }));
+        }
+
+        let lower_range = range_from_lower(DateRangeBound {
+            value: parse_absolute_date(lower)
+                .with_context(|| format!("invalid date range `{trimmed}`"))?
+                .instant,
+            inclusive: true,
+        });
+        let upper_range = range_from_upper(DateRangeBound {
+            value: parse_absolute_date(upper)
+                .with_context(|| format!("invalid date range `{trimmed}`"))?
+                .instant,
+            inclusive: true,
+        });
+        return lower_range
+            .intersect(&upper_range)
+            .with_context(|| format!("date range `{trimmed}` resolves to an empty range"));
+    }
+
+    let parsed =
+        parse_absolute_date(trimmed).with_context(|| format!("invalid date range `{trimmed}`"))?;
+    Ok(range_from_parsed_date(parsed))
+}
+
+fn date_range_contains(range: &DateRange, date: NaiveDate) -> bool {
+    let day_start = date
+        .and_hms_opt(0, 0, 0)
+        .expect("valid start of day")
+        .and_utc()
+        .timestamp_micros();
+    let day_end = (date + Duration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .expect("valid start of next day")
+        .and_utc()
+        .timestamp_micros()
+        - 1;
+    let lower_ok = range
+        .lower_bound_micros()
+        .is_none_or(|lower| lower <= day_end);
+    let upper_ok = range
+        .upper_bound_micros()
+        .is_none_or(|upper| upper >= day_start);
+    lower_ok && upper_ok
 }
 
 fn create_note(vault: &Vault, args: &CreateArgs) -> Result<()> {
@@ -428,7 +624,17 @@ mod tests {
     #[test]
     fn list_ids_only_returns_identifiers() {
         let vault = fixture_vault();
-        let entries = collect_note_list(&vault, true).expect("list notes");
+        let entries = collect_note_list(
+            &vault,
+            &ListArgs {
+                ids_only: true,
+                category: None,
+                status: None,
+                date_range: None,
+                limit: None,
+            },
+        )
+        .expect("list notes");
         assert!(entries.iter().all(|(_, title)| title.is_none()));
         assert!(entries.iter().any(|(id, _)| id == "2024-01-15"));
     }
@@ -436,13 +642,82 @@ mod tests {
     #[test]
     fn list_with_titles_includes_note_titles() {
         let vault = fixture_vault();
-        let entries = collect_note_list(&vault, false).expect("list notes");
+        let entries = collect_note_list(
+            &vault,
+            &ListArgs {
+                ids_only: false,
+                category: None,
+                status: None,
+                date_range: None,
+                limit: None,
+            },
+        )
+        .expect("list notes");
         let photography_title = entries
             .iter()
             .find(|(id, _)| id == "Photography Equipment")
             .and_then(|(_, title)| title.clone())
             .expect("title present");
         assert_eq!(photography_title, "Photography Equipment");
+    }
+
+    #[test]
+    fn list_filters_by_category_status_date_and_limit() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(VaultConfig::new(temp_dir.path().to_path_buf())).expect("vault");
+
+        create_note(
+            &vault,
+            &CreateArgs {
+                id: Some("2026-04-14".to_string()),
+                title: Some("April 14".to_string()),
+                category: Some("project".to_string()),
+                content: Some("Daily project note".to_string()),
+                file: None,
+                metadata: Some(r#"{"status":"active","date":"2026-04-14"}"#.to_string()),
+            },
+        )
+        .expect("create first note");
+        create_note(
+            &vault,
+            &CreateArgs {
+                id: Some("2026-04-20".to_string()),
+                title: Some("April 20".to_string()),
+                category: Some("project".to_string()),
+                content: Some("Second project note".to_string()),
+                file: None,
+                metadata: Some(r#"{"status":"active","date":"2026-04-20"}"#.to_string()),
+            },
+        )
+        .expect("create second note");
+        create_note(
+            &vault,
+            &CreateArgs {
+                id: Some("Reference".to_string()),
+                title: Some("Reference".to_string()),
+                category: Some("reference".to_string()),
+                content: Some("Reference note".to_string()),
+                file: None,
+                metadata: Some(r#"{"status":"done","date":"2026-04-14"}"#.to_string()),
+            },
+        )
+        .expect("create reference note");
+
+        let entries = collect_note_list(
+            &vault,
+            &ListArgs {
+                ids_only: false,
+                category: Some("project".to_string()),
+                status: Some("active".to_string()),
+                date_range: Some("2026-04-10..2026-04-18".to_string()),
+                limit: Some(1),
+            },
+        )
+        .expect("list filtered notes");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "2026-04-14");
+        assert_eq!(entries[0].1.as_deref(), Some("April 14"));
     }
 
     #[test]
