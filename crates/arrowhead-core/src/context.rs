@@ -680,9 +680,7 @@ impl ContextService {
                 .into_iter()
                 .collect::<Vec<_>>()
         };
-        let related_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let related_days = active_days_from_metric_records(&metrics);
         let pivots = build_metric_pivots(
             &target_value,
             &metrics,
@@ -792,9 +790,7 @@ impl ContextService {
             Some("Metric emitted by requested source".to_string()),
             metric_limit,
         );
-        let related_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
-            .into_iter()
-            .collect::<Vec<_>>();
+        let related_days = active_days_from_metric_records(&metrics);
         let pivots = build_source_pivots(
             source,
             &metrics,
@@ -1721,10 +1717,7 @@ impl ContextService {
 
         let mut evidence = evidence_by_note.into_values().collect::<Vec<_>>();
         sort_note_metric_evidence(&mut evidence);
-        if evidence.len() > note_limit {
-            evidence.truncate(note_limit);
-        }
-        Ok(evidence)
+        Ok(prune_note_metric_evidence(evidence, note_limit))
     }
 
     async fn source_note_evidence(
@@ -1810,10 +1803,7 @@ impl ContextService {
 
         let mut evidence = evidence_by_note.into_values().collect::<Vec<_>>();
         sort_note_metric_evidence(&mut evidence);
-        if evidence.len() > note_limit {
-            evidence.truncate(note_limit);
-        }
-        Ok(evidence)
+        Ok(prune_note_metric_evidence(evidence, note_limit))
     }
 
     async fn related_metric_items_for_records(
@@ -2175,6 +2165,22 @@ fn active_days_from_notes_and_metrics(
         .into_iter()
         .map(|date| date.to_string())
         .collect()
+}
+
+fn active_days_from_metric_records(metrics: &[MetricRecordEntry]) -> Vec<String> {
+    let mut days = Vec::new();
+    let mut seen = HashSet::new();
+    for metric in metrics {
+        let day = metric
+            .record
+            .date
+            .unwrap_or_else(|| metric.record.ts.date_naive())
+            .to_string();
+        if seen.insert(day.clone()) {
+            days.push(day);
+        }
+    }
+    days
 }
 
 fn active_dates_from_notes_and_metrics(
@@ -2916,6 +2922,53 @@ fn sort_note_metric_evidence(evidence: &mut [NoteMetricEvidence]) {
             .then_with(|| right.note.file_modified_at.cmp(&left.note.file_modified_at))
             .then_with(|| left.note.note_id.cmp(&right.note.note_id))
     });
+}
+
+fn prune_note_metric_evidence(
+    evidence: Vec<NoteMetricEvidence>,
+    limit: usize,
+) -> Vec<NoteMetricEvidence> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let strong_count = evidence
+        .iter()
+        .filter(|evidence| evidence.kind != ContextEvidenceKind::Inferred)
+        .count();
+    let strong_cap = strong_count.min(limit);
+    let inferred_room = limit.saturating_sub(strong_cap);
+    let inferred_cap = if inferred_room == 0 {
+        0
+    } else if strong_count >= 2 {
+        1.min(inferred_room)
+    } else {
+        2.min(inferred_room)
+    };
+
+    let mut kept = Vec::new();
+    let mut kept_strong = 0;
+    let mut kept_inferred = 0;
+    for item in evidence {
+        match item.kind {
+            ContextEvidenceKind::Inferred => {
+                if kept_inferred < inferred_cap {
+                    kept.push(item);
+                    kept_inferred += 1;
+                }
+            }
+            _ => {
+                if kept_strong < strong_cap {
+                    kept.push(item);
+                    kept_strong += 1;
+                }
+            }
+        }
+        if kept.len() >= limit {
+            break;
+        }
+    }
+    kept
 }
 
 fn sort_metric_record_evidence(evidence: &mut [MetricRecordEvidence]) {
@@ -3689,6 +3742,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metric_context_prunes_extra_inferred_notes_when_strong_leads_exist() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "2026-04-15",
+            Some("2026-04-15"),
+            "Daily note for follow-up weigh-in.",
+            Some(ts(2026, 4, 15, 7, 0)),
+            ts(2026, 4, 15, 21, 0),
+        );
+        insert_note_fixture(
+            &service,
+            "Weight Lexicon",
+            Some("Weight Lexicon"),
+            "body.weight is one of the health metrics tracked in this vault.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+        insert_note_fixture(
+            &service,
+            "Weight Glossary",
+            Some("Weight Glossary"),
+            "Glossary note for body.weight and related tracking terms.",
+            Some(ts(2026, 4, 16, 9, 0)),
+            ts(2026, 4, 16, 9, 30),
+        );
+
+        let payload = service
+            .metric("body.weight", None, Some(10), Some(5))
+            .await
+            .expect("metric context");
+
+        let inferred_notes = payload
+            .related
+            .notes
+            .iter()
+            .filter(|note| note.reason.as_deref() == Some("Note text matches metric key"))
+            .count();
+        assert_eq!(
+            inferred_notes, 1,
+            "expected only one inferred note once multiple stronger day/explicit leads exist"
+        );
+    }
+
+    #[tokio::test]
     async fn metric_context_applies_date_range_filter() {
         let (_dir, service) = build_service();
         let payload = service
@@ -3829,6 +3927,117 @@ mod tests {
                 .map(|link| link.kind),
             Some(ContextLinkKind::Explicit),
             "expected explicit source note links to be classified explicitly"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_context_prunes_extra_inferred_notes_when_strong_leads_exist() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "2026-04-15",
+            Some("2026-04-15"),
+            "Daily note for follow-up weigh-in.",
+            Some(ts(2026, 4, 15, 7, 0)),
+            ts(2026, 4, 15, 21, 0),
+        );
+        insert_note_fixture(
+            &service,
+            "Weight Lexicon",
+            Some("Weight Lexicon"),
+            "body.weight is one of the health metrics tracked in this vault.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+        insert_note_fixture(
+            &service,
+            "Weight Glossary",
+            Some("Weight Glossary"),
+            "Glossary note for body.weight and body.fat_percentage.",
+            Some(ts(2026, 4, 16, 9, 0)),
+            ts(2026, 4, 16, 9, 30),
+        );
+
+        let payload = service
+            .source("withings", None, Some(10), Some(5))
+            .await
+            .expect("source context");
+
+        let inferred_notes = payload
+            .related
+            .notes
+            .iter()
+            .filter(|note| note.reason.as_deref() == Some("Note text matches source metric key"))
+            .count();
+        assert_eq!(
+            inferred_notes, 1,
+            "expected only one inferred note once source context already has stronger leads"
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_context_related_days_and_pivot_follow_metric_activity() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "2019-10-09",
+            Some("2019-10-09"),
+            "Exercise at home with [[body weight]].",
+            Some(ts(2019, 10, 9, 7, 0)),
+            ts(2019, 10, 9, 8, 0),
+        );
+
+        let payload = service
+            .metric("body.weight", None, Some(10), Some(5))
+            .await
+            .expect("metric context");
+
+        assert_eq!(
+            payload.related.days,
+            vec!["2026-04-15".to_string(), "2026-04-14".to_string()],
+            "expected related metric days to come from actual metric activity"
+        );
+        assert_eq!(
+            payload
+                .pivots
+                .iter()
+                .find(|pivot| pivot.kind == "context_day")
+                .map(|pivot| pivot.target.as_str()),
+            Some("2026-04-15"),
+            "expected metric pivots to prefer the latest metric-active day"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_context_related_days_and_pivot_follow_source_activity() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "2019-04-07",
+            Some("2019-04-07"),
+            "Noticed low [[body fat percentage]] on the scales today.",
+            Some(ts(2019, 4, 7, 7, 0)),
+            ts(2019, 4, 7, 8, 0),
+        );
+
+        let payload = service
+            .source("withings", None, Some(10), Some(5))
+            .await
+            .expect("source context");
+
+        assert_eq!(
+            payload.related.days,
+            vec!["2026-04-15".to_string(), "2026-04-14".to_string()],
+            "expected related source days to come from actual source metric activity"
+        );
+        assert_eq!(
+            payload
+                .pivots
+                .iter()
+                .find(|pivot| pivot.kind == "context_day")
+                .map(|pivot| pivot.target.as_str()),
+            Some("2026-04-15"),
+            "expected source pivots to prefer the latest source-active day"
         );
     }
 
