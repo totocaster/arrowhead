@@ -3,14 +3,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::task;
 
 use crate::{
     MetricRecord, MetricValidationIssue, MetricValidationStatus,
     query::{
-        DateRange, parse_absolute_date, parse_relative_range, range_from_lower,
+        DateRange, DateRangeBound, parse_absolute_date, parse_relative_range, range_from_lower,
         range_from_parsed_date, range_from_upper,
     },
     sqlite::IndexDatabase,
@@ -18,6 +18,9 @@ use crate::{
 
 /// Default number of metrics search results to return when no limit is provided.
 pub const DEFAULT_METRICS_SEARCH_LIMIT: usize = 10;
+
+const METRICS_DATE_FORMAT_HINT: &str =
+    "expected YYYY-MM-DD, YYYY-MM, or a range like YYYY-MM-DD..YYYY-MM-DD";
 
 /// Summary information for an indexed metrics file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,43 +170,131 @@ fn parse_metrics_date_filter(input: &str) -> Result<DateRange> {
         }
 
         if lower.is_empty() {
-            let parsed = parse_absolute_date(upper)
-                .with_context(|| format!("invalid metrics date filter `{trimmed}`"))?;
-            return Ok(range_from_upper(crate::query::DateRangeBound {
-                value: parsed.instant,
-                inclusive: true,
-            }));
+            return Ok(range_from_upper(parse_metrics_date_bound(
+                upper,
+                DateBoundKind::Upper,
+                trimmed,
+            )?));
         }
 
         if upper.is_empty() {
-            let parsed = parse_absolute_date(lower)
-                .with_context(|| format!("invalid metrics date filter `{trimmed}`"))?;
-            return Ok(range_from_lower(crate::query::DateRangeBound {
-                value: parsed.instant,
-                inclusive: true,
-            }));
+            return Ok(range_from_lower(parse_metrics_date_bound(
+                lower,
+                DateBoundKind::Lower,
+                trimmed,
+            )?));
         }
 
-        let lower_parsed = parse_absolute_date(lower)
-            .with_context(|| format!("invalid metrics date filter `{trimmed}`"))?;
-        let upper_parsed = parse_absolute_date(upper)
-            .with_context(|| format!("invalid metrics date filter `{trimmed}`"))?;
-        let lower_range = range_from_lower(crate::query::DateRangeBound {
-            value: lower_parsed.instant,
-            inclusive: true,
-        });
-        let upper_range = range_from_upper(crate::query::DateRangeBound {
-            value: upper_parsed.instant,
-            inclusive: true,
-        });
+        let lower_range = range_from_lower(parse_metrics_date_bound(
+            lower,
+            DateBoundKind::Lower,
+            trimmed,
+        )?);
+        let upper_range = range_from_upper(parse_metrics_date_bound(
+            upper,
+            DateBoundKind::Upper,
+            trimmed,
+        )?);
         return lower_range.intersect(&upper_range).with_context(|| {
             format!("metrics date filter `{trimmed}` resolves to an empty range")
         });
     }
 
-    let parsed = parse_absolute_date(trimmed)
-        .with_context(|| format!("invalid metrics date `{trimmed}`"))?;
+    parse_metrics_date_literal(trimmed)
+}
+
+fn parse_metrics_date_literal(value: &str) -> Result<DateRange> {
+    if let Some(range) = parse_metrics_month_range(value)? {
+        return Ok(range);
+    }
+
+    let parsed = parse_absolute_date(value).with_context(|| {
+        format!("invalid metrics date literal `{value}`: {METRICS_DATE_FORMAT_HINT}")
+    })?;
     Ok(range_from_parsed_date(parsed))
+}
+
+fn parse_metrics_date_bound(
+    value: &str,
+    kind: DateBoundKind,
+    original_input: &str,
+) -> Result<DateRangeBound> {
+    if let Some(bound) = parse_metrics_month_bound(value, kind)? {
+        return Ok(bound);
+    }
+
+    let parsed = parse_absolute_date(value).with_context(|| {
+        format!("invalid metrics date filter `{original_input}`: {METRICS_DATE_FORMAT_HINT}")
+    })?;
+    Ok(DateRangeBound {
+        value: parsed.instant,
+        inclusive: true,
+    })
+}
+
+fn parse_metrics_month_range(value: &str) -> Result<Option<DateRange>> {
+    let Some(start) = parse_metrics_month_start(value)? else {
+        return Ok(None);
+    };
+
+    let end = start
+        .checked_add_months(Months::new(1))
+        .context("metrics month range overflow")?
+        .checked_sub_signed(Duration::microseconds(1))
+        .context("metrics month range underflow")?;
+
+    Ok(Some(DateRange::new(
+        Some(DateRangeBound {
+            value: start,
+            inclusive: true,
+        }),
+        Some(DateRangeBound {
+            value: end,
+            inclusive: true,
+        }),
+    )))
+}
+
+fn parse_metrics_month_bound(value: &str, kind: DateBoundKind) -> Result<Option<DateRangeBound>> {
+    let Some(start) = parse_metrics_month_start(value)? else {
+        return Ok(None);
+    };
+
+    let end = start
+        .checked_add_months(Months::new(1))
+        .context("metrics month range overflow")?
+        .checked_sub_signed(Duration::microseconds(1))
+        .context("metrics month range underflow")?;
+
+    let bound = match kind {
+        DateBoundKind::Lower => DateRangeBound {
+            value: start,
+            inclusive: true,
+        },
+        DateBoundKind::Upper => DateRangeBound {
+            value: end,
+            inclusive: true,
+        },
+    };
+
+    Ok(Some(bound))
+}
+
+fn parse_metrics_month_start(value: &str) -> Result<Option<DateTime<Utc>>> {
+    let Ok(date) = NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d") else {
+        return Ok(None);
+    };
+
+    let naive = date
+        .and_hms_opt(0, 0, 0)
+        .context("invalid metrics month start")?;
+    Ok(Some(Utc.from_utc_datetime(&naive)))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DateBoundKind {
+    Lower,
+    Upper,
 }
 
 fn merge_metrics_date_range(target: &mut Option<DateRange>, next: DateRange) -> Result<()> {
@@ -295,6 +386,7 @@ mod tests {
 
     use super::*;
     use crate::{parse_metrics_reader, sqlite::IndexDatabase};
+    use chrono::TimeZone;
     use tempfile::TempDir;
 
     fn build_service(contents: &str, relative_path: &str) -> MetricsService {
@@ -320,6 +412,33 @@ mod tests {
         assert_eq!(query.source_filters, vec!["withings".to_string()]);
         assert_eq!(query.text_terms, vec!["steak dinner".to_string()]);
         assert!(query.date_range.is_some());
+    }
+
+    #[test]
+    fn parse_metrics_query_expands_month_shorthand_date_filters() {
+        let query = parse_metrics_query("date:2026-04").expect("parse query");
+        let range = query.date_range.expect("date range");
+        let expected_start = Utc
+            .with_ymd_and_hms(2026, 4, 1, 0, 0, 0)
+            .single()
+            .expect("start");
+        let expected_end = Utc
+            .with_ymd_and_hms(2026, 5, 1, 0, 0, 0)
+            .single()
+            .expect("end")
+            - Duration::microseconds(1);
+
+        assert_eq!(range.start.expect("start bound").value, expected_start);
+        assert_eq!(range.end.expect("end bound").value, expected_end);
+    }
+
+    #[test]
+    fn parse_metrics_query_reports_actionable_date_hints() {
+        let err = parse_metrics_query("date:2026-04-99").expect_err("invalid date");
+        assert!(
+            err.to_string().contains(METRICS_DATE_FORMAT_HINT),
+            "expected date hint in error: {err:#}"
+        );
     }
 
     #[tokio::test]
@@ -362,6 +481,25 @@ mod tests {
             .expect("search by text");
         assert_eq!(by_text.len(), 1);
         assert_eq!(by_text[0].record.id, "01AAB");
+    }
+
+    #[tokio::test]
+    async fn search_accepts_month_shorthand_date_filters() {
+        let service = build_service(
+            concat!(
+                r#"{"id":"01AAA","ts":"2026-04-14T08:30:00+00:00","key":"nutrition.energy_intake","value":850,"unit":"kcal","source":"manual"}"#,
+                "\n",
+                r#"{"id":"01AAB","ts":"2026-05-01T08:30:00+00:00","key":"nutrition.energy_intake","value":900,"unit":"kcal","source":"manual"}"#
+            ),
+            "Metrics/health.metrics.ndjson",
+        );
+
+        let results = service
+            .search("key:nutrition.energy_intake date:2026-04", Some(5))
+            .await
+            .expect("search with month shorthand");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.id, "01AAA");
     }
 
     #[tokio::test]

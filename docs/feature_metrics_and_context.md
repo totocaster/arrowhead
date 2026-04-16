@@ -322,6 +322,10 @@ For v1, the essential metrics-specific fields are:
 - `date:`
 - `note:`
 
+`date:` should accept relative ranges (`past7d`), exact days (`2026-04-16`),
+calendar-month shorthand (`2026-04`), and explicit bounded ranges
+(`2026-04-01..2026-04-30`).
+
 Default free-text search should cover at least:
 
 - the metric `note` field

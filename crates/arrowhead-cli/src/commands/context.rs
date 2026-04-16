@@ -153,7 +153,7 @@ pub struct NoteArgs {
 pub struct MetricArgs {
     /// Metric id (`metric:<id>` or raw id) or metric key.
     pub metric: String,
-    /// Optional metrics date range such as `past30d` or `2026-04-01..2026-04-15`.
+    /// Optional metrics date range such as `past30d`, `2026-04`, or `2026-04-01..2026-04-15`.
     #[arg(long)]
     pub range: Option<String>,
     /// Maximum number of related notes to surface.
@@ -172,7 +172,7 @@ pub struct MetricArgs {
 pub struct SourceArgs {
     /// Metrics source identifier.
     pub source: String,
-    /// Optional metrics date range such as `past30d` or `2026-04-01..2026-04-15`.
+    /// Optional metrics date range such as `past30d`, `2026-04`, or `2026-04-01..2026-04-15`.
     #[arg(long)]
     pub range: Option<String>,
     /// Maximum number of related notes to surface.
@@ -284,8 +284,15 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
         ContextAction::Source(args) => args.json,
     };
 
+    let metric_range = match &command.action {
+        ContextAction::Metric(args) => normalized_metric_range(args.range.as_deref()),
+        _ => None,
+    };
+
     if json {
         println!("{}", to_string_pretty(&payload)?);
+    } else if let ContextAction::Metric(_) = &command.action {
+        render_metric_context_with_range(&payload, metric_range);
     } else {
         render_context_payload(&payload);
     }
@@ -331,28 +338,33 @@ pub(crate) async fn build_context_service(
 }
 
 pub(crate) fn render_context_payload(payload: &ContextPayload) {
-    println!(
-        "Context: {} {}",
-        render_target_kind(payload.summary.kind),
-        payload.summary.target
-    );
-    if let Some(label) = payload
-        .summary
-        .label
-        .as_deref()
-        .filter(|label| *label != payload.summary.target)
-    {
-        println!("{label}");
-    }
-
     match payload.summary.kind {
-        ContextTargetKind::Day => render_day_context(payload),
-        ContextTargetKind::Week | ContextTargetKind::Month | ContextTargetKind::Changed => {
-            render_window_context(payload)
-        }
-        ContextTargetKind::Note => render_note_context(payload),
         ContextTargetKind::Metric => render_metric_context(payload),
-        ContextTargetKind::Source => render_source_context(payload),
+        _ => {
+            println!(
+                "Context: {} {}",
+                render_target_kind(payload.summary.kind),
+                payload.summary.target
+            );
+            if let Some(label) = payload
+                .summary
+                .label
+                .as_deref()
+                .filter(|label| *label != payload.summary.target)
+            {
+                println!("{label}");
+            }
+
+            match payload.summary.kind {
+                ContextTargetKind::Day => render_day_context(payload),
+                ContextTargetKind::Week | ContextTargetKind::Month | ContextTargetKind::Changed => {
+                    render_window_context(payload)
+                }
+                ContextTargetKind::Note => render_note_context(payload),
+                ContextTargetKind::Source => render_source_context(payload),
+                ContextTargetKind::Metric => unreachable!("metric contexts are handled above"),
+            }
+        }
     }
 
     render_attention(payload);
@@ -530,7 +542,49 @@ fn render_note_context(payload: &ContextPayload) {
     }
 }
 
+fn normalized_metric_range(range: Option<&str>) -> Option<&str> {
+    range.map(str::trim).filter(|range| !range.is_empty())
+}
+
+fn metric_summary_line(label: Option<&str>, range: Option<&str>) -> Option<String> {
+    label.map(|label| match normalized_metric_range(range) {
+        Some(range) => append_metric_range(label, range),
+        None => label.to_string(),
+    })
+}
+
+fn metric_context_header(target: &str, range: Option<&str>) -> String {
+    match normalized_metric_range(range) {
+        Some(range) => format!("Context: metric {target} (range: {range})"),
+        None => format!("Context: metric {target}"),
+    }
+}
+
+fn append_metric_range(label: &str, range: &str) -> String {
+    if label.ends_with(')') {
+        if let Some(open_index) = label.rfind(" (") {
+            let prefix = &label[..open_index];
+            let details = &label[open_index + 2..label.len() - 1];
+            return format!("{prefix} ({details}, range: {range})");
+        }
+    }
+
+    format!("{label} (range: {range})")
+}
+
 fn render_metric_context(payload: &ContextPayload) {
+    render_metric_context_with_range(payload, None);
+}
+
+fn render_metric_context_with_range(payload: &ContextPayload, metric_range: Option<&str>) {
+    println!(
+        "{}",
+        metric_context_header(&payload.summary.target, metric_range)
+    );
+    if let Some(label) = metric_summary_line(payload.summary.label.as_deref(), metric_range) {
+        println!("{label}");
+    }
+
     if !payload.activity.metrics.is_empty() {
         println!("\nLatest Records");
         for metric in &payload.activity.metrics {
@@ -694,4 +748,42 @@ fn print_attention_line(item: &ContextAttentionItem) {
         ));
     }
     println!("- {}:{} {}", item.kind, suffix, item.message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metric_context_header_includes_active_range() {
+        assert_eq!(
+            metric_context_header("nutrition.energy_intake", Some("past7d")),
+            "Context: metric nutrition.energy_intake (range: past7d)"
+        );
+        assert_eq!(
+            metric_context_header("nutrition.energy_intake", None),
+            "Context: metric nutrition.energy_intake"
+        );
+    }
+
+    #[test]
+    fn metric_summary_line_includes_active_range() {
+        assert_eq!(
+            metric_summary_line(Some("nutrition.energy_intake (10 records)"), Some("past7d"))
+                .as_deref(),
+            Some("nutrition.energy_intake (10 records, range: past7d)")
+        );
+        assert_eq!(
+            metric_summary_line(Some("nutrition.energy_intake (10 records)"), None).as_deref(),
+            Some("nutrition.energy_intake (10 records)")
+        );
+    }
+
+    #[test]
+    fn metric_summary_line_appends_range_when_label_has_no_record_suffix() {
+        assert_eq!(
+            metric_summary_line(Some("body.weight from withings"), Some("past7d")).as_deref(),
+            Some("body.weight from withings (range: past7d)")
+        );
+    }
 }

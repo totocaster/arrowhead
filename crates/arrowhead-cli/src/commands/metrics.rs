@@ -118,7 +118,7 @@ pub struct ReadArgs {
 /// Arguments for `arrowhead metrics search`.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct SearchArgs {
-    /// Search query supporting `key:`, `source:`, `file:`, `date:`, and `note:` filters.
+    /// Search query supporting `key:`, `source:`, `file:`, `note:`, and `date:` filters like `2026-04`, `2026-04-16`, `past7d`, or `2026-04-01..2026-04-30`.
     pub query: String,
     /// Maximum number of records or aggregate buckets to return.
     #[arg(long, default_value_t = 10)]

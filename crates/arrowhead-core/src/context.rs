@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
 
@@ -1380,6 +1380,7 @@ impl ContextService {
         Ok(results
             .into_iter()
             .filter(|result| !exclude_ids.contains(&result.note_id))
+            .filter(|result| !is_context_noise_search_result(result))
             .map(|result| note_item_from_search_result(result, Some(reason.to_string())))
             .collect())
     }
@@ -1550,6 +1551,7 @@ impl ContextService {
     ) -> Result<Vec<ContextLink>> {
         let mut note_ids = notes
             .iter()
+            .filter(|note| !is_context_noise_note_item(note))
             .map(|note| note.note_id.clone())
             .collect::<Vec<_>>();
         note_ids.sort();
@@ -2533,6 +2535,40 @@ fn note_contains_literal_phrase(note: &NoteRecord, phrase: &str) -> bool {
         .any(|window| window.join(" ") == needle)
 }
 
+fn is_context_noise_search_result(result: &SearchResult) -> bool {
+    result
+        .relative_path
+        .as_deref()
+        .map(Path::new)
+        .is_some_and(is_context_noise_path)
+        || is_context_noise_note_id(&result.note_id)
+}
+
+fn is_context_noise_note_item(note: &ContextNoteItem) -> bool {
+    note.relative_path
+        .as_deref()
+        .is_some_and(is_context_noise_path)
+        || is_context_noise_note_id(&note.note_id)
+}
+
+fn is_context_noise_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_context_noise_filename)
+}
+
+fn is_context_noise_filename(file_name: &str) -> bool {
+    ["AGENTS.md", "CLAUDE.md", "ARROWHEAD.md"]
+        .iter()
+        .any(|candidate| file_name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_context_noise_note_id(note_id: &str) -> bool {
+    ["AGENTS", "CLAUDE", "ARROWHEAD"]
+        .iter()
+        .any(|candidate| note_id.eq_ignore_ascii_case(candidate.trim()))
+}
+
 fn normalize_literal_phrase(value: &str) -> String {
     value
         .chars()
@@ -2728,6 +2764,41 @@ mod tests {
             .expect("upsert metrics");
     }
 
+    fn insert_note_fixture(
+        service: &ContextService,
+        note_id: &str,
+        title: Option<&str>,
+        body: &str,
+        created_at: Option<DateTime<Utc>>,
+        file_modified_at: DateTime<Utc>,
+    ) {
+        let note = build_note(
+            service.vault.as_ref(),
+            note_id,
+            title,
+            body,
+            created_at,
+            file_modified_at,
+        );
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract metadata");
+        let mut note_ids = service
+            .vault
+            .inventory_snapshot()
+            .expect("snapshot")
+            .entries()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<HashSet<_>>();
+        note_ids.insert(note.id.clone());
+        let resolved_links = make_resolved_links(&extraction, &note_ids);
+        service
+            .database
+            .upsert_note(&note, &extraction, &resolved_links, Utc::now())
+            .expect("upsert fixture note");
+    }
+
     #[tokio::test]
     async fn note_context_surfaces_related_metrics_and_notes() {
         let (_dir, service) = build_service();
@@ -2783,6 +2854,70 @@ mod tests {
                 .iter()
                 .any(|note| note.note_id == "Project Hub"),
             "expected textual note match"
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_context_applies_date_range_filter() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .metric("body.weight", Some("2026-04-15"), Some(5), Some(5))
+            .await
+            .expect("metric context");
+
+        assert_eq!(payload.summary.kind, ContextTargetKind::Metric);
+        assert_eq!(payload.summary.target, "body.weight");
+        assert_eq!(
+            payload.summary.label.as_deref(),
+            Some("body.weight (1 record)")
+        );
+        assert_eq!(payload.activity.metrics.len(), 1);
+        assert_eq!(
+            payload.activity.metrics[0].record.date,
+            Some(NaiveDate::from_ymd_opt(2026, 4, 15).expect("date"))
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_context_filters_convention_file_text_matches() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "AGENTS",
+            Some("AGENTS.md - Toto's Vault Operating Manual"),
+            "Known metric keys include body.weight and nutrition.energy_intake.",
+            Some(Utc::now() - chrono::Duration::hours(2)),
+            Utc::now() - chrono::Duration::hours(1),
+        );
+        insert_note_fixture(
+            &service,
+            "CLAUDE",
+            Some("CLAUDE.md - Toto's Vault Operating Manual"),
+            "Schema reference table: body.weight, nutrition.energy_intake, body.fat_pct.",
+            Some(Utc::now() - chrono::Duration::hours(2)),
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let payload = service
+            .metric("body.weight", None, Some(5), Some(5))
+            .await
+            .expect("metric context");
+
+        assert!(
+            payload
+                .related
+                .notes
+                .iter()
+                .all(|note| note.note_id != "AGENTS" && note.note_id != "CLAUDE"),
+            "expected convention files to be filtered from related notes"
+        );
+        assert!(
+            payload
+                .related
+                .notes
+                .iter()
+                .any(|note| note.note_id == "Project Hub"),
+            "expected contextual note matches to remain"
         );
     }
 
@@ -2907,6 +3042,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn changed_context_skips_convention_file_link_noise() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "AGENTS",
+            Some("AGENTS.md - Toto's Vault Operating Manual"),
+            "Examples: [[YYYY-MM-DD]] and [[wikilinks]] for agents.",
+            Some(Utc::now() - chrono::Duration::hours(3)),
+            Utc::now() - chrono::Duration::hours(1),
+        );
+        insert_note_fixture(
+            &service,
+            "CLAUDE",
+            Some("CLAUDE.md - Toto's Vault Operating Manual"),
+            "Examples: [[YYYY-MM-DD]] and [[wikilinks]] for Claude templates.",
+            Some(Utc::now() - chrono::Duration::hours(3)),
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let payload = service.changed(3, Some(5), Some(5)).await.expect("changed");
+
+        assert!(
+            payload.activity.links.iter().all(|link| {
+                !link.from.starts_with("note:AGENTS") && !link.from.starts_with("note:CLAUDE")
+            }),
+            "expected convention-file wikilink examples to be filtered from changed activity"
+        );
+    }
+
     #[test]
     fn literal_phrase_matching_avoids_stemmed_false_positives() {
         let mut metadata = MetadataMap::default();
@@ -2946,5 +3111,14 @@ mod tests {
             file_modified_at: Utc::now(),
             created_at: None,
         }
+    }
+
+    #[test]
+    fn context_noise_filters_match_agent_instruction_files() {
+        assert!(is_context_noise_filename("AGENTS.md"));
+        assert!(is_context_noise_filename("claude.md"));
+        assert!(is_context_noise_note_id("ARROWHEAD"));
+        assert!(!is_context_noise_filename("Project Hub.md"));
+        assert!(!is_context_noise_note_id("Project Hub"));
     }
 }
