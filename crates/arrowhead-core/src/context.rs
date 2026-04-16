@@ -1,7 +1,7 @@
 //! Context aggregation across notes, metrics, and sources.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -173,6 +173,21 @@ pub struct ContextMetricItem {
     /// Optional explanation for why the metric is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NoteMetricEvidenceKind {
+    Explicit,
+    Structural,
+    Inferred,
+}
+
+#[derive(Debug, Clone)]
+struct NoteMetricEvidence {
+    note: ContextNoteItem,
+    kind: NoteMetricEvidenceKind,
+    link_reason: String,
+    confidence: Option<f32>,
 }
 
 /// Historical section of a context payload.
@@ -493,91 +508,60 @@ impl ContextService {
         }
 
         let exact_record = self.metrics.read_record(target).await?;
-        let (mut metrics, target_value, label, note_terms, record_target) =
-            if let Some(record) = exact_record {
-                let mut records = self
-                    .metrics
-                    .search(
-                        &build_metrics_field_query("key", &record.record.key, range),
-                        Some(metric_limit),
-                    )
-                    .await?;
-                prepend_metric_record(&mut records, record.clone());
-                (
-                    records,
-                    format!("metric:{}", record.record.id),
-                    Some(format!(
-                        "{} from {}",
-                        record.record.key, record.record.source
-                    )),
-                    vec![
-                        format!("metric:{}", record.record.id),
-                        record.record.key.clone(),
-                    ],
-                    Some(record.record.id.clone()),
+        let (mut metrics, target_value, label) = if let Some(record) = exact_record {
+            let mut records = self
+                .metrics
+                .search(
+                    &build_metrics_field_query("key", &record.record.key, range),
+                    Some(metric_limit),
                 )
-            } else {
-                if target.starts_with("metric:") {
-                    bail!("metric {target} was not found in the index");
-                }
-                let records = self
-                    .metrics
-                    .search(
-                        &build_metrics_field_query("key", target, range),
-                        Some(metric_limit),
-                    )
-                    .await?;
-                if records.is_empty() {
-                    bail!("metric key `{target}` was not found in the index");
-                }
-                let record_count = records.len();
-                (
-                    records,
-                    target.to_string(),
-                    Some(format!(
-                        "{} ({} record{})",
-                        target,
-                        record_count,
-                        if record_count == 1 { "" } else { "s" }
-                    )),
-                    vec![target.to_string()],
-                    None,
+                .await?;
+            prepend_metric_record(&mut records, record.clone());
+            (
+                records,
+                format!("metric:{}", record.record.id),
+                Some(format!(
+                    "{} from {}",
+                    record.record.key, record.record.source
+                )),
+            )
+        } else {
+            if target.starts_with("metric:") {
+                bail!("metric {target} was not found in the index");
+            }
+            let records = self
+                .metrics
+                .search(
+                    &build_metrics_field_query("key", target, range),
+                    Some(metric_limit),
                 )
-            };
+                .await?;
+            if records.is_empty() {
+                bail!("metric key `{target}` was not found in the index");
+            }
+            let record_count = records.len();
+            (
+                records,
+                target.to_string(),
+                Some(format!(
+                    "{} ({} record{})",
+                    target,
+                    record_count,
+                    if record_count == 1 { "" } else { "s" }
+                )),
+            )
+        };
 
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
-        let mut related_notes = Vec::new();
-        let mut seen_note_ids = HashSet::new();
-        for term in &note_terms {
-            let reason = if term.starts_with("metric:") {
-                "Explicit metric reference"
-            } else {
-                "Note text matches metric key"
-            };
-            let search_results = self
-                .search_notes_by_phrase(term, note_limit * 2, &seen_note_ids, reason)
-                .await?;
-            merge_note_items(
-                &mut related_notes,
-                search_results,
-                note_limit,
-                &mut seen_note_ids,
-            );
-            if related_notes.len() >= note_limit {
-                break;
-            }
-        }
-        let date_notes = self
-            .note_items_for_metric_dates(&metrics, "Same day as metric activity")
+        let note_evidence = self
+            .metric_note_evidence(&target_value, &metrics, note_limit)
             .await?;
-        merge_note_items(
-            &mut related_notes,
-            date_notes,
-            note_limit,
-            &mut seen_note_ids,
-        );
+        let related_notes = note_evidence
+            .iter()
+            .map(|evidence| evidence.note.clone())
+            .collect::<Vec<_>>();
 
         let mut links = Vec::new();
         for record in &metrics {
@@ -589,21 +573,13 @@ impl ContextService {
                 confidence: None,
             });
         }
-        for note in &related_notes {
-            let kind = if record_target.is_some() {
-                ContextLinkKind::Explicit
-            } else {
-                ContextLinkKind::Related
-            };
+        for evidence in &note_evidence {
             links.push(ContextLink {
-                kind,
-                from: format!("note:{}", note.note_id),
+                kind: note_metric_evidence_link_kind(evidence.kind),
+                from: format!("note:{}", evidence.note.note_id),
                 to: target_value.clone(),
-                reason: note
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "Related note".to_string()),
-                confidence: None,
+                reason: evidence.link_reason.clone(),
+                confidence: evidence.confidence,
             });
         }
 
@@ -1569,6 +1545,102 @@ impl ContextService {
         Ok(links)
     }
 
+    async fn metric_note_evidence(
+        &self,
+        metric_target: &str,
+        metric_records: &[MetricRecordEntry],
+        note_limit: usize,
+    ) -> Result<Vec<NoteMetricEvidence>> {
+        if metric_records.is_empty() || note_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let metric_key = metric_records
+            .first()
+            .map(|record| record.record.key.clone())
+            .unwrap_or_else(|| metric_target.to_string());
+        let explicit_terms = metric_records
+            .iter()
+            .map(|record| format!("metric:{}", record.record.id))
+            .collect::<BTreeSet<_>>();
+
+        let mut evidence_by_note = HashMap::new();
+        let empty_excludes = HashSet::new();
+
+        for term in explicit_terms {
+            let results = self
+                .search_notes_by_phrase(
+                    &term,
+                    note_limit.saturating_mul(3).max(1),
+                    &empty_excludes,
+                    "Explicit metric reference",
+                )
+                .await?;
+            for note in results {
+                let reason = format!("Note explicitly references matching metric record `{term}`");
+                upsert_note_metric_evidence(
+                    &mut evidence_by_note,
+                    NoteMetricEvidence {
+                        note,
+                        kind: NoteMetricEvidenceKind::Explicit,
+                        link_reason: reason,
+                        confidence: None,
+                    },
+                );
+            }
+        }
+
+        let date_notes = self
+            .note_items_for_metric_dates(metric_records, "Same day as metric activity")
+            .await?;
+        for note in date_notes {
+            let reason = note
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Same day as metric activity".to_string());
+            upsert_note_metric_evidence(
+                &mut evidence_by_note,
+                NoteMetricEvidence {
+                    note,
+                    kind: NoteMetricEvidenceKind::Structural,
+                    link_reason: reason,
+                    confidence: None,
+                },
+            );
+        }
+
+        let text_matches = self
+            .search_notes_by_literal_phrase(
+                &metric_key,
+                note_limit.saturating_mul(4).max(1),
+                &empty_excludes,
+                "Note text matches metric key",
+            )
+            .await?;
+        for note in text_matches {
+            let reason = note
+                .reason
+                .clone()
+                .unwrap_or_else(|| "Note text matches metric key".to_string());
+            upsert_note_metric_evidence(
+                &mut evidence_by_note,
+                NoteMetricEvidence {
+                    note,
+                    kind: NoteMetricEvidenceKind::Inferred,
+                    link_reason: reason,
+                    confidence: Some(0.35),
+                },
+            );
+        }
+
+        let mut evidence = evidence_by_note.into_values().collect::<Vec<_>>();
+        sort_note_metric_evidence(&mut evidence);
+        if evidence.len() > note_limit {
+            evidence.truncate(note_limit);
+        }
+        Ok(evidence)
+    }
+
     async fn related_metric_items_for_records(
         &self,
         records: &[MetricRecordEntry],
@@ -1929,6 +2001,11 @@ fn indexed_notes_to_context_items(
 ) -> Result<Vec<ContextNoteItem>> {
     let mut items = Vec::new();
     for entry in entries {
+        if is_context_noise_path(Path::new(&entry.relative_path))
+            || is_context_noise_note_id(&entry.id)
+        {
+            continue;
+        }
         items.push(ContextNoteItem {
             note_id: entry.id.clone(),
             title: entry.title.clone(),
@@ -2311,6 +2388,42 @@ fn merge_note_items(
         if seen.insert(item.note_id.clone()) {
             target.push(item);
         }
+    }
+}
+
+fn upsert_note_metric_evidence(
+    target: &mut HashMap<String, NoteMetricEvidence>,
+    incoming: NoteMetricEvidence,
+) {
+    match target.get_mut(&incoming.note.note_id) {
+        Some(existing) => {
+            let incoming_is_stronger = incoming.kind < existing.kind
+                || (incoming.kind == existing.kind
+                    && incoming.note.file_modified_at > existing.note.file_modified_at);
+            if incoming_is_stronger {
+                *existing = incoming;
+            }
+        }
+        None => {
+            target.insert(incoming.note.note_id.clone(), incoming);
+        }
+    }
+}
+
+fn sort_note_metric_evidence(evidence: &mut [NoteMetricEvidence]) {
+    evidence.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| right.note.file_modified_at.cmp(&left.note.file_modified_at))
+            .then_with(|| left.note.note_id.cmp(&right.note.note_id))
+    });
+}
+
+fn note_metric_evidence_link_kind(kind: NoteMetricEvidenceKind) -> ContextLinkKind {
+    match kind {
+        NoteMetricEvidenceKind::Explicit => ContextLinkKind::Explicit,
+        NoteMetricEvidenceKind::Structural => ContextLinkKind::Structural,
+        NoteMetricEvidenceKind::Inferred => ContextLinkKind::Related,
     }
 }
 
@@ -2858,6 +2971,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metric_context_prefers_explicit_and_structural_note_evidence() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Weight Lexicon",
+            Some("Weight Lexicon"),
+            "body.weight is one of the health metrics tracked in this vault.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+
+        let payload = service
+            .metric("body.weight", None, Some(6), Some(5))
+            .await
+            .expect("metric context");
+
+        let note_ids = payload
+            .related
+            .notes
+            .iter()
+            .map(|note| note.note_id.as_str())
+            .collect::<Vec<_>>();
+        let project_position = note_ids
+            .iter()
+            .position(|note_id| *note_id == "Project Hub")
+            .expect("explicit note present");
+        let daily_note_position = note_ids
+            .iter()
+            .position(|note_id| *note_id == "2026-04-14")
+            .expect("same-day note present");
+        let glossary_position = note_ids
+            .iter()
+            .position(|note_id| *note_id == "Weight Lexicon")
+            .expect("inferred note present");
+
+        assert!(
+            project_position < glossary_position,
+            "expected explicit note evidence to outrank inferred text matches"
+        );
+        assert!(
+            daily_note_position < glossary_position,
+            "expected structural same-day note evidence to outrank inferred text matches"
+        );
+        assert_eq!(
+            payload
+                .links
+                .items
+                .iter()
+                .find(|link| link.from == "note:Project Hub" && link.to == "body.weight")
+                .map(|link| link.kind),
+            Some(ContextLinkKind::Explicit),
+            "expected explicit note links to be classified explicitly"
+        );
+    }
+
+    #[tokio::test]
     async fn metric_context_applies_date_range_filter() {
         let (_dir, service) = build_service();
         let payload = service
@@ -3024,6 +3193,39 @@ mod tests {
                 .iter()
                 .any(|day| day == "2026-04-14" || day == "2026-04-15"),
             "expected active days inside requested month"
+        );
+    }
+
+    #[tokio::test]
+    async fn month_context_filters_convention_file_activity_noise() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "AGENTS",
+            Some("AGENTS.md - Toto's Vault Operating Manual"),
+            "Operating instructions for the vault.",
+            Some(ts(2026, 4, 14, 18, 19)),
+            ts(2026, 4, 14, 18, 20),
+        );
+
+        let payload = service
+            .month(
+                MonthContextSelector::ContainingDay(
+                    NaiveDate::from_ymd_opt(2026, 4, 14).expect("date"),
+                ),
+                Some(10),
+                Some(5),
+            )
+            .await
+            .expect("month context");
+
+        assert!(
+            payload
+                .activity
+                .notes_created
+                .iter()
+                .all(|note| note.note_id != "AGENTS"),
+            "expected convention-file noise to be filtered from month note activity"
         );
     }
 

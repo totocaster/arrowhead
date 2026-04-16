@@ -17,8 +17,8 @@ use tokio::task;
 use tracing::debug;
 
 use arrowhead_core::{
-    MetadataMap, MetricCreateRequest, MetricUpdateRequest, NoteRecord, PatchValue, Vault,
-    WeekContextSelector,
+    MetadataMap, MetricCreateRequest, MetricUpdateRequest, MonthContextSelector, NoteRecord,
+    PatchValue, Vault, WeekContextSelector,
     status::{ActivityState, ActivityStatus, DaemonStatus},
 };
 
@@ -27,11 +27,11 @@ use crate::{
     runtime::McpRuntime,
     tools::{
         CallToolParams, CallToolResultPayload, ContextChangedParams, ContextDayParams,
-        ContextMetricParams, ContextNoteParams, ContextSourceParams, ContextWeekParams,
-        DaemonStatusPayload, GraphContextPayload, GraphLinksPayload, GraphNoteParams,
-        GraphOrphansPayload, GraphUnresolvedPayload, ImplementationDescriptor, InitializeParams,
-        InitializeResultPayload, LinkEdgePayload, MetricCreateParams, MetricDeleteParams,
-        MetricDeletePayload, MetricFileCreateParams, MetricFileCreatePayload,
+        ContextMetricParams, ContextMonthParams, ContextNoteParams, ContextSourceParams,
+        ContextWeekParams, DaemonStatusPayload, GraphContextPayload, GraphLinksPayload,
+        GraphNoteParams, GraphOrphansPayload, GraphUnresolvedPayload, ImplementationDescriptor,
+        InitializeParams, InitializeResultPayload, LinkEdgePayload, MetricCreateParams,
+        MetricDeleteParams, MetricDeletePayload, MetricFileCreateParams, MetricFileCreatePayload,
         MetricFileDeleteParams, MetricFileDeletePayload, MetricFileRenameParams,
         MetricFileRenamePayload, MetricReadParams, MetricReadPayload, MetricUpdateParams,
         MetricsFilesPayload, MetricsSearchResultsPayload, NoteContentPayload, NoteCreateParams,
@@ -229,6 +229,23 @@ impl HandlerRegistry {
             .context_service()
             .week(
                 resolve_week_selector(&params)?,
+                params.note_limit,
+                params.metric_limit,
+            )
+            .await
+            .map_err(map_context_error)?;
+        serde_json::to_value(payload).map_err(|err| {
+            ProtocolError::internal(format!("failed to serialise context payload: {err}"))
+        })
+    }
+
+    async fn handle_context_month(&self, request: Request) -> Result<Value, ProtocolError> {
+        let params: ContextMonthParams = request.params.deserialize()?;
+        let payload = self
+            .runtime
+            .context_service()
+            .month(
+                resolve_month_selector(&params)?,
                 params.note_limit,
                 params.metric_limit,
             )
@@ -907,6 +924,7 @@ impl HandlerRegistry {
             }
             "context_get_day"
             | "context_get_week"
+            | "context_get_month"
             | "context_get_changed"
             | "context_get_note"
             | "context_get_metric"
@@ -953,6 +971,7 @@ impl HandlerRegistry {
             "mcp.graph.find_unresolved" => self.handle_graph_unresolved().await,
             "mcp.context.get_day" => self.handle_context_day(request).await,
             "mcp.context.get_week" => self.handle_context_week(request).await,
+            "mcp.context.get_month" => self.handle_context_month(request).await,
             "mcp.context.get_changed" => self.handle_context_changed(request).await,
             "mcp.context.get_note" => self.handle_context_note(request).await,
             "mcp.context.get_metric" => self.handle_context_metric(request).await,
@@ -1303,6 +1322,37 @@ impl HandlerRegistry {
                     "type": "boolean",
                     "default": false,
                     "description": "When true, inspect the previous week."
+                },
+                "noteLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for related notes."
+                },
+                "metricLimit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional limit for metric records."
+                }
+            }
+        });
+        let context_month_schema = json!({
+            "type": "object",
+            "description": "Parameters for building month context.",
+            "additionalProperties": false,
+            "properties": {
+                "day": {
+                    "type": "string",
+                    "description": "Optional day inside the requested month in YYYY-MM-DD format."
+                },
+                "this": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, inspect the current month."
+                },
+                "last": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, inspect the previous month."
                 },
                 "noteLimit": {
                     "type": "integer",
@@ -2559,6 +2609,17 @@ impl HandlerRegistry {
                 annotations: Some(json!({ "method": "mcp.context.get_week" })),
             },
             ToolDescriptor {
+                name: "context_get_month".to_string(),
+                title: Some("Context: Month".to_string()),
+                description: Some(
+                    "Build a context payload around a calendar month."
+                        .to_string(),
+                ),
+                input_schema: context_month_schema,
+                output_schema: Some(context_payload_schema.clone()),
+                annotations: Some(json!({ "method": "mcp.context.get_month" })),
+            },
+            ToolDescriptor {
                 name: "context_get_changed".to_string(),
                 title: Some("Context: Changed".to_string()),
                 description: Some(
@@ -2940,6 +3001,7 @@ fn resolve_tool_method(name: &str) -> Option<&'static str> {
         "graph_find_unresolved" => Some("mcp.graph.find_unresolved"),
         "context_get_day" => Some("mcp.context.get_day"),
         "context_get_week" => Some("mcp.context.get_week"),
+        "context_get_month" => Some("mcp.context.get_month"),
         "context_get_changed" => Some("mcp.context.get_changed"),
         "context_get_note" => Some("mcp.context.get_note"),
         "context_get_metric" => Some("mcp.context.get_metric"),
@@ -2986,6 +3048,31 @@ fn resolve_week_selector(params: &ContextWeekParams) -> Result<WeekContextSelect
         return Ok(WeekContextSelector::ContainingDay(parsed));
     }
     Ok(WeekContextSelector::ThisWeek)
+}
+
+fn resolve_month_selector(
+    params: &ContextMonthParams,
+) -> Result<MonthContextSelector, ProtocolError> {
+    if params.this && params.last {
+        return Err(ProtocolError::invalid_params(
+            "`this` and `last` cannot both be true for month context",
+        ));
+    }
+    if params.day.is_some() && (params.this || params.last) {
+        return Err(ProtocolError::invalid_params(
+            "`day` cannot be combined with `this` or `last` for month context",
+        ));
+    }
+    if params.last {
+        return Ok(MonthContextSelector::LastMonth);
+    }
+    if let Some(day) = params.day.as_deref() {
+        let parsed = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d").map_err(|err| {
+            ProtocolError::invalid_params(format!("invalid month day `{}`: {err}", day.trim()))
+        })?;
+        return Ok(MonthContextSelector::ContainingDay(parsed));
+    }
+    Ok(MonthContextSelector::ThisMonth)
 }
 
 #[derive(Debug, Clone, Copy)]

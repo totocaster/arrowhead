@@ -15,9 +15,9 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics indexing model | In progress | Metrics conventions resolution, parser/validator coverage, SQLite persistence, core indexing refresh, and read/search surfaces are now wired; mutation indexing is now refreshed directly after record writes. |
 | Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
-| Context command family | Accepted | `context day|week|changed|note|metric|source` are now wired in CLI/MCP, human output is now lead-first instead of count-first, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
-| Proactive linking | Proposed | Explicit and inferred links should be surfaced with reasons. |
-| Implementation | In progress | Round 1 through file-level CLI/MCP metrics CRUD plus full time-window and entity context are now landing; CLI compatibility aliasing is in, while proactive linking and MCP discovery consolidation are still pending. |
+| Context command family | Accepted | `context day|week|month|changed|note|metric|source` are now wired in CLI/MCP, human output is now lead-first instead of count-first, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
+| Proactive linking | In progress | Metric context now has a first internal evidence pass that ranks explicit metric refs above same-day structural ties above inferred key-text matches; broader inferred-link confidence work is still pending. |
+| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, and the first evidence-driven metric ranking slice are now in; broader proactive linking and MCP discovery consolidation are still pending. |
 
 ## Accepted Decisions
 
@@ -430,6 +430,7 @@ arrowhead context source withings --range past-30-days
 
 - `mcp.context.get_day`
 - `mcp.context.get_week`
+- `mcp.context.get_month`
 - `mcp.context.get_changed`
 - `mcp.context.get_note`
 - `mcp.context.get_metric`
@@ -627,8 +628,8 @@ This should complement the existing Metrics plugin, not compete with it.
 
 ### Phase 4: Context surfaces
 
-- implement day, week, changed, note, metric, and source context
-- `note`, `metric`, and `source` are now wired in CLI and MCP
+- implement day, week, month, changed, note, metric, and source context
+- all context time windows and entity views are now wired in CLI and MCP
 - define stable JSON payloads
 - add human-readable CLI renderers
 - fold existing note-context and related-notes behaviors into the new context
@@ -646,7 +647,9 @@ This should complement the existing Metrics plugin, not compete with it.
 ### Phase 5: Proactive linking
 
 - detect explicit note-to-metric references
+  - first metric-context ranking pass now uses explicit metric refs before weaker signals
 - add structural and inferred link generation
+  - same-day structural note evidence now outranks loose metric-key text matches in metric context
 - expose reasons and confidence in CLI and MCP
 
 ### Phase 6: Polish and hardening

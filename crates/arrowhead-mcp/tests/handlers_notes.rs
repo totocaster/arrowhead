@@ -724,6 +724,37 @@ async fn context_get_week_accepts_anchor_day() {
 }
 
 #[tokio::test]
+async fn context_get_month_accepts_anchor_day() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let handler = build_handler_with_context(&temp_dir).await;
+
+    let structured = call_tool_structured(
+        &handler,
+        "context_get_month",
+        json!({ "day": "2026-04-14" }),
+    )
+    .await;
+
+    assert_eq!(
+        structured
+            .get("summary")
+            .and_then(Value::as_object)
+            .and_then(|summary| summary.get("kind"))
+            .and_then(Value::as_str),
+        Some("month")
+    );
+    assert!(
+        structured
+            .get("related")
+            .and_then(Value::as_object)
+            .and_then(|related| related.get("days"))
+            .and_then(Value::as_array)
+            .is_some_and(|days| days.iter().any(|day| day.as_str() == Some("2026-04-14"))),
+        "expected month context related days"
+    );
+}
+
+#[tokio::test]
 async fn context_get_changed_returns_recent_activity() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let handler = build_handler_with_context(&temp_dir).await;
@@ -1365,6 +1396,12 @@ async fn protocol_tools_list_contains_metrics_and_note_tools() {
             .iter()
             .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_week")),
         "tool list should include context_get_week"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some("context_get_month")),
+        "tool list should include context_get_month"
     );
     assert!(
         tools

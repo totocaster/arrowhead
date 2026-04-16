@@ -296,6 +296,24 @@ pub struct ContextWeekParams {
     pub metric_limit: Option<usize>,
 }
 
+/// Parameters for `mcp.context.get_month`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextMonthParams {
+    /// Optional day inside the month to inspect in YYYY-MM-DD format.
+    pub day: Option<String>,
+    /// Inspect the current month.
+    #[serde(default)]
+    pub this: bool,
+    /// Inspect the previous month.
+    #[serde(default)]
+    pub last: bool,
+    /// Optional limit for related notes.
+    pub note_limit: Option<usize>,
+    /// Optional limit for metric records.
+    pub metric_limit: Option<usize>,
+}
+
 /// Parameters for `mcp.context.get_changed`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
