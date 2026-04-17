@@ -1569,6 +1569,48 @@ impl ContextService {
             .collect())
     }
 
+    async fn search_notes_by_exact_metric_key(
+        &self,
+        metric_key: &str,
+        limit: usize,
+        exclude_ids: &HashSet<String>,
+        reason: &str,
+    ) -> Result<Vec<ContextNoteItem>> {
+        let candidates = self
+            .search_notes_by_phrase(metric_key, limit.max(1) * 4, exclude_ids, reason)
+            .await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let vault = Arc::clone(&self.vault);
+        let note_ids = candidates
+            .iter()
+            .map(|item| item.note_id.clone())
+            .collect::<Vec<_>>();
+        let metric_key = metric_key.to_ascii_lowercase();
+        let matching_ids = task::spawn_blocking(move || -> HashSet<String> {
+            let mut matches = HashSet::new();
+            for note_id in note_ids {
+                let Ok(note) = vault.load_note(&note_id) else {
+                    continue;
+                };
+                if extract_metric_key_mentions(&note).contains(&metric_key) {
+                    matches.insert(note_id);
+                }
+            }
+            matches
+        })
+        .await
+        .context("metric-key note match task aborted")?;
+
+        Ok(candidates
+            .into_iter()
+            .filter(|item| matching_ids.contains(&item.note_id))
+            .take(limit.max(1))
+            .collect())
+    }
+
     async fn note_items_for_dates(
         &self,
         dates: &BTreeSet<NaiveDate>,
@@ -1758,6 +1800,27 @@ impl ContextService {
             }
         }
 
+        let explicit_key_reason = format!("Note explicitly mentions metric key `{metric_key}`");
+        let exact_key_mentions = self
+            .search_notes_by_exact_metric_key(
+                &metric_key,
+                note_limit.saturating_mul(4).max(1),
+                &empty_excludes,
+                "Exact metric key mention",
+            )
+            .await?;
+        for note in exact_key_mentions {
+            upsert_note_metric_evidence(
+                &mut evidence_by_note,
+                NoteMetricEvidence {
+                    note,
+                    kind: ContextEvidenceKind::Explicit,
+                    link_reason: explicit_key_reason.clone(),
+                    confidence: None,
+                },
+            );
+        }
+
         let date_notes = self
             .note_items_for_metric_dates(metric_records, "Same day as metric activity")
             .await?;
@@ -1877,7 +1940,7 @@ impl ContextService {
             .collect::<BTreeSet<_>>();
         for metric_key in metric_keys {
             let text_matches = self
-                .search_notes_by_literal_phrase(
+                .search_notes_by_exact_metric_key(
                     &metric_key,
                     note_limit.saturating_mul(3).max(1),
                     &empty_excludes,
@@ -1969,6 +2032,7 @@ impl ContextService {
         }
 
         let mut evidence_by_metric = HashMap::new();
+        let mentioned_metric_keys = extract_metric_key_mentions(note);
         for metric_id in explicit_metric_ids {
             if let Some(record) = self.metrics.read_record(metric_id).await? {
                 upsert_metric_record_evidence(
@@ -1983,24 +2047,53 @@ impl ContextService {
             }
         }
 
-        for date in note_dates {
-            let results = self
-                .metrics
-                .search(
-                    &format!("date:{date}"),
-                    Some(metric_limit.saturating_mul(2).max(1)),
-                )
-                .await?;
-            for record in results {
-                upsert_metric_record_evidence(
-                    &mut evidence_by_metric,
-                    MetricRecordEvidence {
-                        record,
-                        kind: ContextEvidenceKind::Structural,
-                        link_reason: format!("Note references day {date} with recorded metrics"),
-                        confidence: None,
-                    },
-                );
+        if mentioned_metric_keys.is_empty() {
+            for date in note_dates {
+                let results = self
+                    .metrics
+                    .search(
+                        &format!("date:{date}"),
+                        Some(metric_limit.saturating_mul(2).max(1)),
+                    )
+                    .await?;
+                for record in results {
+                    upsert_metric_record_evidence(
+                        &mut evidence_by_metric,
+                        MetricRecordEvidence {
+                            record,
+                            kind: ContextEvidenceKind::Structural,
+                            link_reason: format!(
+                                "Note references day {date} with recorded metrics"
+                            ),
+                            confidence: None,
+                        },
+                    );
+                }
+            }
+        } else {
+            for date in note_dates {
+                for metric_key in &mentioned_metric_keys {
+                    let results = self
+                        .metrics
+                        .search(
+                            &build_metrics_field_query("key", metric_key, Some(&date.to_string())),
+                            Some(metric_limit.saturating_mul(2).max(1)),
+                        )
+                        .await?;
+                    for record in results {
+                        upsert_metric_record_evidence(
+                            &mut evidence_by_metric,
+                            MetricRecordEvidence {
+                                record,
+                                kind: ContextEvidenceKind::Structural,
+                                link_reason: format!(
+                                    "Note references day {date} and metric key `{metric_key}`"
+                                ),
+                                confidence: None,
+                            },
+                        );
+                    }
+                }
             }
         }
 
@@ -2009,7 +2102,7 @@ impl ContextService {
             .filter(|evidence| evidence.kind != ContextEvidenceKind::Inferred)
             .map(|evidence| evidence.record.record.key.clone())
             .collect::<HashSet<_>>();
-        for metric_key in extract_metric_key_mentions(note) {
+        for metric_key in mentioned_metric_keys {
             if stronger_keys.contains(&metric_key) {
                 continue;
             }
@@ -2030,8 +2123,10 @@ impl ContextService {
                     MetricRecordEvidence {
                         record,
                         kind: ContextEvidenceKind::Inferred,
-                        link_reason: format!("Note text mentions metric key `{metric_key}`"),
-                        confidence: Some(0.35),
+                        link_reason: format!(
+                            "Note explicitly mentions metric key `{metric_key}`; latest matching record"
+                        ),
+                        confidence: Some(0.45),
                     },
                 );
             }
@@ -3900,6 +3995,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn note_context_scopes_day_metrics_to_explicit_key_mentions() {
+        let (_dir, service) = build_service();
+        insert_metric_rows(
+            &service,
+            "Metrics/Whoop.metrics.ndjson",
+            &[
+                r#"{"id":"01AAC","ts":"2026-04-15T08:45:00+00:00","date":"2026-04-15","key":"sleep.duration","value":7.4,"unit":"h","source":"whoop"}"#,
+            ],
+        );
+        insert_note_fixture(
+            &service,
+            "Weight Review",
+            Some("Weight Review"),
+            "Compare [[2026-04-15]] against the latest body.weight trend.",
+            Some(ts(2026, 4, 16, 7, 0)),
+            ts(2026, 4, 16, 7, 30),
+        );
+
+        let payload = service
+            .note("Weight Review", Some(5), Some(10))
+            .await
+            .expect("note context");
+
+        assert!(
+            payload
+                .activity
+                .metrics
+                .iter()
+                .any(|metric| metric.record.key == "body.weight"),
+            "expected same-day body.weight metric to remain present"
+        );
+        assert!(
+            payload
+                .activity
+                .metrics
+                .iter()
+                .all(|metric| metric.record.key != "sleep.duration"),
+            "expected unrelated same-day metrics to be excluded once the note names a specific key"
+        );
+        assert!(
+            payload.related.metrics.iter().any(|metric| {
+                metric.key == "body.weight"
+                    && metric.reason.as_deref()
+                        == Some("Note references day 2026-04-15 and metric key `body.weight`")
+            }),
+            "expected key-scoped structural reason for note metric leads"
+        );
+    }
+
+    #[tokio::test]
     async fn note_context_surfaces_inferred_metric_key_evidence() {
         let (_dir, service) = build_service();
         insert_note_fixture(
@@ -4037,8 +4182,8 @@ mod tests {
             "expected structural same-day note evidence to remain present"
         );
         assert!(
-            note_ids.iter().all(|note_id| *note_id != "Weight Lexicon"),
-            "expected weaker inferred metric-key notes to drop once stronger leads exist"
+            note_ids.iter().any(|note_id| *note_id == "Weight Lexicon"),
+            "expected exact metric-key notes to surface as explicit evidence"
         );
         assert_eq!(
             payload
@@ -4050,10 +4195,20 @@ mod tests {
             Some(ContextLinkKind::Explicit),
             "expected explicit note links to be classified explicitly"
         );
+        assert_eq!(
+            payload
+                .related
+                .notes
+                .iter()
+                .find(|note| note.note_id == "Weight Lexicon")
+                .and_then(|note| note.evidence_kind),
+            Some(ContextEvidenceKind::Explicit),
+            "expected exact metric-key note matches to be classified explicitly"
+        );
     }
 
     #[tokio::test]
-    async fn metric_context_prunes_extra_inferred_notes_when_strong_leads_exist() {
+    async fn metric_context_limits_inferred_metric_key_notes_when_strong_leads_exist() {
         let (_dir, service) = build_service();
         insert_note_fixture(
             &service,
@@ -4089,7 +4244,10 @@ mod tests {
             .related
             .notes
             .iter()
-            .filter(|note| note.reason.as_deref() == Some("Note text matches metric key"))
+            .filter(|note| {
+                note.reason.as_deref() == Some("Note text matches metric key")
+                    && note.evidence_kind == Some(ContextEvidenceKind::Inferred)
+            })
             .count();
         assert_eq!(
             inferred_notes, 0,
