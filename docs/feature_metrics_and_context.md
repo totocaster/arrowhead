@@ -7,7 +7,7 @@ metrics data and richer context retrieval across notes, days, and metrics.
 
 > **Status:** In progress.
 >
-> **Last updated:** 2026-04-16
+> **Last updated:** 2026-04-17
 
 | Area | Status | Notes |
 | --- | --- | --- |
@@ -16,8 +16,8 @@ metrics data and richer context retrieval across notes, days, and metrics.
 | Metrics CLI CRUD | Accepted | Record-level CRUD, `metrics files create|rename|delete`, and `metrics assign-missing-ids` are now wired alongside `metrics files`, `metrics read`, and `metrics search`. |
 | Metrics MCP CRUD | Accepted | File-level `mcp.metrics.create_file|rename_file|delete_file` now join the read-only and record-level metrics tools. |
 | Context command family | Accepted | `context day|week|month|changed|note|metric|source` are now wired in CLI/MCP, human output is now lead-first instead of count-first, and CLI compatibility aliases now route `graph context` plus `notes similar|surprise` onto the shared context model. |
-| Proactive linking | In progress | Metric, note, and source context now share an internal evidence model that prefers explicit refs or source mentions, then structural day alignment, then inferred key-text matches; day context also emits explicit day↔note and day↔metric relationships, and inferred note tails are now capped once stronger leads exist. Broader inferred-link confidence work is still pending. |
-| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, the first shared evidence-driven linking slice across note/metric/source, and rollup-driven trend leads in metric/month/source/week/changed context are now in; broader proactive linking and MCP discovery consolidation are still pending. |
+| Proactive linking | In progress | Metric, note, and source context now share an internal evidence model that prefers explicit refs or source mentions, then structural day alignment, then inferred key-text matches; day context also emits explicit day↔note and day↔metric relationships, inferred note tails are now capped once stronger leads exist, and CLI/MCP payloads now expose evidence kind plus inferred confidence on leads and pivots. Broader inferred-link confidence work is still pending. |
+| Implementation | In progress | Metrics CRUD, rollups, note/context filters, full time-window and entity context, the first shared evidence-driven linking slice across note/metric/source, rollup-driven trend leads in metric/month/source/week/changed context, and public evidence metadata on context leads/pivots are now in; broader proactive linking and MCP discovery consolidation are still pending. |
 
 ## Accepted Decisions
 
@@ -659,7 +659,8 @@ This should complement the existing Metrics plugin, not compete with it.
   - `context metric` now surfaces daily trend rollups for the target metric
   - `context month` now surfaces top source-specific metric trends plus aggregate follow-up pivots
   - `context source`, `context week`, and `context changed` now surface matching trend rollups plus aggregate pivots
-- expose reasons and confidence in CLI and MCP
+- expose evidence kind, reasons, and confidence in CLI and MCP
+  - leads and pivots now expose evidence kind/confidence in JSON and MCP payloads
 
 ### Phase 6: Polish and hardening
 

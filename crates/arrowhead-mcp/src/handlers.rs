@@ -1815,7 +1815,12 @@ impl HandlerRegistry {
                 "fileModifiedAt": date_time_schema("Optional note file modification timestamp."),
                 "createdAt": date_time_schema("Optional note file creation timestamp."),
                 "preview": { "type": "string" },
-                "reason": { "type": "string" }
+                "reason": { "type": "string" },
+                "evidenceKind": {
+                    "type": "string",
+                    "enum": ["explicit", "structural", "inferred"]
+                },
+                "confidence": { "type": "number" }
             },
             "additionalProperties": false
         });
@@ -1834,7 +1839,12 @@ impl HandlerRegistry {
                     "description": "Optional metric date in YYYY-MM-DD format."
                 },
                 "ts": date_time_schema("Metric timestamp."),
-                "reason": { "type": "string" }
+                "reason": { "type": "string" },
+                "evidenceKind": {
+                    "type": "string",
+                    "enum": ["explicit", "structural", "inferred"]
+                },
+                "confidence": { "type": "number" }
             },
             "additionalProperties": false
         });
@@ -1879,7 +1889,12 @@ impl HandlerRegistry {
                 "kind": { "type": "string" },
                 "target": { "type": "string" },
                 "command": { "type": "string" },
-                "reason": { "type": "string" }
+                "reason": { "type": "string" },
+                "evidenceKind": {
+                    "type": "string",
+                    "enum": ["explicit", "structural", "inferred"]
+                },
+                "confidence": { "type": "number" }
             },
             "additionalProperties": false
         });

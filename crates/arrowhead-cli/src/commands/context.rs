@@ -11,8 +11,8 @@ use tracing::warn;
 use super::CommandContext;
 use crate::logging;
 use arrowhead_core::{
-    ContextAttentionItem, ContextLink, ContextMetricItem, ContextMetricRollup, ContextPayload,
-    ContextPivot, ContextService, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT,
+    ContextAttentionItem, ContextEvidenceKind, ContextLink, ContextMetricItem, ContextMetricRollup,
+    ContextPayload, ContextPivot, ContextService, ContextTargetKind, DEFAULT_CONTEXT_METRIC_LIMIT,
     DEFAULT_CONTEXT_NOTE_LIMIT, MonthContextSelector, SearchConfig, SearchService, Vault,
     VaultConfig, WeekContextSelector, embeddings::EmbeddingPipeline, sqlite::IndexDatabase,
 };
@@ -687,7 +687,12 @@ fn render_next_pivots(pivots: &[ContextPivot]) {
     }
     println!("\nNext Pivots");
     for pivot in pivots {
-        println!("- {} ({})", pivot.command, pivot.reason);
+        let suffix = render_reason_and_evidence(
+            Some(pivot.reason.as_str()),
+            pivot.evidence_kind,
+            pivot.confidence,
+        );
+        println!("- {}{}", pivot.command, suffix);
     }
 }
 
@@ -698,11 +703,8 @@ fn print_note_line(note: &arrowhead_core::ContextNoteItem) {
         .as_ref()
         .map(|path| format!(" [{}]", path.display()))
         .unwrap_or_default();
-    let reason = note
-        .reason
-        .as_deref()
-        .map(|reason| format!(" ({reason})"))
-        .unwrap_or_default();
+    let reason =
+        render_reason_and_evidence(note.reason.as_deref(), note.evidence_kind, note.confidence);
     println!("- Note: {}{}{}", label, path, reason);
 }
 
@@ -735,11 +737,11 @@ fn print_metric_lead_line(metric: &ContextMetricItem) {
         .date
         .map(|date| format!(" on {date}"))
         .unwrap_or_default();
-    let reason_suffix = metric
-        .reason
-        .as_deref()
-        .map(|reason| format!(" ({reason})"))
-        .unwrap_or_default();
+    let reason_suffix = render_reason_and_evidence(
+        metric.reason.as_deref(),
+        metric.evidence_kind,
+        metric.confidence,
+    );
     println!(
         "- Metric: {} = {}{} from {}{}{}",
         metric.key, metric.value, unit_suffix, metric.source, date_suffix, reason_suffix
@@ -793,10 +795,43 @@ fn print_metric_rollup(rollup: &ContextMetricRollup) {
 }
 
 fn print_link_line(link: &ContextLink) {
+    let evidence = match link.confidence {
+        Some(confidence) => format!("{:?} {:.2}", link.kind, confidence).to_lowercase(),
+        None => format!("{:?}", link.kind).to_lowercase(),
+    };
     println!(
-        "- {:?}: {} -> {} ({})",
-        link.kind, link.from, link.to, link.reason
+        "- {}: {} -> {} ({})",
+        evidence, link.from, link.to, link.reason
     );
+}
+
+fn render_reason_and_evidence(
+    reason: Option<&str>,
+    evidence_kind: Option<ContextEvidenceKind>,
+    confidence: Option<f32>,
+) -> String {
+    let evidence_label = render_evidence_label(evidence_kind, confidence);
+    match (reason, evidence_label) {
+        (Some(reason), Some(evidence)) => format!(" ({reason}; {evidence})"),
+        (Some(reason), None) => format!(" ({reason})"),
+        (None, Some(evidence)) => format!(" ({evidence})"),
+        (None, None) => String::new(),
+    }
+}
+
+fn render_evidence_label(
+    evidence_kind: Option<ContextEvidenceKind>,
+    confidence: Option<f32>,
+) -> Option<String> {
+    let label = match evidence_kind? {
+        ContextEvidenceKind::Explicit => "explicit".to_string(),
+        ContextEvidenceKind::Structural => "structural".to_string(),
+        ContextEvidenceKind::Inferred => match confidence {
+            Some(confidence) => format!("inferred {confidence:.2}"),
+            None => "inferred".to_string(),
+        },
+    };
+    Some(label)
 }
 
 fn print_attention_line(item: &ContextAttentionItem) {

@@ -103,6 +103,24 @@ pub struct ContextNoteItem {
     /// Optional explanation for why the note is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional evidence classification backing this note lead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_kind: Option<ContextEvidenceKind>,
+    /// Optional confidence for inferred note leads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+/// Evidence classification attached to context leads and pivots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextEvidenceKind {
+    /// Directly observed in source content, such as an explicit metric reference.
+    Explicit,
+    /// Derived from stable structure such as shared days, graph links, or source alignment.
+    Structural,
+    /// Inferred from weaker signals such as text or semantic similarity.
+    Inferred,
 }
 
 /// Relationship bucket classification.
@@ -179,6 +197,12 @@ pub struct ContextMetricItem {
     /// Optional explanation for why the metric is present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Optional evidence classification backing this metric lead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_kind: Option<ContextEvidenceKind>,
+    /// Optional confidence for inferred metric leads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 /// Aggregated per-day metric trend surfaced by context responses.
@@ -217,13 +241,6 @@ pub struct ContextMetricRollupBucket {
     pub record_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ContextEvidenceKind {
-    Explicit,
-    Structural,
-    Inferred,
-}
-
 #[derive(Debug, Clone)]
 struct NoteMetricEvidence {
     note: ContextNoteItem,
@@ -237,6 +254,12 @@ struct MetricRecordEvidence {
     record: MetricRecordEntry,
     kind: ContextEvidenceKind,
     link_reason: String,
+    confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LeadEvidence {
+    kind: ContextEvidenceKind,
     confidence: Option<f32>,
 }
 
@@ -319,7 +342,7 @@ pub struct ContextRelated {
 }
 
 /// Suggested follow-up command or read to continue exploration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextPivot {
     /// Stable pivot kind.
@@ -330,6 +353,12 @@ pub struct ContextPivot {
     pub command: String,
     /// Why this follow-up is worth exploring.
     pub reason: String,
+    /// Optional evidence classification behind the suggested pivot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_kind: Option<ContextEvidenceKind>,
+    /// Optional confidence for inferred pivots.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 /// Stable context payload shared by CLI JSON and MCP responses.
@@ -435,6 +464,9 @@ impl ContextService {
         let mut related_notes = self
             .note_items_for_ids(&related_note_ids, Some("Graph link"))
             .await?;
+        for note in &mut related_notes {
+            note.evidence_kind = Some(ContextEvidenceKind::Structural);
+        }
         trim_note_items(&mut related_notes, note_limit);
 
         let mut seen_note_ids = related_notes
@@ -447,6 +479,17 @@ impl ContextService {
                 let search_results = self
                     .search_notes_by_phrase(&term, note_limit * 2, &seen_note_ids, "Textual match")
                     .await?;
+                let search_results = search_results
+                    .into_iter()
+                    .map(|note| {
+                        note_item_with_evidence(
+                            note,
+                            ContextEvidenceKind::Inferred,
+                            Some(0.35),
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 merge_note_items(
                     &mut related_notes,
                     search_results,
@@ -466,7 +509,14 @@ impl ContextService {
             {
                 let semantic_matches = search_results
                     .into_iter()
-                    .map(|result| note_item_from_search_result(result, None))
+                    .map(|result| {
+                        note_item_with_evidence(
+                            note_item_from_search_result(result, None),
+                            ContextEvidenceKind::Inferred,
+                            Some(0.25),
+                            Some("Semantic match".to_string()),
+                        )
+                    })
                     .collect::<Vec<_>>();
                 merge_note_items(
                     &mut related_notes,
@@ -482,7 +532,6 @@ impl ContextService {
         let metric_evidence = self
             .note_metric_record_evidence(&note, &explicit_metric_ids, &note_dates, metric_limit)
             .await?;
-        let metric_reasons = metric_reasons_from_evidence(&metric_evidence);
         let metrics = metric_evidence
             .iter()
             .map(|evidence| evidence.record.clone())
@@ -511,11 +560,8 @@ impl ContextService {
             .collect::<Vec<_>>();
         links.extend(graph_links);
         dedup_context_links(&mut links);
-        let related_metric_items = metric_items_from_records_dedup_by_key_with_reasons(
-            &metrics,
-            Some(&metric_reasons),
-            metric_limit,
-        );
+        let related_metric_items =
+            metric_items_from_evidence_dedup_by_key(&metric_evidence, metric_limit);
         let pivot_days = note_dates
             .iter()
             .map(ToString::to_string)
@@ -631,7 +677,7 @@ impl ContextService {
             .await?;
         let related_notes = note_evidence
             .iter()
-            .map(|evidence| evidence.note.clone())
+            .map(note_item_from_evidence)
             .collect::<Vec<_>>();
 
         let mut links = Vec::new();
@@ -766,7 +812,7 @@ impl ContextService {
             .await?;
         let related_notes = note_evidence
             .iter()
-            .map(|evidence| evidence.note.clone())
+            .map(note_item_from_evidence)
             .collect::<Vec<_>>();
 
         let mut links = metrics
@@ -1450,6 +1496,8 @@ impl ContextService {
                     created_at: entry.and_then(|item| item.created_at),
                     preview,
                     reason: reason.clone(),
+                    evidence_kind: None,
+                    confidence: None,
                 });
             }
             Ok(items)
@@ -1563,6 +1611,8 @@ impl ContextService {
                     created_at: entry.and_then(|item| item.created_at),
                     preview: database.note_excerpt(&note_id, 240)?,
                     reason: Some(reason.clone()),
+                    evidence_kind: None,
+                    confidence: None,
                 });
             }
             Ok(items)
@@ -1886,9 +1936,16 @@ impl ContextService {
                     continue;
                 }
                 if seen_keys.insert(candidate.record.key.clone()) {
-                    items.push(context_metric_item_from_record(
-                        &candidate,
-                        Some(format!("{reason_prefix} {date}")),
+                    items.push(metric_item_with_evidence(
+                        context_metric_item_from_record(
+                            &candidate,
+                            Some(format!("{reason_prefix} {date}")),
+                            None,
+                            None,
+                        ),
+                        ContextEvidenceKind::Structural,
+                        None,
+                        None,
                     ));
                 }
                 if items.len() >= limit {
@@ -2340,6 +2397,8 @@ fn indexed_notes_to_context_items(
             created_at: entry.created_at,
             preview: database.note_excerpt(&entry.id, 240)?,
             reason: Some(reason.to_string()),
+            evidence_kind: None,
+            confidence: None,
         });
     }
     Ok(items)
@@ -2348,6 +2407,8 @@ fn indexed_notes_to_context_items(
 fn context_metric_item_from_record(
     record: &MetricRecordEntry,
     reason: Option<String>,
+    evidence_kind: Option<ContextEvidenceKind>,
+    confidence: Option<f32>,
 ) -> ContextMetricItem {
     ContextMetricItem {
         metric_id: record.record.id.clone(),
@@ -2358,25 +2419,69 @@ fn context_metric_item_from_record(
         date: record.record.date,
         ts: record.record.ts.into(),
         reason,
+        evidence_kind,
+        confidence,
     }
 }
 
-fn metric_items_from_records_dedup_by_key_with_reasons(
-    records: &[MetricRecordEntry],
-    reasons: Option<&std::collections::HashMap<String, String>>,
+fn note_item_with_evidence(
+    mut note: ContextNoteItem,
+    evidence_kind: ContextEvidenceKind,
+    confidence: Option<f32>,
+    reason: Option<String>,
+) -> ContextNoteItem {
+    if let Some(reason) = reason {
+        note.reason = Some(reason);
+    }
+    note.evidence_kind = Some(evidence_kind);
+    note.confidence = confidence;
+    note
+}
+
+fn metric_item_with_evidence(
+    mut metric: ContextMetricItem,
+    evidence_kind: ContextEvidenceKind,
+    confidence: Option<f32>,
+    reason: Option<String>,
+) -> ContextMetricItem {
+    if let Some(reason) = reason {
+        metric.reason = Some(reason);
+    }
+    metric.evidence_kind = Some(evidence_kind);
+    metric.confidence = confidence;
+    metric
+}
+
+fn note_item_from_evidence(evidence: &NoteMetricEvidence) -> ContextNoteItem {
+    note_item_with_evidence(
+        evidence.note.clone(),
+        evidence.kind,
+        evidence.confidence,
+        Some(evidence.link_reason.clone()),
+    )
+}
+
+fn metric_item_from_evidence(evidence: &MetricRecordEvidence) -> ContextMetricItem {
+    metric_item_with_evidence(
+        context_metric_item_from_record(&evidence.record, None, None, None),
+        evidence.kind,
+        evidence.confidence,
+        Some(evidence.link_reason.clone()),
+    )
+}
+
+fn metric_items_from_evidence_dedup_by_key(
+    evidence: &[MetricRecordEvidence],
     limit: usize,
 ) -> Vec<ContextMetricItem> {
     let mut items = Vec::new();
     let mut seen = HashSet::new();
-    for record in records {
+    for entry in evidence {
         if items.len() >= limit {
             break;
         }
-        if seen.insert(record.record.key.clone()) {
-            items.push(context_metric_item_from_record(
-                record,
-                reasons.and_then(|map| map.get(&record.record.id).cloned()),
-            ));
+        if seen.insert(entry.record.record.key.clone()) {
+            items.push(metric_item_from_evidence(entry));
         }
     }
     items
@@ -2394,7 +2499,12 @@ fn metric_items_from_records_dedup_by_key(
             break;
         }
         if seen.insert(record.record.key.clone()) {
-            items.push(context_metric_item_from_record(record, reason.clone()));
+            items.push(metric_item_with_evidence(
+                context_metric_item_from_record(record, reason.clone(), None, None),
+                ContextEvidenceKind::Structural,
+                None,
+                None,
+            ));
         }
     }
     items
@@ -2554,20 +2664,6 @@ fn sort_context_metric_rollups(rollups: &mut [ContextMetricRollup]) {
     });
 }
 
-fn metric_reasons_from_evidence(
-    evidence: &[MetricRecordEvidence],
-) -> std::collections::HashMap<String, String> {
-    evidence
-        .iter()
-        .map(|evidence| {
-            (
-                evidence.record.record.id.clone(),
-                evidence.link_reason.clone(),
-            )
-        })
-        .collect()
-}
-
 fn note_day_links(note_id: &str, dates: &BTreeSet<NaiveDate>) -> Vec<ContextLink> {
     dates
         .iter()
@@ -2630,12 +2726,26 @@ fn push_pivot(
     command: String,
     reason: impl Into<String>,
 ) {
+    push_pivot_with_evidence(pivots, seen_commands, kind, target, command, reason, None);
+}
+
+fn push_pivot_with_evidence(
+    pivots: &mut Vec<ContextPivot>,
+    seen_commands: &mut HashSet<String>,
+    kind: &str,
+    target: impl Into<String>,
+    command: String,
+    reason: impl Into<String>,
+    evidence: Option<LeadEvidence>,
+) {
     if seen_commands.insert(command.clone()) {
         pivots.push(ContextPivot {
             kind: kind.to_string(),
             target: target.into(),
             command,
             reason: reason.into(),
+            evidence_kind: evidence.map(|evidence| evidence.kind),
+            confidence: evidence.and_then(|evidence| evidence.confidence),
         });
     }
 }
@@ -2668,33 +2778,45 @@ fn build_note_pivots(
         "Read the anchor note directly.",
     );
     if let Some(day) = days.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_day",
             day.clone(),
             format!("arrowhead context day {day}"),
             "Explore the surrounding day context.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     if let Some(metric) = metrics.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_metric",
             metric.key.clone(),
             format!("arrowhead context metric {}", shell_quote(&metric.key)),
             "Follow the strongest metric lead.",
+            metric.evidence_kind.map(|kind| LeadEvidence {
+                kind,
+                confidence: metric.confidence,
+            }),
         );
     }
     if let Some(note) = notes.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_note",
             note.note_id.clone(),
             format!("arrowhead context note {}", shell_quote(&note.note_id)),
             "Inspect the strongest related note.",
+            note.evidence_kind.map(|kind| LeadEvidence {
+                kind,
+                confidence: note.confidence,
+            }),
         );
     }
     pivots
@@ -2713,17 +2835,23 @@ fn build_day_pivots(
         .find(|note| note.note_id == day)
         .or_else(|| notes.first())
     {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "read_note",
             note.note_id.clone(),
             format!("arrowhead notes read {}", shell_quote(&note.note_id)),
             "Read the daily note or strongest note lead for this day.",
+            Some(LeadEvidence {
+                kind: note
+                    .evidence_kind
+                    .unwrap_or(ContextEvidenceKind::Structural),
+                confidence: note.confidence,
+            }),
         );
     }
     if let Some(metric) = metrics.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_metric",
@@ -2733,26 +2861,40 @@ fn build_day_pivots(
                 shell_quote(&metric.record.key)
             ),
             "Inspect a metric recorded on this day.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     if let Some(compare_day) = compare_days.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_day",
             compare_day.clone(),
             format!("arrowhead context day {compare_day}"),
             "Compare this day against the nearest adjacent active day.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     if let Some(note) = notes.iter().find(|note| note.note_id != day) {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_note",
             note.note_id.clone(),
             format!("arrowhead context note {}", shell_quote(&note.note_id)),
             "Inspect a note that changed or linked into this day.",
+            Some(LeadEvidence {
+                kind: note
+                    .evidence_kind
+                    .unwrap_or(ContextEvidenceKind::Structural),
+                confidence: note.confidence,
+            }),
         );
     }
     pivots
@@ -2778,33 +2920,45 @@ fn build_metric_pivots(
         "Inspect the exact metric target directly.",
     );
     if let Some(day) = related_days.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_day",
             day.clone(),
             format!("arrowhead context day {day}"),
             "Explore a day where this metric was active.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     if let Some(note) = related_notes.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_note",
             note.note_id.clone(),
             format!("arrowhead context note {}", shell_quote(&note.note_id)),
             "Inspect the strongest related note.",
+            note.evidence_kind.map(|kind| LeadEvidence {
+                kind,
+                confidence: note.confidence,
+            }),
         );
     }
     if let Some(metric) = related_metrics.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_metric",
             metric.key.clone(),
             format!("arrowhead context metric {}", shell_quote(&metric.key)),
             "Compare against a nearby co-occurring metric.",
+            metric.evidence_kind.map(|kind| LeadEvidence {
+                kind,
+                confidence: metric.confidence,
+            }),
         );
     } else if let Some(metric) = metrics.first() {
         let day = metric
@@ -2812,23 +2966,31 @@ fn build_metric_pivots(
             .date
             .unwrap_or_else(|| metric.record.ts.date_naive())
             .to_string();
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_day",
             day.clone(),
             format!("arrowhead context day {day}"),
             "Inspect the day containing the latest record.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     if let Some(rollup) = metric_rollups.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "metrics_aggregate",
             rollup.key.clone(),
             metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), range),
             "Inspect the daily trend for this metric.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     pivots
@@ -2848,13 +3010,17 @@ fn build_window_pivots(
         .map(|pivot| pivot.command.clone())
         .collect::<HashSet<_>>();
     if let Some(rollup) = metric_rollups.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "metrics_aggregate",
             rollup.key.clone(),
             metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), Some(window_target)),
             aggregate_reason,
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     pivots
@@ -2876,43 +3042,65 @@ fn build_source_pivots(
         .map(|metric| metric.key.clone())
         .or_else(|| metrics.first().map(|record| record.record.key.clone()))
     {
-        push_pivot(
+        let evidence = related_metrics.first().and_then(|metric| {
+            metric.evidence_kind.map(|kind| LeadEvidence {
+                kind,
+                confidence: metric.confidence,
+            })
+        });
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_metric",
             metric_key.clone(),
             format!("arrowhead context metric {}", shell_quote(&metric_key)),
             format!("Inspect a metric emitted by source {source}."),
+            Some(evidence.unwrap_or(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            })),
         );
     }
     if let Some(day) = related_days.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_day",
             day.clone(),
             format!("arrowhead context day {day}"),
             "Inspect an active day for this source.",
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     if let Some(note) = related_notes.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "context_note",
             note.note_id.clone(),
             format!("arrowhead context note {}", shell_quote(&note.note_id)),
             "Inspect the strongest related note for this source.",
+            note.evidence_kind.map(|kind| LeadEvidence {
+                kind,
+                confidence: note.confidence,
+            }),
         );
     }
     if let Some(rollup) = metric_rollups.first() {
-        push_pivot(
+        push_pivot_with_evidence(
             &mut pivots,
             &mut seen,
             "metrics_aggregate",
             rollup.key.clone(),
             metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), range),
             format!("Inspect the strongest daily trend for source {source}."),
+            Some(LeadEvidence {
+                kind: ContextEvidenceKind::Structural,
+                confidence: None,
+            }),
         );
     }
     pivots
@@ -2945,6 +3133,8 @@ fn note_item_from_note_record(note: &NoteRecord, reason: Option<String>) -> Cont
         created_at: note.created_at,
         preview: preview_from_text(&note.content, 240),
         reason,
+        evidence_kind: None,
+        confidence: None,
     }
 }
 
@@ -2957,6 +3147,8 @@ fn note_item_from_search_result(result: SearchResult, reason: Option<String>) ->
         created_at: None,
         preview: result.preview,
         reason: reason.or(result.reason),
+        evidence_kind: None,
+        confidence: None,
     }
 }
 
@@ -4532,6 +4724,8 @@ mod tests {
             created_at: None,
             preview: Some("body.weight glossary".to_string()),
             reason: Some("Note text matches metric key".to_string()),
+            evidence_kind: Some(ContextEvidenceKind::Inferred),
+            confidence: Some(0.35),
         };
 
         assert!(
