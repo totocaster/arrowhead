@@ -257,6 +257,16 @@ struct MetricRecordEvidence {
     confidence: Option<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct RelatedMetricCandidate {
+    record: MetricRecordEntry,
+    overlap_days: usize,
+    same_source_overlap_days: usize,
+    shared_namespace_segments: usize,
+    matching_record_count: usize,
+    latest_overlap_ts: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LeadEvidence {
     kind: ContextEvidenceKind,
@@ -716,7 +726,7 @@ impl ContextService {
                 &metrics,
                 &exclude_metric_keys,
                 metric_limit,
-                "Recorded on the same day as the target metric on",
+                "Co-recorded with the target metric on",
             )
             .await?;
         let related_metric_keys = if related_metric_items.is_empty() {
@@ -1986,40 +1996,82 @@ impl ContextService {
             return Ok(Vec::new());
         }
 
-        let mut items = Vec::new();
-        let mut seen_keys = HashSet::new();
+        let target_key = records
+            .first()
+            .map(|record| record.record.key.as_str())
+            .unwrap_or_default();
+        let mut target_sources_by_day = HashMap::<NaiveDate, HashSet<String>>::new();
         for record in records {
-            let Some(date) = record.record.date else {
-                continue;
-            };
-            let related = self
-                .metrics
-                .search(&format!("date:{date}"), Some(limit.max(1) * 4))
-                .await?;
+            let date = record
+                .record
+                .date
+                .unwrap_or_else(|| record.record.ts.date_naive());
+            target_sources_by_day
+                .entry(date)
+                .or_default()
+                .insert(record.record.source.clone());
+        }
+
+        let mut candidates_by_key = HashMap::<String, RelatedMetricCandidate>::new();
+        for (date, target_sources) in target_sources_by_day {
+            let related = self.metrics.search(&format!("date:{date}"), None).await?;
             for candidate in related {
                 if exclude_keys.contains(&candidate.record.key) {
                     continue;
                 }
-                if seen_keys.insert(candidate.record.key.clone()) {
-                    items.push(metric_item_with_evidence(
-                        context_metric_item_from_record(
-                            &candidate,
-                            Some(format!("{reason_prefix} {date}")),
-                            None,
-                            None,
-                        ),
-                        ContextEvidenceKind::Structural,
-                        None,
-                        None,
-                    ));
+                let entry = candidates_by_key
+                    .entry(candidate.record.key.clone())
+                    .or_insert_with(|| RelatedMetricCandidate {
+                        record: candidate.clone(),
+                        overlap_days: 0,
+                        same_source_overlap_days: 0,
+                        shared_namespace_segments: 0,
+                        matching_record_count: 0,
+                        latest_overlap_ts: candidate.record.ts.into(),
+                    });
+                entry.overlap_days += 1;
+                entry.matching_record_count += 1;
+                if target_sources.contains(&candidate.record.source) {
+                    entry.same_source_overlap_days += 1;
                 }
-                if items.len() >= limit {
-                    return Ok(items);
+                entry.shared_namespace_segments =
+                    entry
+                        .shared_namespace_segments
+                        .max(shared_metric_namespace_segments(
+                            target_key,
+                            &candidate.record.key,
+                        ));
+                if candidate.record.ts > entry.record.record.ts {
+                    entry.record = candidate.clone();
                 }
+                entry.latest_overlap_ts = entry.latest_overlap_ts.max(candidate.record.ts.into());
             }
         }
 
-        Ok(items)
+        let mut candidates = candidates_by_key.into_values().collect::<Vec<_>>();
+        sort_related_metric_candidates(&mut candidates);
+
+        Ok(candidates
+            .into_iter()
+            .take(limit)
+            .map(|candidate| {
+                metric_item_with_evidence(
+                    context_metric_item_from_record(
+                        &candidate.record,
+                        Some(format_related_metric_reason(
+                            &candidate,
+                            reason_prefix,
+                            target_key,
+                        )),
+                        None,
+                        None,
+                    ),
+                    ContextEvidenceKind::Structural,
+                    None,
+                    None,
+                )
+            })
+            .collect())
     }
 
     async fn note_metric_record_evidence(
@@ -2779,6 +2831,24 @@ fn sort_context_metric_rollups(rollups: &mut [ContextMetricRollup]) {
     });
 }
 
+fn sort_related_metric_candidates(candidates: &mut [RelatedMetricCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .shared_namespace_segments
+            .cmp(&left.shared_namespace_segments)
+            .then_with(|| {
+                right
+                    .same_source_overlap_days
+                    .cmp(&left.same_source_overlap_days)
+            })
+            .then_with(|| right.overlap_days.cmp(&left.overlap_days))
+            .then_with(|| right.latest_overlap_ts.cmp(&left.latest_overlap_ts))
+            .then_with(|| right.matching_record_count.cmp(&left.matching_record_count))
+            .then_with(|| left.record.record.key.cmp(&right.record.record.key))
+            .then_with(|| left.record.record.source.cmp(&right.record.record.source))
+    });
+}
+
 fn sort_context_note_items(items: &mut [ContextNoteItem]) {
     items.sort_by(|left, right| {
         context_note_item_rank(left)
@@ -2865,6 +2935,47 @@ fn ordered_note_context_days(
         .into_iter()
         .map(|day| day.to_string())
         .collect()
+}
+
+fn shared_metric_namespace_segments(left: &str, right: &str) -> usize {
+    left.split('.')
+        .zip(right.split('.'))
+        .take_while(|(left_segment, right_segment)| left_segment == right_segment)
+        .count()
+}
+
+fn format_related_metric_reason(
+    candidate: &RelatedMetricCandidate,
+    reason_prefix: &str,
+    target_key: &str,
+) -> String {
+    let day_label = if candidate.overlap_days == 1 {
+        "shared day"
+    } else {
+        "shared days"
+    };
+    let overlap_reason = format!("{reason_prefix} {} {day_label}", candidate.overlap_days);
+
+    let mut qualifiers = Vec::new();
+    if candidate.same_source_overlap_days > 0 {
+        qualifiers.push(if candidate.same_source_overlap_days == 1 {
+            "same source".to_string()
+        } else {
+            format!("same source on {} days", candidate.same_source_overlap_days)
+        });
+    }
+
+    let shared_namespace =
+        shared_metric_namespace_segments(target_key, &candidate.record.record.key);
+    if shared_namespace > 0 {
+        qualifiers.push("same metric family".to_string());
+    }
+
+    if qualifiers.is_empty() {
+        overlap_reason
+    } else {
+        format!("{overlap_reason}; {}", qualifiers.join(", "))
+    }
 }
 
 fn note_day_links(note_id: &str, dates: &BTreeSet<NaiveDate>) -> Vec<ContextLink> {
@@ -4836,6 +4947,86 @@ mod tests {
                 .map(|pivot| pivot.target.as_str()),
             Some("2026-04-15"),
             "expected metric pivots to prefer the latest metric-active day"
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_context_prefers_same_source_family_for_related_metric_pivot() {
+        let (_dir, service) = build_service();
+        insert_metric_rows(
+            &service,
+            "Metrics/Cooccurring.metrics.ndjson",
+            &[
+                r#"{"id":"01CO001","ts":"2026-04-14T08:31:00Z","date":"2026-04-14","key":"body.fat_percentage","value":24.2,"unit":"%","source":"withings","note":"Body composition"}"#,
+                r#"{"id":"01CO002","ts":"2026-04-15T08:31:00Z","date":"2026-04-15","key":"body.fat_percentage","value":24.1,"unit":"%","source":"withings","note":"Body composition"}"#,
+                r#"{"id":"01CO003","ts":"2026-04-15T12:00:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":850,"unit":"kcal","source":"manual-health-log","note":"Meal log"}"#,
+                r#"{"id":"01CO004","ts":"2026-04-15T07:00:00Z","date":"2026-04-15","key":"whoop.day_strain","value":12.3,"unit":"strain","source":"whoop","note":"Recovery import"}"#,
+            ],
+        );
+
+        let payload = service
+            .metric("body.weight", None, Some(5), Some(10))
+            .await
+            .expect("metric context");
+
+        assert_eq!(
+            payload
+                .related
+                .metrics
+                .first()
+                .map(|metric| metric.key.as_str()),
+            Some("body.fat_percentage"),
+            "expected nearby metric leads to prefer same-source body metrics over arbitrary same-day metrics"
+        );
+        assert_eq!(
+            payload
+                .pivots
+                .iter()
+                .find(|pivot| pivot.kind == "context_metric")
+                .map(|pivot| pivot.target.as_str()),
+            Some("body.fat_percentage"),
+            "expected metric pivots to follow the strongest co-occurring metric family"
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_context_prefers_same_namespace_metric_pivot_when_sources_match() {
+        let (_dir, service) = build_service();
+        insert_metric_rows(
+            &service,
+            "Metrics/Sleep.metrics.ndjson",
+            &[
+                r#"{"id":"01SLP000","ts":"2026-04-14T06:30:00Z","date":"2026-04-14","key":"sleep.duration","value":7.0,"unit":"h","source":"whoop","note":"Sleep import"}"#,
+                r#"{"id":"01SLP001","ts":"2026-04-15T06:30:00Z","date":"2026-04-15","key":"sleep.duration","value":7.2,"unit":"h","source":"whoop","note":"Sleep import"}"#,
+                r#"{"id":"01SLP002","ts":"2026-04-15T06:31:00Z","date":"2026-04-15","key":"sleep.efficiency","value":92.0,"unit":"%","source":"whoop","note":"Sleep efficiency"}"#,
+                r#"{"id":"01SLP003","ts":"2026-04-14T06:31:00Z","date":"2026-04-14","key":"recovery.resting_heart_rate","value":58.0,"unit":"bpm","source":"whoop","note":"Recovery"}"#,
+                r#"{"id":"01SLP004","ts":"2026-04-15T06:32:00Z","date":"2026-04-15","key":"recovery.resting_heart_rate","value":57.0,"unit":"bpm","source":"whoop","note":"Recovery"}"#,
+                r#"{"id":"01SLP005","ts":"2026-04-15T12:30:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":640,"unit":"kcal","source":"manual-health-log","note":"Lunch"}"#,
+            ],
+        );
+
+        let payload = service
+            .metric("sleep.duration", None, Some(5), Some(10))
+            .await
+            .expect("metric context");
+
+        assert_eq!(
+            payload
+                .related
+                .metrics
+                .first()
+                .map(|metric| metric.key.as_str()),
+            Some("sleep.efficiency"),
+            "expected same-family sleep metrics to outrank unrelated co-recorded metrics"
+        );
+        assert_eq!(
+            payload
+                .pivots
+                .iter()
+                .find(|pivot| pivot.kind == "context_metric")
+                .map(|pivot| pivot.target.as_str()),
+            Some("sleep.efficiency"),
+            "expected metric pivots to prefer the closest same-family metric"
         );
     }
 
