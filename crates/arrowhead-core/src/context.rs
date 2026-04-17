@@ -24,6 +24,7 @@ use crate::{
 pub const DEFAULT_CONTEXT_NOTE_LIMIT: usize = 5;
 /// Default number of metric records returned by context queries.
 pub const DEFAULT_CONTEXT_METRIC_LIMIT: usize = 10;
+const INFERRED_NOTE_ACTIVITY_WINDOW_DAYS: i64 = 45;
 
 static METRIC_REFERENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"metric:([A-Za-z0-9][A-Za-z0-9._:-]*)").expect("valid metric reference regex")
@@ -1690,6 +1691,10 @@ impl ContextService {
                 },
             );
         }
+        let has_strong_evidence = evidence_by_note
+            .values()
+            .any(|evidence| evidence.kind != ContextEvidenceKind::Inferred);
+        let activity_window = metric_activity_window(metric_records);
 
         let text_matches = self
             .search_notes_by_literal_phrase(
@@ -1700,6 +1705,11 @@ impl ContextService {
             )
             .await?;
         for note in text_matches {
+            if has_strong_evidence
+                && !inferred_note_matches_metric_activity_window(&note, activity_window)
+            {
+                continue;
+            }
             let reason = note
                 .reason
                 .clone()
@@ -1771,6 +1781,10 @@ impl ContextService {
                 },
             );
         }
+        let has_strong_evidence = evidence_by_note
+            .values()
+            .any(|evidence| evidence.kind != ContextEvidenceKind::Inferred);
+        let activity_window = metric_activity_window(metric_records);
 
         let metric_keys = metric_records
             .iter()
@@ -1786,6 +1800,11 @@ impl ContextService {
                 )
                 .await?;
             for note in text_matches {
+                if has_strong_evidence
+                    && !inferred_note_matches_metric_activity_window(&note, activity_window)
+                {
+                    continue;
+                }
                 let reason = format!(
                     "Note text mentions metric key `{metric_key}` emitted by source `{source}`"
                 );
@@ -2181,6 +2200,57 @@ fn active_days_from_metric_records(metrics: &[MetricRecordEntry]) -> Vec<String>
         }
     }
     days
+}
+
+fn metric_activity_window(metrics: &[MetricRecordEntry]) -> Option<(NaiveDate, NaiveDate)> {
+    let mut dates = metrics.iter().map(|metric| {
+        metric
+            .record
+            .date
+            .unwrap_or_else(|| metric.record.ts.date_naive())
+    });
+    let first = dates.next()?;
+    let mut start = first;
+    let mut end = first;
+    for date in dates {
+        start = start.min(date);
+        end = end.max(date);
+    }
+    Some((start, end))
+}
+
+fn inferred_note_matches_metric_activity_window(
+    note: &ContextNoteItem,
+    activity_window: Option<(NaiveDate, NaiveDate)>,
+) -> bool {
+    let Some((start, end)) = activity_window else {
+        return true;
+    };
+    let lower = start - Duration::days(INFERRED_NOTE_ACTIVITY_WINDOW_DAYS);
+    let upper = end + Duration::days(INFERRED_NOTE_ACTIVITY_WINDOW_DAYS);
+    let anchor_dates = context_note_anchor_dates(note);
+    !anchor_dates.is_empty()
+        && anchor_dates
+            .iter()
+            .any(|date| *date >= lower && *date <= upper)
+}
+
+fn context_note_anchor_dates(note: &ContextNoteItem) -> BTreeSet<NaiveDate> {
+    let mut dates = BTreeSet::new();
+    if let Some(captures) = DATE_PREFIX_RE.captures(&note.note_id) {
+        if let Some(matched) = captures.get(1) {
+            if let Ok(date) = NaiveDate::parse_from_str(matched.as_str(), "%Y-%m-%d") {
+                dates.insert(date);
+            }
+        }
+    }
+    if let Some(file_modified_at) = note.file_modified_at {
+        dates.insert(file_modified_at.date_naive());
+    }
+    if let Some(created_at) = note.created_at {
+        dates.insert(created_at.date_naive());
+    }
+    dates
 }
 
 fn active_dates_from_notes_and_metrics(
@@ -3708,26 +3778,17 @@ mod tests {
             .iter()
             .map(|note| note.note_id.as_str())
             .collect::<Vec<_>>();
-        let project_position = note_ids
-            .iter()
-            .position(|note_id| *note_id == "Project Hub")
-            .expect("explicit note present");
-        let daily_note_position = note_ids
-            .iter()
-            .position(|note_id| *note_id == "2026-04-14")
-            .expect("same-day note present");
-        let glossary_position = note_ids
-            .iter()
-            .position(|note_id| *note_id == "Weight Lexicon")
-            .expect("inferred note present");
-
         assert!(
-            project_position < glossary_position,
-            "expected explicit note evidence to outrank inferred text matches"
+            note_ids.iter().any(|note_id| *note_id == "Project Hub"),
+            "expected explicit note evidence to remain present"
         );
         assert!(
-            daily_note_position < glossary_position,
-            "expected structural same-day note evidence to outrank inferred text matches"
+            note_ids.iter().any(|note_id| *note_id == "2026-04-14"),
+            "expected structural same-day note evidence to remain present"
+        );
+        assert!(
+            note_ids.iter().all(|note_id| *note_id != "Weight Lexicon"),
+            "expected weaker inferred metric-key notes to drop once stronger leads exist"
         );
         assert_eq!(
             payload
@@ -3781,8 +3842,35 @@ mod tests {
             .filter(|note| note.reason.as_deref() == Some("Note text matches metric key"))
             .count();
         assert_eq!(
-            inferred_notes, 1,
-            "expected only one inferred note once multiple stronger day/explicit leads exist"
+            inferred_notes, 0,
+            "expected inferred metric-key notes to drop once multiple stronger day/explicit leads exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn metric_context_filters_stale_inferred_notes_when_strong_leads_exist() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "2019-10-09",
+            Some("2019-10-09"),
+            "Exercise at home with [[body weight]].",
+            Some(ts(2019, 10, 9, 7, 0)),
+            ts(2019, 10, 9, 8, 0),
+        );
+
+        let payload = service
+            .metric("body.weight", None, Some(10), Some(5))
+            .await
+            .expect("metric context");
+
+        assert!(
+            payload
+                .related
+                .notes
+                .iter()
+                .all(|note| note.note_id != "2019-10-09"),
+            "expected stale inferred note text matches to be filtered once stronger leads exist"
         );
     }
 
@@ -3897,26 +3985,17 @@ mod tests {
             .iter()
             .map(|note| note.note_id.as_str())
             .collect::<Vec<_>>();
-        let explicit_position = note_ids
-            .iter()
-            .position(|note_id| *note_id == "Related Note")
-            .expect("explicit source note present");
-        let daily_note_position = note_ids
-            .iter()
-            .position(|note_id| *note_id == "2026-04-14")
-            .expect("same-day note present");
-        let inferred_position = note_ids
-            .iter()
-            .position(|note_id| *note_id == "Weight Lexicon")
-            .expect("inferred note present");
-
         assert!(
-            explicit_position < inferred_position,
-            "expected explicit source mentions to outrank inferred metric-key notes"
+            note_ids.iter().any(|note_id| *note_id == "Related Note"),
+            "expected explicit source note evidence to remain present"
         );
         assert!(
-            daily_note_position < inferred_position,
-            "expected same-day source notes to outrank inferred metric-key notes"
+            note_ids.iter().any(|note_id| *note_id == "2026-04-14"),
+            "expected same-day source note evidence to remain present"
+        );
+        assert!(
+            note_ids.iter().all(|note_id| *note_id != "Weight Lexicon"),
+            "expected weaker inferred source metric-key notes to drop once stronger leads exist"
         );
         assert_eq!(
             payload
@@ -3970,8 +4049,35 @@ mod tests {
             .filter(|note| note.reason.as_deref() == Some("Note text matches source metric key"))
             .count();
         assert_eq!(
-            inferred_notes, 1,
-            "expected only one inferred note once source context already has stronger leads"
+            inferred_notes, 0,
+            "expected inferred source metric-key notes to drop once stronger leads exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_context_filters_stale_inferred_notes_when_strong_leads_exist() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "2019-04-07",
+            Some("2019-04-07"),
+            "Noticed low [[body fat percentage]] on the scales today.",
+            Some(ts(2019, 4, 7, 7, 0)),
+            ts(2019, 4, 7, 8, 0),
+        );
+
+        let payload = service
+            .source("withings", None, Some(10), Some(5))
+            .await
+            .expect("source context");
+
+        assert!(
+            payload
+                .related
+                .notes
+                .iter()
+                .all(|note| note.note_id != "2019-04-07"),
+            "expected stale inferred source note matches to be filtered once stronger leads exist"
         );
     }
 
@@ -4257,6 +4363,30 @@ mod tests {
         assert!(
             !note_contains_literal_phrase(&note, "withings"),
             "stemmed `with` matches should not satisfy a literal source lookup"
+        );
+    }
+
+    #[test]
+    fn inferred_note_window_matching_requires_temporal_anchor() {
+        let note = ContextNoteItem {
+            note_id: "Weight Lexicon".to_string(),
+            title: Some("Weight Lexicon".to_string()),
+            relative_path: Some(PathBuf::from("Weight Lexicon.md")),
+            file_modified_at: None,
+            created_at: None,
+            preview: Some("body.weight glossary".to_string()),
+            reason: Some("Note text matches metric key".to_string()),
+        };
+
+        assert!(
+            !inferred_note_matches_metric_activity_window(
+                &note,
+                Some((
+                    NaiveDate::from_ymd_opt(2026, 4, 14).expect("date"),
+                    NaiveDate::from_ymd_opt(2026, 4, 15).expect("date"),
+                )),
+            ),
+            "expected inferred notes without a usable temporal anchor to be dropped once a metric window is known"
         );
     }
 

@@ -654,6 +654,7 @@ This should complement the existing Metrics plugin, not compete with it.
   - day context now emits day↔note and day↔metric relationships for agent-facing JSON
   - inferred note tails are now pruned once explicit/structural leads are already plentiful
   - metric/source day pivots and `related.days` now follow actual metric activity instead of inferred note dates
+  - stale inferred note matches now drop out when stronger local metric/source evidence already exists
 - reuse metrics rollups inside context
   - `context metric` now surfaces daily trend rollups for the target metric
   - `context month` now surfaces top source-specific metric trends plus aggregate follow-up pivots
