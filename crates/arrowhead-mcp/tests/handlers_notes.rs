@@ -165,6 +165,24 @@ async fn build_handler_with_context(temp_dir: &TempDir) -> HandlerRegistry {
     HandlerRegistry::new(Arc::new(runtime))
 }
 
+async fn build_handler_with_recent_changed_context(temp_dir: &TempDir) -> HandlerRegistry {
+    let handler = build_handler_with_context(temp_dir).await;
+    let vault_path = temp_dir.path().to_path_buf();
+    let runtime = McpRuntime::initialise(
+        RuntimeOptions::new(vault_path)
+            .with_embedding_model(None)
+            .with_daemon_socket(Some(temp_dir.path().join("control.sock")))
+            .with_daemon_status(Some(temp_dir.path().join("status.json"))),
+    )
+    .await
+    .expect("runtime initialises");
+
+    seed_recent_changed_note(runtime.vault().as_ref(), runtime.database().as_ref());
+
+    drop(handler);
+    HandlerRegistry::new(Arc::new(runtime))
+}
+
 fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
     let notes = vec![
         build_context_note(
@@ -228,6 +246,27 @@ fn seed_context_vault(vault: &Vault, database: &IndexDatabase) {
             ts(2026, 4, 15, 8, 30),
         )
         .expect("upsert context metrics");
+}
+
+fn seed_recent_changed_note(vault: &Vault, database: &IndexDatabase) {
+    let note = build_context_note(
+        vault,
+        "Recent Update",
+        Some("Recent Update"),
+        "Latest changes point back to [[Project Hub]] and the withings trend.",
+        Some(Utc::now() - chrono::Duration::days(10)),
+        Utc::now() - chrono::Duration::hours(1),
+    );
+    let note_ids = ["Project Hub".to_string(), note.id.clone()]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let extraction = MetadataExtractor::new()
+        .extract(&note)
+        .expect("extract metadata");
+    let resolved_links = make_resolved_links(&extraction, &note_ids);
+    database
+        .upsert_note(&note, &extraction, &resolved_links, note.file_modified_at)
+        .expect("upsert recent changed note");
 }
 
 fn ts(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
@@ -757,7 +796,7 @@ async fn context_get_month_accepts_anchor_day() {
 #[tokio::test]
 async fn context_get_changed_returns_recent_activity() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let handler = build_handler_with_context(&temp_dir).await;
+    let handler = build_handler_with_recent_changed_context(&temp_dir).await;
 
     let structured =
         call_tool_structured(&handler, "context_get_changed", json!({ "days": 3 })).await;

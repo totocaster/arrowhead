@@ -467,6 +467,7 @@ impl ContextService {
         for note in &mut related_notes {
             note.evidence_kind = Some(ContextEvidenceKind::Structural);
         }
+        sort_context_note_items(&mut related_notes);
         trim_note_items(&mut related_notes, note_limit);
 
         let mut seen_note_ids = related_notes
@@ -496,6 +497,8 @@ impl ContextService {
                     note_limit,
                     &mut seen_note_ids,
                 );
+                sort_context_note_items(&mut related_notes);
+                trim_note_items(&mut related_notes, note_limit);
                 if related_notes.len() >= note_limit {
                     break;
                 }
@@ -524,6 +527,8 @@ impl ContextService {
                     note_limit,
                     &mut seen_note_ids,
                 );
+                sort_context_note_items(&mut related_notes);
+                trim_note_items(&mut related_notes, note_limit);
             }
         }
 
@@ -562,10 +567,7 @@ impl ContextService {
         dedup_context_links(&mut links);
         let related_metric_items =
             metric_items_from_evidence_dedup_by_key(&metric_evidence, metric_limit);
-        let pivot_days = note_dates
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
+        let pivot_days = ordered_note_context_days(&note_dates, &metric_evidence);
         let pivots =
             build_note_pivots(&note.id, &pivot_days, &related_notes, &related_metric_items);
 
@@ -2777,6 +2779,94 @@ fn sort_context_metric_rollups(rollups: &mut [ContextMetricRollup]) {
     });
 }
 
+fn sort_context_note_items(items: &mut [ContextNoteItem]) {
+    items.sort_by(|left, right| {
+        context_note_item_rank(left)
+            .cmp(&context_note_item_rank(right))
+            .then_with(|| {
+                right
+                    .confidence
+                    .partial_cmp(&left.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.file_modified_at.cmp(&left.file_modified_at))
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.note_id.cmp(&right.note_id))
+    });
+}
+
+fn context_note_item_rank(note: &ContextNoteItem) -> u8 {
+    match note.evidence_kind {
+        Some(ContextEvidenceKind::Explicit) => 0,
+        Some(ContextEvidenceKind::Structural) => 1,
+        Some(ContextEvidenceKind::Inferred) => 2,
+        None => 3,
+    }
+}
+
+fn ordered_note_context_days(
+    note_dates: &BTreeSet<NaiveDate>,
+    metric_evidence: &[MetricRecordEvidence],
+) -> Vec<String> {
+    let mut day_scores = HashMap::new();
+    for evidence in metric_evidence {
+        let day = evidence
+            .record
+            .record
+            .date
+            .unwrap_or_else(|| evidence.record.record.ts.date_naive());
+        let score = day_scores.entry(day).or_insert((
+            evidence.kind,
+            evidence.confidence,
+            evidence.record.record.ts,
+        ));
+        if evidence.kind < score.0
+            || (evidence.kind == score.0
+                && evidence
+                    .confidence
+                    .partial_cmp(&score.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    == std::cmp::Ordering::Greater)
+            || (evidence.kind == score.0
+                && evidence.confidence == score.1
+                && evidence.record.record.ts > score.2)
+        {
+            *score = (
+                evidence.kind,
+                evidence.confidence,
+                evidence.record.record.ts,
+            );
+        }
+    }
+
+    let mut ordered_days = note_dates.iter().copied().collect::<Vec<_>>();
+    ordered_days.sort_by(|left, right| {
+        let left_score = day_scores.get(left);
+        let right_score = day_scores.get(right);
+        match (left_score, right_score) {
+            (
+                Some((left_kind, left_confidence, left_ts)),
+                Some((right_kind, right_confidence, right_ts)),
+            ) => left_kind
+                .cmp(right_kind)
+                .then_with(|| {
+                    right_confidence
+                        .partial_cmp(left_confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| right_ts.cmp(left_ts))
+                .then_with(|| right.cmp(left)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => right.cmp(left),
+        }
+    });
+    ordered_days
+        .into_iter()
+        .map(|day| day.to_string())
+        .collect()
+}
+
 fn note_day_links(note_id: &str, dates: &BTreeSet<NaiveDate>) -> Vec<ContextLink> {
     dates
         .iter()
@@ -4155,6 +4245,92 @@ mod tests {
                 .iter()
                 .all(|source| source != "manual-health-log"),
             "expected unrelated manual source rows to stay out once the note names withings"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_context_prioritises_metric_backed_days_for_day_pivot() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Trend Review",
+            Some("Trend Review"),
+            "Compare body.weight between 2026-04-14 and 2026-04-15.",
+            Some(ts(2026, 4, 16, 9, 0)),
+            ts(2026, 4, 16, 9, 15),
+        );
+
+        let payload = service
+            .note("Trend Review", Some(5), Some(5))
+            .await
+            .expect("note context");
+
+        assert_eq!(
+            payload.related.days.first().map(String::as_str),
+            Some("2026-04-15"),
+            "expected most recent metric-backed day to lead related.days"
+        );
+        assert_eq!(
+            payload
+                .pivots
+                .iter()
+                .find(|pivot| pivot.kind == "context_day")
+                .map(|pivot| pivot.target.as_str()),
+            Some("2026-04-15"),
+            "expected note day pivot to prefer the strongest metric-backed day"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_context_sorts_related_notes_by_recency_for_pivots() {
+        let (_dir, service) = build_service();
+        insert_note_fixture(
+            &service,
+            "Alpha Link",
+            Some("Alpha Link"),
+            "Older linked note.",
+            Some(ts(2026, 4, 14, 8, 0)),
+            ts(2026, 4, 14, 8, 30),
+        );
+        insert_note_fixture(
+            &service,
+            "Zulu Link",
+            Some("Zulu Link"),
+            "Newer linked note.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+        insert_note_fixture(
+            &service,
+            "Pivot Ranking",
+            Some("Pivot Ranking"),
+            "See [[Alpha Link]] and [[Zulu Link]] for details.",
+            Some(ts(2026, 4, 16, 9, 0)),
+            ts(2026, 4, 16, 9, 15),
+        );
+
+        let payload = service
+            .note("Pivot Ranking", Some(5), Some(5))
+            .await
+            .expect("note context");
+
+        assert_eq!(
+            payload
+                .related
+                .notes
+                .first()
+                .map(|note| note.note_id.as_str()),
+            Some("Zulu Link"),
+            "expected newer structural graph links to rank before older ones"
+        );
+        assert_eq!(
+            payload
+                .pivots
+                .iter()
+                .find(|pivot| pivot.kind == "context_note")
+                .map(|pivot| pivot.target.as_str()),
+            Some("Zulu Link"),
+            "expected note pivot to follow the highest-ranked related note"
         );
     }
 
