@@ -41,5 +41,6 @@
 - MCP notes: `README.md#mcp-protocol-details`
 - CLI commands: `crates/arrowhead-cli/src/commands/`
 - Core modules: `crates/arrowhead-core/src/`
+- Daemon checks for agents: `arrowhead index status --json`, `.arrowhead/daemon/status.json`, `.arrowhead/logs/daemon.log`
 
 Keep the repo ready-to-build at all times. When in doubt, optimise for clarity and testability.

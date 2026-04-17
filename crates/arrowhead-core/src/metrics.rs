@@ -882,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_mismatch_warns_for_known_keys() {
+    fn unit_mismatch_warns_for_builtin_metric_keys() {
         let row = parse_metrics_line(
             r#"{"id":"01ABC","ts":"2026-04-14T08:30:00+04:00","key":"body.weight","value":105.6,"source":"withings","unit":"lb"}"#,
             Path::new("Metrics/test.metrics.ndjson"),

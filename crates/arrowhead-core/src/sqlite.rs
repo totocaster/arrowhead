@@ -55,6 +55,28 @@ pub struct NoteIndexState {
     pub indexed_at: DateTime<Utc>,
 }
 
+/// How a user-supplied note reference resolved to an indexed note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoteReferenceMatchKind {
+    /// Exact note id match.
+    ExactId,
+    /// Case-insensitive note id match.
+    NormalizedId,
+    /// Case-insensitive note title match.
+    Title,
+    /// Case-insensitive note alias match.
+    Alias,
+}
+
+/// Canonical result for a resolved note reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNoteReference {
+    /// Canonical note identifier stored in the index.
+    pub note_id: String,
+    /// Match strategy used to resolve the reference.
+    pub kind: NoteReferenceMatchKind,
+}
+
 /// Indexed note row with timestamps useful for exploratory context queries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedNoteRecord {
@@ -524,6 +546,60 @@ impl IndexDatabase {
             .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
             .context("failed to count notes")?;
         Ok(count.max(0) as u64)
+    }
+
+    /// Resolve a note reference using exact ids plus case-insensitive id, title, and alias
+    /// matching. Ambiguous title or alias matches return an error instead of guessing.
+    pub fn resolve_note_reference(&self, candidate: &str) -> Result<Option<ResolvedNoteReference>> {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        if self.note_state(trimmed)?.is_some() {
+            return Ok(Some(ResolvedNoteReference {
+                note_id: trimmed.to_string(),
+                kind: NoteReferenceMatchKind::ExactId,
+            }));
+        }
+
+        let conn = self.connection()?;
+        let normalized = normalise_link_lookup(trimmed);
+
+        if let Some(note_id) = resolve_unique_note_match(
+            trimmed,
+            "note ids",
+            collect_note_ids_matching(&conn, &normalized)?,
+        )? {
+            return Ok(Some(ResolvedNoteReference {
+                note_id,
+                kind: NoteReferenceMatchKind::NormalizedId,
+            }));
+        }
+
+        if let Some(note_id) = resolve_unique_note_match(
+            trimmed,
+            "note titles",
+            collect_note_titles_matching(&conn, &normalized)?,
+        )? {
+            return Ok(Some(ResolvedNoteReference {
+                note_id,
+                kind: NoteReferenceMatchKind::Title,
+            }));
+        }
+
+        if let Some(note_id) = resolve_unique_note_match(
+            trimmed,
+            "note aliases",
+            collect_note_aliases_matching(&conn, &normalized)?,
+        )? {
+            return Ok(Some(ResolvedNoteReference {
+                note_id,
+                kind: NoteReferenceMatchKind::Alias,
+            }));
+        }
+
+        Ok(None)
     }
 
     /// Load resolution hints to support WikiLink matching (titles and aliases).
@@ -1419,6 +1495,88 @@ fn date_to_micros(date: NaiveDate) -> Option<i64> {
         .map(|value| value.and_utc().timestamp_micros())
 }
 
+fn collect_note_ids_matching(conn: &Connection, normalized: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM notes ORDER BY id ASC")
+        .context("failed to prepare note id lookup")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("failed to query note ids")?;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        let id = row.context("failed to load indexed note id")?;
+        if normalise_link_lookup(&id) == normalized {
+            matches.push(id);
+        }
+    }
+    Ok(matches)
+}
+
+fn collect_note_titles_matching(conn: &Connection, normalized: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT id, title FROM notes WHERE title IS NOT NULL ORDER BY id ASC")
+        .context("failed to prepare note title lookup")?;
+    let mut rows = stmt.query([]).context("failed to query note titles")?;
+
+    let mut matches = Vec::new();
+    while let Some(row) = rows.next().context("failed to iterate note titles")? {
+        let id: String = row.get(0).context("failed to load note id")?;
+        let title: String = row.get(1).context("failed to load note title")?;
+        if normalise_link_lookup(&title) == normalized {
+            matches.push(id);
+        }
+    }
+    Ok(matches)
+}
+
+fn collect_note_aliases_matching(conn: &Connection, normalized: &str) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT note_id, value FROM metadata WHERE key = 'aliases' ORDER BY note_id ASC")
+        .context("failed to prepare note alias lookup")?;
+    let mut rows = stmt.query([]).context("failed to query note aliases")?;
+
+    let mut matches = Vec::new();
+    while let Some(row) = rows.next().context("failed to iterate note aliases")? {
+        let note_id: String = row.get(0).context("failed to load note id")?;
+        let raw_value: String = row.get(1).context("failed to load alias metadata")?;
+        match serde_json::from_str::<Value>(&raw_value)? {
+            Value::Array(items) => {
+                if items.iter().any(|item| {
+                    item.as_str().map(normalise_link_lookup).as_deref() == Some(normalized)
+                }) {
+                    matches.push(note_id);
+                }
+            }
+            Value::Null => {}
+            _ => {
+                debug!(
+                    note_id = %note_id,
+                    "skipping non-array aliases metadata while resolving note reference"
+                );
+            }
+        }
+    }
+    Ok(matches)
+}
+
+fn resolve_unique_note_match(
+    candidate: &str,
+    label: &str,
+    mut matches: Vec<String>,
+) -> Result<Option<String>> {
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(anyhow!(
+            "note reference `{candidate}` is ambiguous; it matches multiple {label}: {}",
+            matches.join(", ")
+        )),
+    }
+}
+
 fn metric_validation_status(row: &ParsedMetricRow) -> &'static str {
     match row.validation_status() {
         MetricValidationStatus::Valid => "valid",
@@ -1756,6 +1914,7 @@ mod tests {
     use std::{
         io::Cursor,
         path::{Path, PathBuf},
+        sync::Arc,
     };
 
     use chrono::Utc;
@@ -1763,6 +1922,7 @@ mod tests {
 
     use crate::{
         graph::{LinkReason, LinkResolutionRecord},
+        indexer::{Indexer, IndexerConfig},
         metadata::MetadataExtractor,
         metrics::parse_metrics_reader,
         vault::{Vault, VaultConfig},
@@ -1804,6 +1964,25 @@ mod tests {
             .expect("metrics rows parse")
     }
 
+    fn temp_vault_with_indexed_notes(
+        notes: &[(&str, &str)],
+    ) -> (TempDir, Arc<Vault>, IndexDatabase) {
+        let dir = TempDir::new().expect("tempdir");
+        for (path, body) in notes {
+            let absolute = dir.path().join(path);
+            if let Some(parent) = absolute.parent() {
+                fs::create_dir_all(parent).expect("create note parent");
+            }
+            fs::write(&absolute, body).expect("write note");
+        }
+
+        let vault =
+            Arc::new(Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault opens"));
+        let database =
+            IndexDatabase::open(dir.path().join(".arrowhead/index.db")).expect("database opens");
+        (dir, vault, database)
+    }
+
     #[test]
     fn creates_schema_on_open() {
         let dir = TempDir::new().expect("tempdir");
@@ -1827,6 +2006,41 @@ mod tests {
         assert!(tables.iter().any(|name| name == "metric_records"));
         assert!(tables.iter().any(|name| name == "metric_issues"));
         assert!(tables.iter().any(|name| name == "metric_links"));
+    }
+
+    #[tokio::test]
+    async fn resolve_note_reference_matches_titles_and_aliases_case_insensitively() {
+        let (_dir, vault, database) = temp_vault_with_indexed_notes(&[
+            (
+                "P0471 Weight Loss.md",
+                "---\naliases:\n  - P0471 Weight Tracker\n---\n\n# Weight loss\n",
+            ),
+            ("Other Note.md", "# Other\n"),
+        ]);
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::new(database.clone()),
+            IndexerConfig::default(),
+            None,
+        );
+        indexer.index_all().await.expect("index succeeds");
+
+        let title_match = database
+            .resolve_note_reference("P0471 Weight loss")
+            .expect("title lookup succeeds")
+            .expect("title match");
+        assert_eq!(title_match.note_id, "P0471 Weight Loss");
+        assert!(matches!(
+            title_match.kind,
+            NoteReferenceMatchKind::NormalizedId | NoteReferenceMatchKind::Title
+        ));
+
+        let alias_match = database
+            .resolve_note_reference("p0471 weight tracker")
+            .expect("alias lookup succeeds")
+            .expect("alias match");
+        assert_eq!(alias_match.note_id, "P0471 Weight Loss");
+        assert_eq!(alias_match.kind, NoteReferenceMatchKind::Alias);
     }
 
     #[test]

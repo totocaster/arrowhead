@@ -86,12 +86,12 @@ pub async fn run(ctx: &CommandContext, command: &GraphCommand) -> Result<()> {
 
     match resolve_action(&command.action)? {
         ResolvedGraphAction::Backlinks(note_id) => {
-            ensure_note_indexed(&database, &note_id)?;
+            let note_id = resolve_note_id(&database, &note_id)?;
             let edges = service.backlinks(&note_id).await?;
             render_backlinks(&note_id, &edges, command.json, command.format)?;
         }
         ResolvedGraphAction::ForwardLinks(note_id) => {
-            ensure_note_indexed(&database, &note_id)?;
+            let note_id = resolve_note_id(&database, &note_id)?;
             let edges = service.forward_links(&note_id).await?;
             render_forward_links(&note_id, &edges, command.json, command.format)?;
         }
@@ -101,6 +101,7 @@ pub async fn run(ctx: &CommandContext, command: &GraphCommand) -> Result<()> {
                     "--format ids is not supported for `graph context`; use `graph forward-links` or `graph backlinks` instead."
                 );
             }
+            let note_id = resolve_note_id(&database, &note_id)?;
             let context_service = build_context_service(
                 ctx,
                 Arc::clone(&vault),
@@ -134,12 +135,15 @@ pub async fn run(ctx: &CommandContext, command: &GraphCommand) -> Result<()> {
     Ok(())
 }
 
-fn ensure_note_indexed(database: &IndexDatabase, note_id: &str) -> Result<()> {
-    if database.note_state(note_id)?.is_some() {
-        Ok(())
-    } else {
-        bail!("note {note_id} is not indexed. Run `arrowhead index start` to refresh the index.");
-    }
+fn resolve_note_id(database: &IndexDatabase, note_id: &str) -> Result<String> {
+    database
+        .resolve_note_reference(note_id)?
+        .map(|resolved| resolved.note_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "note {note_id} is not indexed. Run `arrowhead index start` to refresh the index."
+            )
+        })
 }
 
 fn resolve_action(action: &Option<GraphAction>) -> Result<ResolvedGraphAction> {

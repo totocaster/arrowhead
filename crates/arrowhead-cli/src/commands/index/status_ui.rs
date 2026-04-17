@@ -434,6 +434,7 @@ impl StatusApp {
                     "Indexer faulted – check issues".to_string(),
                     Color::Red,
                 ),
+                ActivityState::Starting => (0.1, "Starting daemon…".to_string(), Color::Yellow),
                 ActivityState::Indexing => {
                     let processed = status.indexed_notes as f64;
                     let queued = status.activity.queued_jobs as f64;

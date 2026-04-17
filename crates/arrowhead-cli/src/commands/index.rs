@@ -15,6 +15,7 @@ use arrowhead_core::{
 use arrowhead_daemon::{
     ControlRequest, ControlResponse, StatusStream, send_control_request, status_stream,
 };
+use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 use serde_json;
 use tokio::{
@@ -32,6 +33,20 @@ use crate::config::{DaemonConfig, DaemonStatusSummary};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+enum StartupWaitOutcome {
+    Ready(Option<DaemonStatus>),
+    Pending(Option<DaemonStatus>),
+}
+
+impl StartupWaitOutcome {
+    fn status(&self) -> Option<&DaemonStatus> {
+        match self {
+            Self::Ready(status) | Self::Pending(status) => status.as_ref(),
+        }
+    }
+}
 
 /// Background index management entry point.
 #[derive(Debug, Args, Clone, PartialEq)]
@@ -231,6 +246,7 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
 
     ctx.config.daemon.auto_start_enabled = auto_start_preference;
 
+    let launched_at = Utc::now();
     let mut pid: Option<u32> = None;
     if let (Some(manager), Some(manifest)) = (&manager, manifest.as_ref()) {
         match manager.start_unit(manifest) {
@@ -260,24 +276,14 @@ pub(crate) async fn initialise_vault(ctx: &mut CommandContext, options: InitOpti
         remove_pid_file(&paths.pid_path)?;
     }
 
-    wait_for_socket(&paths.socket_path, STARTUP_TIMEOUT)
-        .await
-        .with_context(|| "indexer failed to expose control socket in time")?;
-
-    update_config_with_status(ctx, &paths, None)?;
-
-    if let Some(actual_pid) = pid {
-        println!(
-            "Arrowhead initialised and indexer started (pid {actual_pid}). Monitor progress with `arrowhead index status`."
-        );
-    } else {
-        println!(
-            "Arrowhead initialised and indexer started. Monitor progress with `arrowhead index status`."
-        );
-    }
-
-    println!(
-        "arrowheadd is performing the initial indexing pass in the background. Check `arrowhead index status` for progress."
+    let startup = wait_for_startup(&paths, launched_at, STARTUP_TIMEOUT).await?;
+    let status = startup.status().cloned();
+    update_config_with_status(ctx, &paths, status.clone())?;
+    print_start_result(
+        &paths,
+        pid,
+        startup,
+        "Arrowhead initialised and indexer launch requested.",
     );
 
     Ok(())
@@ -291,10 +297,13 @@ async fn handle_start(ctx: &mut CommandContext, args: &IndexStartArgs) -> Result
         bail!("arrowhead indexer already running for this vault");
     }
 
+    remove_stale_runtime_metadata(&paths)?;
+
     ensure_runtime_dirs(&vault, &paths)?;
     println!("initialising arrowhead indexer…");
 
     let manager = AutoStartManager::detect(paths.autostart_manifest_path.clone());
+    let launched_at = Utc::now();
     let mut pid: Option<u32> = None;
 
     if let Some(manager) = &manager {
@@ -328,24 +337,24 @@ async fn handle_start(ctx: &mut CommandContext, args: &IndexStartArgs) -> Result
         remove_pid_file(&paths.pid_path)?;
     }
 
-    if !args.no_wait {
-        wait_for_socket(&paths.socket_path, STARTUP_TIMEOUT)
-            .await
-            .with_context(|| "indexer failed to expose control socket in time")?;
-    }
-
-    update_config_with_status(ctx, &paths, None)?;
-
-    if let Some(actual_pid) = pid {
-        println!(
-            "arrowhead indexer started (pid {actual_pid}). Control socket: {}",
-            paths.socket_path.display()
-        );
+    let status = if args.no_wait {
+        None
     } else {
-        println!(
-            "arrowhead indexer started. Control socket: {}",
-            paths.socket_path.display()
-        );
+        let startup = wait_for_startup(&paths, launched_at, STARTUP_TIMEOUT).await?;
+        let status = startup.status().cloned();
+        print_start_result(&paths, pid, startup, "Arrowhead indexer launch requested.");
+        status
+    };
+
+    update_config_with_status(ctx, &paths, status)?;
+
+    if args.no_wait {
+        if let Some(actual_pid) = pid {
+            println!("Arrowhead indexer launch requested (pid {actual_pid}).");
+        } else {
+            println!("Arrowhead indexer launch requested.");
+        }
+        print_status_follow_up(&paths);
     }
 
     Ok(())
@@ -365,12 +374,17 @@ async fn handle_stop(ctx: &mut CommandContext) -> Result<()> {
         }
         Err(err) => {
             if paths.socket_path.exists() {
-                return Err(err.context("failed to contact arrowhead indexer"));
+                println!(
+                    "control socket exists but the indexer is unreachable; removing stale socket ({})",
+                    err
+                );
+                remove_stale_socket(&paths.socket_path)?;
+            } else {
+                println!(
+                    "no active indexer detected; cleaning up stale metadata ({})",
+                    err
+                );
             }
-            println!(
-                "no active indexer detected; cleaning up stale metadata ({})",
-                err
-            );
         }
     }
 
@@ -609,7 +623,6 @@ pub(crate) struct DaemonPaths {
     pub log_path: PathBuf,
 }
 
-#[cfg(test)]
 async fn fetch_status(paths: &DaemonPaths) -> Result<Option<DaemonStatus>> {
     match send_control_request(&paths.socket_path, ControlRequest::StatusSnapshot).await {
         Ok(ControlResponse::Status { status }) => Ok(Some(status)),
@@ -817,17 +830,6 @@ fn remove_pid_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
-    let start = Instant::now();
-    while !path.exists() {
-        if start.elapsed() > timeout {
-            bail!("timed out waiting for control socket {}", path.display());
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-    Ok(())
-}
-
 async fn wait_for_socket_removal(path: &Path, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     while path.exists() {
@@ -840,6 +842,153 @@ async fn wait_for_socket_removal(path: &Path, timeout: Duration) -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
     Ok(())
+}
+
+async fn wait_for_startup(
+    paths: &DaemonPaths,
+    launched_at: DateTime<Utc>,
+    timeout: Duration,
+) -> Result<StartupWaitOutcome> {
+    let start = Instant::now();
+    let mut last_status = None;
+    let mut last_reported_state = None;
+    let mut announced_wait = false;
+
+    loop {
+        let live = is_socket_alive(paths).await?;
+        if let Some(status) = load_fresh_status(paths, launched_at).await? {
+            if last_reported_state != Some(status.activity.state) {
+                println!("{}", startup_status_line(&status));
+                last_reported_state = Some(status.activity.state);
+            }
+            last_status = Some(status);
+        } else if !announced_wait && start.elapsed() >= Duration::from_secs(1) {
+            println!(
+                "Waiting for the Arrowhead control socket at {}…",
+                paths.socket_path.display()
+            );
+            announced_wait = true;
+        }
+
+        if live {
+            return Ok(StartupWaitOutcome::Ready(last_status));
+        }
+
+        if start.elapsed() > timeout {
+            return Ok(StartupWaitOutcome::Pending(last_status));
+        }
+
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn load_fresh_status(
+    paths: &DaemonPaths,
+    launched_at: DateTime<Utc>,
+) -> Result<Option<DaemonStatus>> {
+    let Some(status) = fetch_status(paths).await? else {
+        return Ok(None);
+    };
+    if status.updated_at < launched_at {
+        return Ok(None);
+    }
+    Ok(Some(status))
+}
+
+fn print_start_result(
+    paths: &DaemonPaths,
+    pid: Option<u32>,
+    startup: StartupWaitOutcome,
+    ready_message: &str,
+) {
+    match startup {
+        StartupWaitOutcome::Ready(status) => {
+            if let Some(actual_pid) = pid {
+                println!("{ready_message} (pid {actual_pid}).");
+            } else {
+                println!("{ready_message}");
+            }
+            if let Some(status) = status {
+                println!("Current state: {}", startup_status_brief(&status));
+            }
+            print_status_follow_up(paths);
+        }
+        StartupWaitOutcome::Pending(status) => {
+            if let Some(actual_pid) = pid {
+                println!(
+                    "Arrowhead daemon is still starting in the background (pid {actual_pid}); the control socket is not ready yet."
+                );
+            } else {
+                println!(
+                    "Arrowhead daemon is still starting in the background; the control socket is not ready yet."
+                );
+            }
+            if let Some(status) = status {
+                println!("Latest state: {}", startup_status_brief(&status));
+            } else {
+                println!("Latest state: no fresh daemon status yet.");
+            }
+            print_status_follow_up(paths);
+        }
+    }
+}
+
+fn print_status_follow_up(paths: &DaemonPaths) {
+    println!("Control socket: {}", paths.socket_path.display());
+    println!("Status file: {}", paths.status_path.display());
+    println!("Log: {}", paths.log_path.display());
+    println!("Watch progress: `arrowhead index status` or `arrowhead index status --json`.");
+}
+
+fn startup_status_line(status: &DaemonStatus) -> String {
+    match status.activity.state {
+        ActivityState::Starting => "Arrowhead daemon is starting up.".to_string(),
+        ActivityState::Downloading => {
+            let detail = status
+                .activity
+                .description
+                .clone()
+                .unwrap_or_else(|| "downloading embeddings".to_string());
+            format!("Arrowhead daemon is {detail}.")
+        }
+        ActivityState::Indexing => {
+            let detail = status
+                .activity
+                .description
+                .clone()
+                .unwrap_or_else(|| "building the initial index".to_string());
+            format!("Arrowhead daemon is {detail}.")
+        }
+        ActivityState::Removing => {
+            "Arrowhead daemon is reconciling stale index entries.".to_string()
+        }
+        ActivityState::Faulted => "Arrowhead daemon reported a startup issue.".to_string(),
+        ActivityState::Idle => "Arrowhead daemon is idle.".to_string(),
+    }
+}
+
+fn startup_status_brief(status: &DaemonStatus) -> String {
+    status
+        .activity
+        .description
+        .clone()
+        .unwrap_or_else(|| describe_activity(status.activity.state).to_string())
+}
+
+fn remove_stale_runtime_metadata(paths: &DaemonPaths) -> Result<()> {
+    if paths.socket_path.exists() {
+        remove_stale_socket(&paths.socket_path)?;
+    }
+    if let Some(pid) = read_pid_file(&paths.pid_path)? {
+        println!("Removing stale PID file for process {pid}.");
+        remove_pid_file(&paths.pid_path)?;
+    }
+    Ok(())
+}
+
+fn remove_stale_socket(path: &Path) -> Result<()> {
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove stale control socket {}", path.display()))
 }
 
 async fn stream_frames(
@@ -966,6 +1115,7 @@ fn render_snapshot(status: &DaemonStatus, tty: bool) {
 
 pub(super) fn describe_activity(state: ActivityState) -> &'static str {
     match state {
+        ActivityState::Starting => "starting",
         ActivityState::Idle => "idle",
         ActivityState::Indexing => "indexing",
         ActivityState::Removing => "removing stale notes",
@@ -1022,6 +1172,68 @@ mod tests {
             .expect("fetch status")
             .expect("status present");
         assert_eq!(fetched.indexed_notes, 5);
+    }
+
+    #[tokio::test]
+    async fn wait_for_startup_reports_pending_when_fresh_status_exists() {
+        let dir = TempDir::new().expect("temp vault");
+        let vault_path = dir.path().join("vault");
+        fs::create_dir_all(&vault_path).expect("create vault");
+
+        let (_vault, paths) = load_vault_environment(&vault_path).expect("env");
+        fs::create_dir_all(&paths.daemon_dir).expect("daemon dir");
+
+        let launched_at = Utc::now();
+        let mut status = DaemonStatus::new(paths.log_path.clone());
+        status.updated_at = Utc::now();
+        status.activity = ActivityStatus::running(ActivityState::Starting, None, 0);
+        status.activity.description = Some("starting arrowhead daemon".to_string());
+        status
+            .save_to_path(&paths.status_path)
+            .expect("save status");
+
+        let outcome = wait_for_startup(&paths, launched_at, Duration::from_millis(1))
+            .await
+            .expect("startup wait succeeds");
+        assert!(
+            matches!(outcome, StartupWaitOutcome::Pending(Some(_))),
+            "expected pending startup outcome, got {outcome:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_removes_stale_socket_metadata() {
+        let dir = TempDir::new().expect("temp dir");
+        let vault_path = dir.path().join("vault");
+        let arrowhead_dir = vault_path.join(".arrowhead");
+        let config_path = dir.path().join("config.toml");
+
+        fs::create_dir_all(arrowhead_dir.join("daemon")).expect("create daemon dir");
+        fs::create_dir_all(arrowhead_dir.join("logs")).expect("create logs dir");
+        fs::create_dir_all(&vault_path).expect("create vault");
+
+        let socket_path = arrowhead_dir.join("daemon/control.sock");
+        fs::write(&socket_path, b"stale").expect("write stale socket placeholder");
+        let pid_path = arrowhead_dir.join("daemon/daemon.pid");
+        fs::write(&pid_path, b"12345").expect("write pid file");
+
+        let app_config = AppConfig {
+            vault: Some(vault_path.clone()),
+            daemon: CliDaemonConfig {
+                socket_path: Some(socket_path.clone()),
+                status_path: Some(arrowhead_dir.join("daemon/status.json")),
+                auto_start_enabled: Some(false),
+                last_status: None,
+            },
+            ..AppConfig::default()
+        };
+
+        let mut ctx = CommandContext::new(app_config, Some(config_path), 0);
+        handle_stop(&mut ctx).await.expect("stop succeeds");
+
+        assert!(!socket_path.exists(), "stale socket should be removed");
+        assert!(!pid_path.exists(), "stale pid file should be removed");
     }
 
     #[tokio::test]

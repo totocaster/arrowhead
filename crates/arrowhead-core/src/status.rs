@@ -166,6 +166,8 @@ impl ActivityStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityState {
+    /// The daemon has started booting but is not ready to serve the control socket yet.
+    Starting,
     /// No work is currently being performed.
     Idle,
     /// Indexing work is in progress.

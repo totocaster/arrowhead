@@ -68,6 +68,6 @@ alfred-workflow:
 .PHONY: help
 help:
 	@printf 'Available targets:\n'
-	@printf '  install    Build and install arrowhead-cli and arrowheadd (override PREFIX, LOCKED=0, FORCE=1 as needed)\n'
+	@printf '  install    Build and install arrowhead-cli and arrowheadd (uses --locked by default; override PREFIX, LOCKED=0, FORCE=1 only when needed)\n'
 	@printf '  clean      Remove target artifacts via cargo clean\n'
 	@printf '  alfred-workflow  Package integrations/alfred-workflow into workflow/arrowhead-search.alfredworkflow\n'

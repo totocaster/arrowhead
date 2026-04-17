@@ -3529,6 +3529,7 @@ fn summarise_activity(activity: &ActivityStatus) -> Option<String> {
     }
 
     match activity.state {
+        ActivityState::Starting => Some("starting".to_string()),
         ActivityState::Idle => Some("idle".to_string()),
         ActivityState::Indexing => activity
             .note_id

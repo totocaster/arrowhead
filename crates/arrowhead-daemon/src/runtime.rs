@@ -238,7 +238,9 @@ impl DaemonRuntime {
 
         let logging_guard = crate::logging::init_logging(&config.log_path)?;
 
-        let status_snapshot = DaemonStatus::new(config.log_path.clone());
+        let mut status_snapshot = DaemonStatus::new(config.log_path.clone());
+        status_snapshot.activity = ActivityStatus::running(ActivityState::Starting, None, 0);
+        status_snapshot.activity.description = Some("starting arrowhead daemon".to_string());
         status_snapshot.save_to_path(&config.status_path)?;
         let status = Arc::new(Mutex::new(status_snapshot.clone()));
         let (frame_tx, _) = broadcast::channel(256);

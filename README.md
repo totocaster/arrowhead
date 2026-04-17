@@ -71,7 +71,7 @@ brew install totocaster/tap/arrowhead
 arrowhead init
 ```
 
-This command launches and registers the indexer, which watches your files and keeps the index ready to use. Initial indexing might take some time depending on your vault size; run `arrowhead index status` to monitor progress.
+This command launches and registers the indexer, which watches your files and keeps the index ready to use. Initial indexing might take some time depending on your vault size. Use `arrowhead index status` for the live TUI, `arrowhead index status --json` for agent-friendly output, and `.arrowhead/daemon/status.json` plus `.arrowhead/logs/daemon.log` for immediate filesystem state while the daemon is still starting.
 
 When you initialise a non-Obsidian workspace, Arrowhead writes `.arrowhead/workspace.toml` to capture attachments, ignored folders, daily note format, and preferred link style. Use flags such as `--attachments-dir`, `--ignore`, `--daily-note-format`, and `--link-style` during `arrowhead init` to pre-populate those values; Obsidian vaults continue to pull the same data from `.obsidian`. You can inspect or tweak these settings later with `arrowhead workspace show` and `arrowhead workspace set`.
 
@@ -171,6 +171,9 @@ arrowhead/
 ## Building
 
 ```bash
+# Uses `Cargo.lock` by default. Set `LOCKED=0` only if you intentionally want
+# unlocked dependency resolution.
+
 # Build all crates
 cargo build
 
@@ -178,7 +181,7 @@ cargo build
 cargo build --release
 
 # Install CLI + daemon (installs `arrowhead` + `arrowheadd`)
-make install PREFIX=$HOME/.local LOCKED=0 FORCE=1
+make install PREFIX=$HOME/.local FORCE=1
 
 # Run CLI
 arrowhead --help
@@ -198,7 +201,11 @@ arrowhead init --vault /path/to/vault [--embeddings fast|good|better|none] [--ft
 # Launch or check the background indexer
 arrowhead index start
 arrowhead index status
-# Interactive TUI output; add --json for machine-readable frames.
+# Interactive TUI output.
+arrowhead index status --json
+# Machine-readable status frames for agents/automation.
+cat /path/to/vault/.arrowhead/daemon/status.json
+# Immediate startup snapshot if the control socket is still coming up.
 
 # Manage auto-start registration (per-user launchd/systemd)
 arrowhead index autostart enable
@@ -229,7 +236,8 @@ arrowhead context week --this
 arrowhead context month --this
 arrowhead context changed --days 3
 arrowhead context note "Project Hub"
-# Compatibility aliases and richer context views
+# Compatibility aliases retained pre-1.0
+arrowhead graph context "Project Hub"
 arrowhead notes similar "Photography Equipment"
 arrowhead notes surprise "Project Hub" --limit 3 --json
 arrowhead context metric body.weight
@@ -261,7 +269,7 @@ arrowhead --mcp-server --generate-token
 ```
 
 Semantic-only matches surface `"N/A"` in the BM25 column of the human-readable output to clarify that no lexical score is available. Graph listings pick up the same pipe-friendly `--format ids` option for backlinks, forward-links, orphans, and unresolved link reports.
-Context commands are exploration-first: day views emphasise notes created or edited, metrics recorded, link activity in changed notes, adjacent days, and concrete next pivots instead of count-heavy summaries.
+Context commands are exploration-first: day views emphasise notes added or edited, metrics recorded, link activity in changed notes, adjacent days, and concrete next pivots instead of count-heavy summaries.
 
 ## Alfred Workflow Integration
 
@@ -278,6 +286,7 @@ Context commands are exploration-first: day views emphasise notes created or edi
 - `arrowhead vault <subcommand>` — inspect filesystem state or reset Arrowhead caches (`status`, `reset`).
 - `arrowhead search` — execute FTS, semantic, or hybrid searches with pipe-friendly output formats.
 - `arrowhead notes` — perform note CRUD operations plus compatibility aliases that forward `notes similar` / `notes surprise` to `context note`.
+- `arrowhead metrics <subcommand>` — inspect metrics files and records and mutate metric rows.
 - `arrowhead context` — retrieve richer day, week, changed, note, metric, and source context views with stable JSON sections.
 - `arrowhead graph` — inspect backlinks, forward links, orphans, unresolved links, or the `graph context` compatibility alias for `context note` (`--json` emits machine-readable payloads).
 - `arrowhead --mcp[(-server)]` — launch the stdio or HTTP MCP transport with shared handlers, token auth, CIDR filtering, and `/health` readiness probes.

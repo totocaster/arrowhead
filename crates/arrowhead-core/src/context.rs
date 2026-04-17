@@ -443,13 +443,13 @@ impl ContextService {
         note_limit: Option<usize>,
         metric_limit: Option<usize>,
     ) -> Result<ContextPayload> {
-        self.ensure_note_indexed(note_id).await?;
+        let note_id = self.resolve_note_id(note_id).await?;
         let note_limit = note_limit.unwrap_or(DEFAULT_CONTEXT_NOTE_LIMIT).max(1);
         let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
-        let note = self.load_note(note_id).await?;
+        let note = self.load_note(&note_id).await?;
         let anchor_note = note_item_from_note_record(&note, Some("Anchor note".to_string()));
 
-        let graph_context = self.graph.context(note_id).await?;
+        let graph_context = self.graph.context(&note_id).await?;
         let unresolved_links = graph_context
             .forward_links
             .iter()
@@ -1435,19 +1435,19 @@ impl ContextService {
         })
     }
 
-    async fn ensure_note_indexed(&self, note_id: &str) -> Result<()> {
+    async fn resolve_note_id(&self, note_id: &str) -> Result<String> {
         let database = Arc::clone(&self.database);
         let note_id = note_id.to_string();
         let lookup_id = note_id.clone();
-        let indexed = task::spawn_blocking(move || database.note_state(&lookup_id))
+        let resolved = task::spawn_blocking(move || database.resolve_note_reference(&lookup_id))
             .await
-            .context("note state task aborted")??;
-        if indexed.is_none() {
+            .context("note resolution task aborted")??;
+        let Some(resolved) = resolved else {
             bail!(
                 "note {note_id} is not indexed. Run `arrowhead index start` to refresh the index."
             );
-        }
-        Ok(())
+        };
+        Ok(resolved.note_id)
     }
 
     async fn load_note(&self, note_id: &str) -> Result<NoteRecord> {

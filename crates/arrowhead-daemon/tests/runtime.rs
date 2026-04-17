@@ -152,7 +152,8 @@ async fn status_stream_emits_frames() -> Result<()> {
     assert!(
         matches!(
             first.status.activity.state,
-            ActivityState::Idle
+            ActivityState::Starting
+                | ActivityState::Idle
                 | ActivityState::Indexing
                 | ActivityState::Downloading
                 | ActivityState::Removing

@@ -449,10 +449,10 @@ fn render_day_context(payload: &ContextPayload) {
     }
 
     if !payload.activity.notes_created.is_empty() {
-        println!("\nNotes Created");
+        println!("\nNotes Added");
         for note in &payload.activity.notes_created {
             print_note_line(note);
-            print_optional_timestamp("created", note.created_at);
+            print_optional_timestamp("file created", note.created_at);
         }
     }
 
@@ -495,10 +495,10 @@ fn render_day_context(payload: &ContextPayload) {
 
 fn render_window_context(payload: &ContextPayload) {
     if !payload.activity.notes_created.is_empty() {
-        println!("\nNotes Created");
+        println!("\nNotes Added");
         for note in &payload.activity.notes_created {
             print_note_line(note);
-            print_optional_timestamp("created", note.created_at);
+            print_optional_timestamp("file created", note.created_at);
         }
     }
 

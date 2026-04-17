@@ -27,6 +27,9 @@ use config::AppConfig;
                   call mcp.discovery.get_vault_conventions before any note creation, update, \
                   or deletion so agents respect local naming rules."
 )]
+#[command(
+    after_help = "Compatibility aliases:\n  arrowhead notes similar <note> -> arrowhead context note <note>\n  arrowhead notes surprise <note> -> arrowhead context note <note>\n  arrowhead graph context <note> -> arrowhead context note <note>\n\nDaemon status:\n  arrowhead index status\n  arrowhead index status --json"
+)]
 struct Cli {
     /// Path to the vault that should be used for this invocation.
     #[arg(long, value_name = "PATH", global = true)]
