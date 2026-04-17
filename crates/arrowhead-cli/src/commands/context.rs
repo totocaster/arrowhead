@@ -636,6 +636,13 @@ fn render_source_context(payload: &ContextPayload) {
         }
     }
 
+    if !payload.related.metric_rollups.is_empty() {
+        println!("\nMetric Trends");
+        for rollup in &payload.related.metric_rollups {
+            print_metric_rollup(rollup);
+        }
+    }
+
     if !payload.related.notes.is_empty() {
         println!("\nRelated Notes");
         for note in &payload.related.notes {

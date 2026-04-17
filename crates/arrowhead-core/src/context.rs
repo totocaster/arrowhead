@@ -743,16 +743,21 @@ impl ContextService {
 
         let note_limit = note_limit.unwrap_or(DEFAULT_CONTEXT_NOTE_LIMIT).max(1);
         let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
-        let mut metrics = self
+        let mut all_metrics = self
             .metrics
-            .search(
-                &build_metrics_field_query("source", source, range),
-                Some(metric_limit),
-            )
+            .search(&build_metrics_field_query("source", source, range), None)
             .await?;
-        if metrics.is_empty() {
+        if all_metrics.is_empty() {
             bail!("source `{source}` was not found in indexed metrics");
         }
+        sort_metric_records(&mut all_metrics);
+        let metric_rollups = metric_rollups_for_window(
+            &all_metrics,
+            metric_limit.clamp(1, 4),
+            metric_limit.clamp(1, 5),
+            Some(format!("Daily trend for source `{source}`")),
+        );
+        let mut metrics = all_metrics.clone();
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
@@ -784,10 +789,10 @@ impl ContextService {
             });
         }
 
-        let attention = attention_items_for_metrics(&metrics);
-        let files = self.metric_files_for_records(&metrics).await?;
+        let attention = attention_items_for_metrics(&all_metrics);
+        let files = self.metric_files_for_records(&all_metrics).await?;
         let related_metric_items = metric_items_from_records_dedup_by_key(
-            &metrics,
+            &all_metrics,
             Some("Metric emitted by requested source".to_string()),
             metric_limit,
         );
@@ -798,6 +803,8 @@ impl ContextService {
             &related_notes,
             &related_days,
             &related_metric_items,
+            &metric_rollups,
+            range,
         );
 
         Ok(ContextPayload {
@@ -807,8 +814,8 @@ impl ContextService {
                 label: Some(format!(
                     "{} ({} record{})",
                     source,
-                    metrics.len(),
-                    if metrics.len() == 1 { "" } else { "s" }
+                    all_metrics.len(),
+                    if all_metrics.len() == 1 { "" } else { "s" }
                 )),
                 note_count: related_notes.len(),
                 metric_count: metrics.len(),
@@ -833,8 +840,8 @@ impl ContextService {
                 days: related_days,
                 notes: related_notes,
                 metrics: related_metric_items,
-                metric_rollups: Vec::new(),
-                metric_keys: unique_metric_keys(&metrics),
+                metric_rollups,
+                metric_keys: unique_metric_keys(&all_metrics),
                 sources: vec![source.to_string()],
             },
             pivots,
@@ -997,7 +1004,7 @@ impl ContextService {
         trim_note_items(&mut history_notes, note_limit);
         trim_note_items(&mut created_notes, note_limit);
         trim_note_items(&mut updated_notes, note_limit);
-        let mut metrics = self
+        let mut all_metrics = self
             .metrics
             .search(
                 &format!(
@@ -1005,9 +1012,17 @@ impl ContextService {
                     start.format("%Y-%m-%d"),
                     end.format("%Y-%m-%d")
                 ),
-                Some(metric_limit),
+                None,
             )
             .await?;
+        sort_metric_records(&mut all_metrics);
+        let metric_rollups = metric_rollups_for_window(
+            &all_metrics,
+            metric_limit.clamp(1, 4),
+            metric_limit.clamp(1, 5),
+            Some("Daily trend inside the requested week".to_string()),
+        );
+        let mut metrics = all_metrics.clone();
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
@@ -1019,7 +1034,7 @@ impl ContextService {
             ],
             note_limit,
         );
-        let files = self.metric_files_for_records(&metrics).await?;
+        let files = self.metric_files_for_records(&all_metrics).await?;
         let mut activity_links = self
             .note_links_for_notes(
                 &created_notes,
@@ -1035,10 +1050,10 @@ impl ContextService {
         );
         dedup_context_links(&mut activity_links);
         trim_context_links(&mut activity_links, note_limit.saturating_mul(2).max(1));
-        let active_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
+        let active_days = active_days_from_notes_and_metrics(&related_notes, &all_metrics)
             .into_iter()
             .collect::<Vec<_>>();
-        let attention = attention_items_for_metrics(&metrics);
+        let attention = attention_items_for_metrics(&all_metrics);
         let links = build_window_links(
             &format!("week:{}..{}", start, end),
             "Requested week contains note activity",
@@ -1046,7 +1061,15 @@ impl ContextService {
             "Requested week contains metric activity",
             &metrics,
         );
-        let pivots = build_day_pivots(&start.to_string(), &related_notes, &metrics, &active_days);
+        let week_range_label = format!("{start}..{end}");
+        let pivots = build_window_pivots(
+            &week_range_label,
+            &related_notes,
+            &metrics,
+            &active_days,
+            &metric_rollups,
+            "Inspect the strongest metric trend in this week.",
+        );
 
         Ok(ContextPayload {
             summary: ContextSummary {
@@ -1080,9 +1103,9 @@ impl ContextService {
                 days: active_days,
                 notes: related_notes,
                 metrics: Vec::new(),
-                metric_rollups: Vec::new(),
-                metric_keys: unique_metric_keys(&metrics),
-                sources: unique_metric_sources(&metrics),
+                metric_rollups,
+                metric_keys: unique_metric_keys(&all_metrics),
+                sources: unique_metric_sources(&all_metrics),
             },
             pivots,
         })
@@ -1175,12 +1198,13 @@ impl ContextService {
             &metrics,
         );
         let month_range_label = format!("{start}..{end}");
-        let pivots = build_month_pivots(
+        let pivots = build_window_pivots(
             &month_range_label,
             &related_notes,
             &metrics,
             &active_days,
             &metric_rollups,
+            "Inspect the strongest metric trend in this month.",
         );
 
         Ok(ContextPayload {
@@ -1258,7 +1282,7 @@ impl ContextService {
         trim_note_items(&mut created_notes, note_limit);
         trim_note_items(&mut updated_notes, note_limit);
         let (start, end) = date_bounds_for_range(&changed_range)?;
-        let mut metrics = self
+        let mut all_metrics = self
             .metrics
             .search(
                 &format!(
@@ -1266,9 +1290,17 @@ impl ContextService {
                     start.format("%Y-%m-%d"),
                     end.format("%Y-%m-%d")
                 ),
-                Some(metric_limit),
+                None,
             )
             .await?;
+        sort_metric_records(&mut all_metrics);
+        let metric_rollups = metric_rollups_for_window(
+            &all_metrics,
+            metric_limit.clamp(1, 4),
+            metric_limit.clamp(1, 5),
+            Some("Daily trend inside the changed window".to_string()),
+        );
+        let mut metrics = all_metrics.clone();
         sort_metric_records(&mut metrics);
         trim_metric_records(&mut metrics, metric_limit);
 
@@ -1281,7 +1313,7 @@ impl ContextService {
             note_limit,
         );
         let files = merge_metric_files(
-            self.metric_files_for_records(&metrics).await?,
+            self.metric_files_for_records(&all_metrics).await?,
             self.metric_files_for_modified_range(&changed_range).await?,
         );
         let mut activity_links = self
@@ -1293,10 +1325,10 @@ impl ContextService {
         );
         dedup_context_links(&mut activity_links);
         trim_context_links(&mut activity_links, note_limit.saturating_mul(2).max(1));
-        let active_days = active_days_from_notes_and_metrics(&related_notes, &metrics)
+        let active_days = active_days_from_notes_and_metrics(&related_notes, &all_metrics)
             .into_iter()
             .collect::<Vec<_>>();
-        let attention = attention_items_for_metrics(&metrics);
+        let attention = attention_items_for_metrics(&all_metrics);
         let links = build_window_links(
             &format!("changed:past{days}d"),
             "Recently changed note",
@@ -1304,11 +1336,14 @@ impl ContextService {
             "Recently recorded metric",
             &metrics,
         );
-        let pivots = build_day_pivots(
-            &format!("past{days}d"),
+        let changed_target = format!("past{days}d");
+        let pivots = build_window_pivots(
+            &changed_target,
             &related_notes,
             &metrics,
             &active_days,
+            &metric_rollups,
+            "Inspect the strongest recent metric trend.",
         );
 
         Ok(ContextPayload {
@@ -1346,9 +1381,9 @@ impl ContextService {
                 days: active_days,
                 notes: related_notes,
                 metrics: Vec::new(),
-                metric_rollups: Vec::new(),
-                metric_keys: unique_metric_keys(&metrics),
-                sources: unique_metric_sources(&metrics),
+                metric_rollups,
+                metric_keys: unique_metric_keys(&all_metrics),
+                sources: unique_metric_sources(&all_metrics),
             },
             pivots,
         })
@@ -2799,14 +2834,15 @@ fn build_metric_pivots(
     pivots
 }
 
-fn build_month_pivots(
-    month_range: &str,
+fn build_window_pivots(
+    window_target: &str,
     notes: &[ContextNoteItem],
     metrics: &[MetricRecordEntry],
     active_days: &[String],
     metric_rollups: &[ContextMetricRollup],
+    aggregate_reason: &str,
 ) -> Vec<ContextPivot> {
-    let mut pivots = build_day_pivots(month_range, notes, metrics, active_days);
+    let mut pivots = build_day_pivots(window_target, notes, metrics, active_days);
     let mut seen = pivots
         .iter()
         .map(|pivot| pivot.command.clone())
@@ -2817,8 +2853,8 @@ fn build_month_pivots(
             &mut seen,
             "metrics_aggregate",
             rollup.key.clone(),
-            metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), Some(month_range)),
-            "Inspect the strongest metric trend in this month.",
+            metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), Some(window_target)),
+            aggregate_reason,
         );
     }
     pivots
@@ -2830,6 +2866,8 @@ fn build_source_pivots(
     related_notes: &[ContextNoteItem],
     related_days: &[String],
     related_metrics: &[ContextMetricItem],
+    metric_rollups: &[ContextMetricRollup],
+    range: Option<&str>,
 ) -> Vec<ContextPivot> {
     let mut pivots = Vec::new();
     let mut seen = HashSet::new();
@@ -2865,6 +2903,16 @@ fn build_source_pivots(
             note.note_id.clone(),
             format!("arrowhead context note {}", shell_quote(&note.note_id)),
             "Inspect the strongest related note for this source.",
+        );
+    }
+    if let Some(rollup) = metric_rollups.first() {
+        push_pivot(
+            &mut pivots,
+            &mut seen,
+            "metrics_aggregate",
+            rollup.key.clone(),
+            metrics_aggregate_command(&rollup.key, rollup.source.as_deref(), range),
+            format!("Inspect the strongest daily trend for source {source}."),
         );
     }
     pivots
@@ -3538,6 +3586,16 @@ mod tests {
             .expect("upsert metrics");
     }
 
+    fn insert_metric_rows(service: &ContextService, relative_path: &str, rows: &[&str]) {
+        let path = PathBuf::from(relative_path);
+        let content = rows.join("\n");
+        let parsed = parse_metrics_reader(Cursor::new(content), path.as_path()).expect("parse");
+        service
+            .database
+            .upsert_metrics_file(relative_path, Utc::now(), &parsed, Utc::now())
+            .expect("upsert metrics");
+    }
+
     fn insert_note_fixture(
         service: &ContextService,
         note_id: &str,
@@ -3963,6 +4021,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_context_surfaces_metric_rollups_and_aggregate_pivot() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .source("withings", None, Some(5), Some(5))
+            .await
+            .expect("source context");
+
+        assert!(
+            payload
+                .related
+                .metric_rollups
+                .iter()
+                .any(|rollup| rollup.key == "body.weight"
+                    && rollup.source.as_deref() == Some("withings")
+                    && rollup.active_day_count == 2),
+            "expected source context to surface a source-specific metric trend"
+        );
+        assert!(
+            payload
+                .pivots
+                .iter()
+                .any(|pivot| pivot.kind == "metrics_aggregate"),
+            "expected source context to suggest an aggregate trend pivot"
+        );
+    }
+
+    #[tokio::test]
     async fn source_context_prefers_explicit_and_structural_note_evidence() {
         let (_dir, service) = build_service();
         insert_note_fixture(
@@ -4219,6 +4304,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn week_context_surfaces_metric_rollups_and_aggregate_pivot() {
+        let (_dir, service) = build_service();
+        let payload = service
+            .week(
+                WeekContextSelector::ContainingDay(
+                    NaiveDate::from_ymd_opt(2026, 4, 14).expect("date"),
+                ),
+                Some(5),
+                Some(5),
+            )
+            .await
+            .expect("week context");
+
+        assert!(
+            payload
+                .related
+                .metric_rollups
+                .iter()
+                .any(|rollup| rollup.key == "body.weight"
+                    && rollup.source.as_deref() == Some("withings")),
+            "expected week context to surface metric trends inside the week"
+        );
+        assert!(
+            payload
+                .pivots
+                .iter()
+                .any(|pivot| pivot.kind == "metrics_aggregate"),
+            "expected week context to suggest a trend-following aggregate pivot"
+        );
+    }
+
+    #[tokio::test]
     async fn month_context_accepts_anchor_day() {
         let (_dir, service) = build_service();
         let payload = service
@@ -4306,6 +4423,45 @@ mod tests {
         assert!(
             !payload.activity.notes.is_empty(),
             "expected recent note activity in changed context"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_context_surfaces_metric_rollups_and_aggregate_pivot() {
+        let (_dir, service) = build_service();
+        let today = Utc::now().date_naive();
+        let yesterday = today - Duration::days(1);
+        let row_one = format!(
+            r#"{{"id":"01RECENT001","ts":"{}T08:30:00Z","date":"{}","key":"body.weight","value":104.0,"unit":"kg","source":"withings","note":"Recent weigh-in"}}"#,
+            yesterday, yesterday
+        );
+        let row_two = format!(
+            r#"{{"id":"01RECENT002","ts":"{}T08:45:00Z","date":"{}","key":"body.weight","value":103.8,"unit":"kg","source":"withings","note":"Today weigh-in"}}"#,
+            today, today
+        );
+        insert_metric_rows(
+            &service,
+            "Metrics/Recent.metrics.ndjson",
+            &[row_one.as_str(), row_two.as_str()],
+        );
+
+        let payload = service.changed(2, Some(5), Some(5)).await.expect("changed");
+
+        assert!(
+            payload
+                .related
+                .metric_rollups
+                .iter()
+                .any(|rollup| rollup.key == "body.weight"
+                    && rollup.source.as_deref() == Some("withings")),
+            "expected changed context to surface recent metric trends"
+        );
+        assert!(
+            payload
+                .pivots
+                .iter()
+                .any(|pivot| pivot.kind == "metrics_aggregate"),
+            "expected changed context to suggest an aggregate trend pivot"
         );
     }
 
