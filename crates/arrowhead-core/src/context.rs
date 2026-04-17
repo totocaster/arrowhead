@@ -2080,15 +2080,24 @@ impl ContextService {
                             Some(metric_limit.saturating_mul(2).max(1)),
                         )
                         .await?;
-                    for record in results {
+                    for record in filter_metric_records_to_note_sources(note, results) {
+                        let link_reason = if note_explicitly_mentions_source(
+                            note,
+                            &record.record.source,
+                        ) {
+                            format!(
+                                "Note references day {date}, metric key `{metric_key}`, and source `{}`",
+                                record.record.source
+                            )
+                        } else {
+                            format!("Note references day {date} and metric key `{metric_key}`")
+                        };
                         upsert_metric_record_evidence(
                             &mut evidence_by_metric,
                             MetricRecordEvidence {
                                 record,
                                 kind: ContextEvidenceKind::Structural,
-                                link_reason: format!(
-                                    "Note references day {date} and metric key `{metric_key}`"
-                                ),
+                                link_reason,
                                 confidence: None,
                             },
                         );
@@ -2106,7 +2115,7 @@ impl ContextService {
             if stronger_keys.contains(&metric_key) {
                 continue;
             }
-            let mut results = self
+            let results = self
                 .metrics
                 .search(
                     &build_metrics_field_query("key", &metric_key, None),
@@ -2116,16 +2125,25 @@ impl ContextService {
             if results.is_empty() {
                 continue;
             }
+            let mut results = filter_metric_records_to_note_sources(note, results);
             sort_metric_records(&mut results);
             if let Some(record) = results.into_iter().next() {
+                let link_reason = if note_explicitly_mentions_source(note, &record.record.source) {
+                    format!(
+                        "Note explicitly mentions source `{}` and metric key `{metric_key}`; latest matching record",
+                        record.record.source
+                    )
+                } else {
+                    format!(
+                        "Note explicitly mentions metric key `{metric_key}`; latest matching record"
+                    )
+                };
                 upsert_metric_record_evidence(
                     &mut evidence_by_metric,
                     MetricRecordEvidence {
                         record,
                         kind: ContextEvidenceKind::Inferred,
-                        link_reason: format!(
-                            "Note explicitly mentions metric key `{metric_key}`; latest matching record"
-                        ),
+                        link_reason,
                         confidence: Some(0.45),
                     },
                 );
@@ -3644,6 +3662,51 @@ fn note_contains_literal_phrase(note: &NoteRecord, phrase: &str) -> bool {
         .any(|window| window.join(" ") == needle)
 }
 
+fn source_match_terms(source: &str) -> BTreeSet<String> {
+    let mut terms = BTreeSet::new();
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return terms;
+    }
+
+    terms.insert(trimmed.to_string());
+
+    for suffix in ["-health-log", "_health_log", "-log", "_log"] {
+        if let Some(stripped) = trimmed.strip_suffix(suffix).map(str::trim) {
+            if stripped.len() >= 3 {
+                terms.insert(stripped.to_string());
+            }
+        }
+    }
+
+    terms
+}
+
+fn note_explicitly_mentions_source(note: &NoteRecord, source: &str) -> bool {
+    source_match_terms(source)
+        .iter()
+        .any(|term| note_contains_literal_phrase(note, term))
+}
+
+fn filter_metric_records_to_note_sources(
+    note: &NoteRecord,
+    records: Vec<MetricRecordEntry>,
+) -> Vec<MetricRecordEntry> {
+    let matching_sources = records
+        .iter()
+        .map(|record| record.record.source.clone())
+        .filter(|source| note_explicitly_mentions_source(note, source))
+        .collect::<HashSet<_>>();
+    if matching_sources.is_empty() {
+        return records;
+    }
+
+    records
+        .into_iter()
+        .filter(|record| matching_sources.contains(&record.record.source))
+        .collect()
+}
+
 fn is_context_noise_search_result(result: &SearchResult) -> bool {
     result
         .relative_path
@@ -4041,6 +4104,57 @@ mod tests {
                         == Some("Note references day 2026-04-15 and metric key `body.weight`")
             }),
             "expected key-scoped structural reason for note metric leads"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_context_prefers_source_qualified_metric_records() {
+        let (_dir, service) = build_service();
+        insert_metric_rows(
+            &service,
+            "Metrics/Manual.metrics.ndjson",
+            &[
+                r#"{"id":"01AAC","ts":"2026-04-16T08:45:00+00:00","date":"2026-04-16","key":"body.weight","value":104.8,"unit":"kg","source":"manual-health-log"}"#,
+            ],
+        );
+        insert_note_fixture(
+            &service,
+            "Withings Weight Review",
+            Some("Withings Weight Review"),
+            "Compare body.weight from withings against the recent trend.",
+            Some(ts(2026, 4, 16, 8, 0)),
+            ts(2026, 4, 16, 8, 30),
+        );
+
+        let payload = service
+            .note("Withings Weight Review", Some(5), Some(10))
+            .await
+            .expect("note context");
+
+        let body_weight = payload
+            .related
+            .metrics
+            .iter()
+            .find(|metric| metric.key == "body.weight")
+            .expect("body.weight lead");
+        assert_eq!(
+            body_weight.source, "withings",
+            "expected source-qualified note evidence to prefer withings over newer manual rows"
+        );
+        assert_eq!(
+            body_weight.reason.as_deref(),
+            Some(
+                "Note explicitly mentions source `withings` and metric key `body.weight`; latest matching record"
+            ),
+            "expected reason to explain the source-qualified key match"
+        );
+        assert!(
+            payload
+                .related
+                .sources
+                .iter()
+                .all(|source| source != "manual-health-log"),
+            "expected unrelated manual source rows to stay out once the note names withings"
         );
     }
 
