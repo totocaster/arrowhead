@@ -349,6 +349,7 @@ That implies, at minimum:
 - `--json` for structured machine output
 - concise default help with examples
 - full `-h` and `--help` support at every command level
+- standard `--version` support, with `-V` when `-v` is reserved for verbosity
 - consistent noun/verb naming across subcommands
 - actionable, conversational error messages
 - clear post-action state summaries when a command changes data

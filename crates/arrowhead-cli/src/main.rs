@@ -20,7 +20,7 @@ use config::AppConfig;
 
 /// Arrowhead command-line interface options.
 #[derive(Debug, Parser)]
-#[command(name = "arrowhead")]
+#[command(name = "arrowhead", version)]
 #[command(
     about = "Obsidian vault search and MCP integration",
     long_about = "Obsidian vault search and MCP integration. When exposing MCP transports, \
@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -170,5 +171,23 @@ mod tests {
         let cli = Cli::try_parse_from(["arrowhead", "--mcp-server", "index", "status"])
             .expect("parse mcp-server + subcommand");
         assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn cli_supports_standard_version_flags() {
+        for flag in ["--version", "-V"] {
+            let err = Cli::try_parse_from(["arrowhead", flag]).expect_err("version should exit");
+            assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+            assert_eq!(
+                err.to_string(),
+                format!("arrowhead {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+
+    #[test]
+    fn short_verbose_flag_remains_available() {
+        let cli = Cli::try_parse_from(["arrowhead", "-v"]).expect("verbose should parse");
+        assert_eq!(cli.verbose, 1);
     }
 }

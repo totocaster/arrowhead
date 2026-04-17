@@ -182,6 +182,7 @@ make install PREFIX=$HOME/.local LOCKED=0 FORCE=1
 
 # Run CLI
 arrowhead --help
+arrowhead --version
 
 # Run tests
 cargo test

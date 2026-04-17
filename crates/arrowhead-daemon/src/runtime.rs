@@ -16,7 +16,7 @@ use arrowhead_core::{
     ActivityState, ActivityStatus, DaemonStatus, DownloadState, DownloadStatus, IssueSeverity,
     StatusFrame, StatusIssue, Vault, VaultConfig,
 };
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 use fastembed::{EmbeddingModel, ModelTrait};
 use hf_hub::api::{Progress, sync::ApiBuilder};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -1047,7 +1047,7 @@ const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
 const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
 
 #[derive(Debug, Parser)]
-#[command(name = "arrowheadd")]
+#[command(name = "arrowheadd", version)]
 struct DaemonCliArgs {
     /// Vault root to index.
     #[arg(long, value_name = "PATH")]
@@ -1096,16 +1096,11 @@ fn normalize_embedding_model(value: Option<String>) -> Option<String> {
     }
 }
 
-fn resolve_daemon_cli_from<I, T>(
-    args: I,
+fn resolve_daemon_cli_args(
+    cli: DaemonCliArgs,
     env_vault: Option<PathBuf>,
     env_embedding_model: Option<&str>,
-) -> Result<ResolvedDaemonCli>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<std::ffi::OsString> + Clone,
-{
-    let cli = DaemonCliArgs::try_parse_from(args).map_err(|err| anyhow!(err.to_string()))?;
+) -> Result<ResolvedDaemonCli> {
     let vault_root = cli.vault.or(env_vault).ok_or_else(|| {
         anyhow!("vault path must be provided with `--vault <path>` or ARROWHEAD_VAULT")
     })?;
@@ -1123,14 +1118,37 @@ where
     })
 }
 
+#[cfg(test)]
+fn resolve_daemon_cli_from<I, T>(
+    args: I,
+    env_vault: Option<PathBuf>,
+    env_embedding_model: Option<&str>,
+) -> Result<ResolvedDaemonCli>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = DaemonCliArgs::try_parse_from(args).map_err(|err| anyhow!(err.to_string()))?;
+    resolve_daemon_cli_args(cli, env_vault, env_embedding_model)
+}
+
 fn resolve_daemon_cli() -> Result<ResolvedDaemonCli> {
     let env_vault = std::env::var_os("ARROWHEAD_VAULT").map(PathBuf::from);
     let env_embedding_model = std::env::var("ARROWHEAD_EMBEDDING_MODEL").ok();
-    resolve_daemon_cli_from(
-        std::env::args_os(),
-        env_vault,
-        env_embedding_model.as_deref(),
-    )
+    let cli = match DaemonCliArgs::try_parse() {
+        Ok(cli) => cli,
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            err.print().context("failed to write clap output")?;
+            std::process::exit(0);
+        }
+        Err(err) => return Err(anyhow!(err.to_string())),
+    };
+    resolve_daemon_cli_args(cli, env_vault, env_embedding_model.as_deref())
 }
 
 /// Default CLI entrypoint used by the binary.
@@ -1154,6 +1172,7 @@ pub async fn cli_main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     #[test]
     fn resolve_daemon_cli_prefers_flags_over_env() {
@@ -1203,5 +1222,18 @@ mod tests {
             err.to_string().contains("ARROWHEAD_VAULT"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn daemon_cli_supports_standard_version_flags() {
+        for flag in ["--version", "-V"] {
+            let err =
+                DaemonCliArgs::try_parse_from(["arrowheadd", flag]).expect_err("version exits");
+            assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+            assert_eq!(
+                err.to_string(),
+                format!("arrowheadd {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
     }
 }
