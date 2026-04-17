@@ -489,7 +489,10 @@ mod tests {
             &vault,
         );
 
-        assert_eq!(payload.get("total").and_then(|value| value.as_u64()), Some(1));
+        assert_eq!(
+            payload.get("total").and_then(|value| value.as_u64()),
+            Some(1)
+        );
         let results = payload
             .get("results")
             .and_then(|value| value.as_array())
@@ -500,16 +503,16 @@ mod tests {
         assert_eq!(item.get("id"), Some(&json!("Sample")));
         assert_eq!(item.get("title"), Some(&json!("Metadata Title")));
         assert_eq!(item.get("score"), Some(&json!(0.75)));
-        assert_eq!(item.get("relative_path"), Some(&json!("Projects/Sample.md")));
+        assert_eq!(
+            item.get("relative_path"),
+            Some(&json!("Projects/Sample.md"))
+        );
         assert_eq!(item.get("preview"), Some(&json!("Preview text")));
         assert_eq!(item.get("reason"), Some(&json!("Hybrid blend")));
         assert_eq!(
             item.get("absolute_path"),
             Some(&json!(
-                vault
-                    .note_path("Projects/Sample.md")
-                    .display()
-                    .to_string()
+                vault.note_path("Projects/Sample.md").display().to_string()
             ))
         );
         assert!(!item.contains_key("note_id"));
