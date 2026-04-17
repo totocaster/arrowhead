@@ -371,8 +371,19 @@ fn delete_record(
     let source_line = located.rows[located.row_index].line_number;
     let source_file = located.relative_path.clone();
     located.rows.remove(located.row_index);
-    write_rows_preserving_raw_lines(&located.absolute_path, &located.rows)?;
-    refresh_index_for_file(vault, database, &located.relative_path)?;
+    if located.rows.is_empty() {
+        fs::remove_file(&located.absolute_path).with_context(|| {
+            format!(
+                "failed to delete emptied metrics file {}",
+                located.absolute_path.display()
+            )
+        })?;
+        database.remove_metrics_file(&located.relative_path.to_string_lossy())?;
+        clean_empty_metrics_parents(vault, located.absolute_path.parent())?;
+    } else {
+        write_rows_preserving_raw_lines(&located.absolute_path, &located.rows)?;
+        refresh_index_for_file(vault, database, &located.relative_path)?;
+    }
 
     Ok(DeletedMetricRecord {
         metric_id,
@@ -1066,6 +1077,46 @@ mod tests {
                 .await
                 .expect("read after delete")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_last_record_removes_empty_metrics_file() {
+        let (_dir, mutation, read) = build_service();
+        let created = mutation
+            .create(MetricCreateRequest {
+                file: Some(PathBuf::from("Metrics/Body.metrics.ndjson")),
+                id: Some("01TESTDELETEFILE0000000000".to_string()),
+                ts: DateTime::parse_from_rfc3339("2026-04-14T08:30:00+04:00").expect("ts"),
+                key: "body.weight".to_string(),
+                value: 105.6,
+                source: "withings".to_string(),
+                date: None,
+                unit: Some("kg".to_string()),
+                origin_id: None,
+                note: None,
+                context: None,
+                tags: Vec::new(),
+                extra_fields: BTreeMap::new(),
+            })
+            .await
+            .expect("create");
+
+        mutation
+            .delete(&created.record.id)
+            .await
+            .expect("delete record");
+
+        let metrics_file = mutation
+            .vault
+            .note_path(Path::new("Metrics/Body.metrics.ndjson"));
+        assert!(
+            !metrics_file.exists(),
+            "deleting the last record should remove the empty file"
+        );
+        assert!(
+            read.list_files().await.expect("list files").is_empty(),
+            "deleting the last record should remove the file from the index"
         );
     }
 

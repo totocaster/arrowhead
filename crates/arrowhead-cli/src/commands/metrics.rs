@@ -926,11 +926,30 @@ fn print_metric_aggregate(summary: &MetricAggregateSummary) {
         println!(
             "  {}  {}{}  ({} record{})",
             bucket.date,
-            bucket.value,
+            format_metric_number(bucket.value),
             unit_suffix,
             bucket.record_count,
             if bucket.record_count == 1 { "" } else { "s" }
         );
+    }
+}
+
+fn format_metric_number(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+
+    let mut formatted = format!("{value:.12}");
+    while formatted.contains('.') && formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    if formatted == "-0" {
+        "0".to_string()
+    } else {
+        formatted
     }
 }
 
@@ -1074,5 +1093,12 @@ mod tests {
         let err = aggregate_metric_records(&records, MetricSearchAggregate::Sum, 10)
             .expect_err("mixed units should fail");
         assert!(err.to_string().contains("single unit"));
+    }
+
+    #[test]
+    fn format_metric_number_trims_floating_point_noise() {
+        assert_eq!(format_metric_number(211.39999999999998), "211.4");
+        assert_eq!(format_metric_number(211.0), "211");
+        assert_eq!(format_metric_number(0.123456789), "0.123456789");
     }
 }

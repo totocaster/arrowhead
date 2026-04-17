@@ -639,10 +639,7 @@ impl ContextService {
         let (mut all_metrics, target_value, label) = if let Some(record) = exact_record {
             let mut records = self
                 .metrics
-                .search(
-                    &build_metrics_field_query("key", &record.record.key, range),
-                    None,
-                )
+                .search_all(&build_metrics_field_query("key", &record.record.key, range))
                 .await?;
             prepend_metric_record(&mut records, record.clone());
             (
@@ -659,7 +656,7 @@ impl ContextService {
             }
             let records = self
                 .metrics
-                .search(&build_metrics_field_query("key", target, range), None)
+                .search_all(&build_metrics_field_query("key", target, range))
                 .await?;
             if records.is_empty() {
                 bail!("metric key `{target}` was not found in the index");
@@ -803,7 +800,7 @@ impl ContextService {
         let metric_limit = metric_limit.unwrap_or(DEFAULT_CONTEXT_METRIC_LIMIT).max(1);
         let mut all_metrics = self
             .metrics
-            .search(&build_metrics_field_query("source", source, range), None)
+            .search_all(&build_metrics_field_query("source", source, range))
             .await?;
         if all_metrics.is_empty() {
             bail!("source `{source}` was not found in indexed metrics");
@@ -1064,14 +1061,11 @@ impl ContextService {
         trim_note_items(&mut updated_notes, note_limit);
         let mut all_metrics = self
             .metrics
-            .search(
-                &format!(
-                    "date:{}..{}",
-                    start.format("%Y-%m-%d"),
-                    end.format("%Y-%m-%d")
-                ),
-                None,
-            )
+            .search_all(&format!(
+                "date:{}..{}",
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ))
             .await?;
         sort_metric_records(&mut all_metrics);
         let metric_rollups = metric_rollups_for_window(
@@ -1201,14 +1195,11 @@ impl ContextService {
         trim_note_items(&mut updated_notes, note_limit);
         let all_metrics = self
             .metrics
-            .search(
-                &format!(
-                    "date:{}..{}",
-                    start.format("%Y-%m-%d"),
-                    end.format("%Y-%m-%d")
-                ),
-                None,
-            )
+            .search_all(&format!(
+                "date:{}..{}",
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ))
             .await?;
         let metric_rollups = metric_rollups_for_window(
             &all_metrics,
@@ -1342,14 +1333,11 @@ impl ContextService {
         let (start, end) = date_bounds_for_range(&changed_range)?;
         let mut all_metrics = self
             .metrics
-            .search(
-                &format!(
-                    "date:{}..{}",
-                    start.format("%Y-%m-%d"),
-                    end.format("%Y-%m-%d")
-                ),
-                None,
-            )
+            .search_all(&format!(
+                "date:{}..{}",
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ))
             .await?;
         sort_metric_records(&mut all_metrics);
         let metric_rollups = metric_rollups_for_window(
@@ -2014,7 +2002,7 @@ impl ContextService {
 
         let mut candidates_by_key = HashMap::<String, RelatedMetricCandidate>::new();
         for (date, target_sources) in target_sources_by_day {
-            let related = self.metrics.search(&format!("date:{date}"), None).await?;
+            let related = self.metrics.search_all(&format!("date:{date}")).await?;
             for candidate in related {
                 if exclude_keys.contains(&candidate.record.key) {
                     continue;
@@ -4796,6 +4784,53 @@ mod tests {
                 .any(|pivot| pivot.kind == "metrics_aggregate"),
             "expected source context to suggest an aggregate trend pivot"
         );
+    }
+
+    #[tokio::test]
+    async fn source_context_rollups_use_all_matching_records_beyond_visible_limit() {
+        let (_dir, service) = build_service();
+        insert_metric_rows(
+            &service,
+            "Metrics/manual.metrics.ndjson",
+            &[
+                r#"{"id":"01MH001","ts":"2026-04-15T01:00:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":320,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH002","ts":"2026-04-15T02:00:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":320,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH003","ts":"2026-04-15T03:00:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":320,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH004","ts":"2026-04-15T04:00:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":320,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH005","ts":"2026-04-15T05:00:00Z","date":"2026-04-15","key":"nutrition.energy_intake","value":320,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH006","ts":"2026-04-16T01:00:00Z","date":"2026-04-16","key":"nutrition.energy_intake","value":100,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH007","ts":"2026-04-16T02:00:00Z","date":"2026-04-16","key":"nutrition.energy_intake","value":100,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH008","ts":"2026-04-16T03:00:00Z","date":"2026-04-16","key":"nutrition.energy_intake","value":100,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH009","ts":"2026-04-16T04:00:00Z","date":"2026-04-16","key":"nutrition.energy_intake","value":100,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH010","ts":"2026-04-16T05:00:00Z","date":"2026-04-16","key":"nutrition.energy_intake","value":100,"unit":"kcal","source":"manual-health-log"}"#,
+                r#"{"id":"01MH011","ts":"2026-04-16T06:00:00Z","date":"2026-04-16","key":"nutrition.energy_intake","value":100,"unit":"kcal","source":"manual-health-log"}"#,
+            ],
+        );
+
+        let payload = service
+            .source("manual-health-log", None, Some(5), Some(10))
+            .await
+            .expect("source context");
+
+        assert_eq!(
+            payload.summary.metric_count, 10,
+            "expected the visible history list to remain capped by metric_limit"
+        );
+
+        let rollup = payload
+            .related
+            .metric_rollups
+            .iter()
+            .find(|rollup| rollup.source.as_deref() == Some("manual-health-log"))
+            .expect("manual source rollup");
+        assert_eq!(rollup.matching_record_count, 11);
+        assert_eq!(rollup.active_day_count, 2);
+        assert_eq!(rollup.buckets[0].date.to_string(), "2026-04-16");
+        assert!((rollup.buckets[0].value - 600.0).abs() <= f64::EPSILON);
+        assert_eq!(rollup.buckets[0].record_count, 6);
+        assert_eq!(rollup.buckets[1].date.to_string(), "2026-04-15");
+        assert!((rollup.buckets[1].value - 1600.0).abs() <= f64::EPSILON);
+        assert_eq!(rollup.buckets[1].record_count, 5);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@
 - `--format human` (default): table with BM25/semantic scores and match reasons.
 - `--format ids`: note IDs only (pipe to `xargs`, `wc -l`, etc.).
 - `--format paths`: absolute file paths.
-- `--json`: machine-readable payload with metadata, ready for `jq`.
+- `--json`: machine-readable payload wrapped as `{ "total": N, "results": [...] }`, ready for `jq`.
 
 ### Metadata Filters & Tips
 - Combine filters inline: `arrowhead search fts "category:project status:active"`.

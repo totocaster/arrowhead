@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate, Utc};
 use clap::{Args, Subcommand};
 use serde_json::to_string_pretty;
 use tracing::warn;
@@ -56,8 +56,15 @@ pub enum ContextAction {
 /// Arguments for `arrowhead context day`.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct DayArgs {
-    /// Day to inspect in YYYY-MM-DD format.
-    pub day: String,
+    /// Optional day to inspect in YYYY-MM-DD format.
+    #[arg(conflicts_with_all = ["this", "last"])]
+    pub day: Option<String>,
+    /// Inspect today.
+    #[arg(long, conflicts_with = "last")]
+    pub this: bool,
+    /// Inspect yesterday.
+    #[arg(long, conflicts_with = "this")]
+    pub last: bool,
     /// Maximum number of related notes to surface.
     #[arg(long, default_value_t = DEFAULT_CONTEXT_NOTE_LIMIT)]
     pub note_limit: usize,
@@ -95,9 +102,9 @@ pub struct WeekArgs {
 /// Arguments for `arrowhead context month`.
 #[derive(Debug, Args, Clone, PartialEq)]
 pub struct MonthArgs {
-    /// Optional day inside the month to inspect in YYYY-MM-DD format.
+    /// Optional month (`YYYY-MM`) or day inside the month (`YYYY-MM-DD`) to inspect.
     #[arg(conflicts_with_all = ["this", "last"])]
-    pub day: Option<String>,
+    pub month: Option<String>,
     /// Inspect the current month.
     #[arg(long, conflicts_with = "last")]
     pub this: bool,
@@ -216,8 +223,9 @@ pub async fn run(ctx: &CommandContext, command: &ContextCommand) -> Result<()> {
 
     let payload = match &command.action {
         ContextAction::Day(args) => {
+            let day = resolve_day(args)?.format("%Y-%m-%d").to_string();
             service
-                .day(&args.day, Some(args.note_limit), Some(args.metric_limit))
+                .day(&day, Some(args.note_limit), Some(args.metric_limit))
                 .await?
         }
         ContextAction::Week(args) => {
@@ -383,6 +391,22 @@ fn render_target_kind(kind: ContextTargetKind) -> &'static str {
     }
 }
 
+fn resolve_day(args: &DayArgs) -> Result<NaiveDate> {
+    resolve_day_with_today(args, Utc::now().date_naive())
+}
+
+fn resolve_day_with_today(args: &DayArgs, today: NaiveDate) -> Result<NaiveDate> {
+    if args.last {
+        return Ok(today - Duration::days(1));
+    }
+    if let Some(day) = args.day.as_deref() {
+        let parsed = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d")
+            .with_context(|| format!("invalid day `{}`", day.trim()))?;
+        return Ok(parsed);
+    }
+    Ok(today)
+}
+
 fn resolve_week_selector(args: &WeekArgs) -> Result<WeekContextSelector> {
     if args.last {
         return Ok(WeekContextSelector::LastWeek);
@@ -399,12 +423,21 @@ fn resolve_month_selector(args: &MonthArgs) -> Result<MonthContextSelector> {
     if args.last {
         return Ok(MonthContextSelector::LastMonth);
     }
-    if let Some(day) = args.day.as_deref() {
-        let parsed = NaiveDate::parse_from_str(day.trim(), "%Y-%m-%d")
-            .with_context(|| format!("invalid month day `{}`", day.trim()))?;
+    if let Some(month) = args.month.as_deref() {
+        let parsed = parse_month_selector_day(month)?;
         return Ok(MonthContextSelector::ContainingDay(parsed));
     }
     Ok(MonthContextSelector::ThisMonth)
+}
+
+fn parse_month_selector_day(input: &str) -> Result<NaiveDate> {
+    let trimmed = input.trim();
+    if let Ok(parsed) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return Ok(parsed);
+    }
+
+    NaiveDate::parse_from_str(&format!("{trimmed}-01"), "%Y-%m-%d")
+        .with_context(|| format!("invalid month `{trimmed}`"))
 }
 
 fn render_day_context(payload: &ContextPayload) {
@@ -855,6 +888,79 @@ fn print_attention_line(item: &ContextAttentionItem) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_day_supports_this_last_and_explicit_values() {
+        let today = NaiveDate::from_ymd_opt(2026, 4, 17).expect("valid date");
+
+        let default_day = resolve_day_with_today(
+            &DayArgs {
+                day: None,
+                this: false,
+                last: false,
+                note_limit: DEFAULT_CONTEXT_NOTE_LIMIT,
+                metric_limit: DEFAULT_CONTEXT_METRIC_LIMIT,
+                json: false,
+            },
+            today,
+        )
+        .expect("default day");
+        assert_eq!(default_day, today);
+
+        let last_day = resolve_day_with_today(
+            &DayArgs {
+                day: None,
+                this: false,
+                last: true,
+                note_limit: DEFAULT_CONTEXT_NOTE_LIMIT,
+                metric_limit: DEFAULT_CONTEXT_METRIC_LIMIT,
+                json: false,
+            },
+            today,
+        )
+        .expect("last day");
+        assert_eq!(
+            last_day,
+            NaiveDate::from_ymd_opt(2026, 4, 16).expect("valid date")
+        );
+
+        let explicit_day = resolve_day_with_today(
+            &DayArgs {
+                day: Some("2026-04-12".to_string()),
+                this: false,
+                last: false,
+                note_limit: DEFAULT_CONTEXT_NOTE_LIMIT,
+                metric_limit: DEFAULT_CONTEXT_METRIC_LIMIT,
+                json: false,
+            },
+            today,
+        )
+        .expect("explicit day");
+        assert_eq!(
+            explicit_day,
+            NaiveDate::from_ymd_opt(2026, 4, 12).expect("valid date")
+        );
+    }
+
+    #[test]
+    fn resolve_month_selector_accepts_month_shorthand() {
+        let selector = resolve_month_selector(&MonthArgs {
+            month: Some("2026-04".to_string()),
+            this: false,
+            last: false,
+            note_limit: DEFAULT_CONTEXT_NOTE_LIMIT,
+            metric_limit: DEFAULT_CONTEXT_METRIC_LIMIT,
+            json: false,
+        })
+        .expect("month selector");
+
+        assert_eq!(
+            selector,
+            MonthContextSelector::ContainingDay(
+                NaiveDate::from_ymd_opt(2026, 4, 1).expect("valid date")
+            )
+        );
+    }
 
     #[test]
     fn metric_context_header_includes_active_range() {

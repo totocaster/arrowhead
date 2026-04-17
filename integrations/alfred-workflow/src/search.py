@@ -149,7 +149,7 @@ def build_item(
     vault_path: Optional[Path],
     secondary_editor: str,
 ) -> Dict[str, Any]:
-    note_id = result.get("note_id", "")
+    note_id = result_id(result)
     title = select_title(result)
     subtitle = select_subtitle(result)
     relative_path = result.get("relative_path")
@@ -230,12 +230,12 @@ def select_title(result: Dict[str, Any]) -> str:
     if isinstance(title, str) and title.strip():
         return title.strip()
 
-    metadata = result.get("metadata") or {}
+    metadata = result.get("metadata") or result.get("frontmatter") or {}
     meta_title = metadata.get("title")
     if isinstance(meta_title, str) and meta_title.strip():
         return meta_title.strip()
 
-    return result.get("note_id", "")
+    return result_id(result)
 
 
 def select_subtitle(result: Dict[str, Any]) -> str:
@@ -261,6 +261,19 @@ def select_subtitle(result: Dict[str, Any]) -> str:
         parts.append(reason)
 
     return " — ".join(parts) if parts else "Result from Arrowhead"
+
+
+def result_id(result: Dict[str, Any]) -> str:
+    """Return the stable note identifier from either the new or legacy payload."""
+    value = result.get("id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    legacy = result.get("note_id")
+    if isinstance(legacy, str) and legacy.strip():
+        return legacy.strip()
+
+    return ""
 
 
 def condense_whitespace(text: str) -> str:
@@ -423,20 +436,29 @@ def run_arrowhead_search(query: str, config: WorkflowConfig) -> "SearchPayload |
         )
 
     try:
-        results = json.loads(completed.stdout)
+        payload = json.loads(completed.stdout)
     except json.JSONDecodeError as err:
         return ErrorPayload(
             title="Invalid JSON from arrowhead",
             detail=str(err),
         )
 
-    if not isinstance(results, list):
+    if isinstance(payload, dict):
+        results = payload.get("results")
+        if isinstance(results, list):
+            return SearchPayload(results=results)
         return ErrorPayload(
             title="Unexpected search payload",
-            detail="Expected a JSON array from arrowhead search.",
+            detail="Expected a `results` array from arrowhead search.",
         )
 
-    return SearchPayload(results=results)
+    if isinstance(payload, list):
+        return SearchPayload(results=payload)
+
+    return ErrorPayload(
+        title="Unexpected search payload",
+        detail="Expected a JSON object or array from arrowhead search.",
+    )
 
 
 def infer_vault_path(env: Dict[str, str]) -> Optional[Path]:

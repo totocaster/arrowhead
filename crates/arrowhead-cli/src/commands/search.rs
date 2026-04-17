@@ -241,35 +241,14 @@ fn render_results(
     }
 
     if json_output {
-        let payload: Vec<_> = results
-            .iter()
-            .map(|result| {
-                let mut object = json!({
-                    "note_id": result.note_id,
-                    "title": result.title,
-                    "score": result.score,
-                    "bm25": result.bm25_score(),
-                    "relative_path": result.relative_path,
-                    "preview": result.preview,
-                    "reason": result.reason,
-                    "metadata": result.metadata,
-                });
-
-                if include_paths {
-                    if let Some(path) = note_absolute_path(vault, result) {
-                        if let serde_json::Value::Object(ref mut map) = object {
-                            map.insert(
-                                "absolute_path".to_string(),
-                                json!(path.display().to_string()),
-                            );
-                        }
-                    }
-                }
-
-                object
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&search_results_json_payload(
+                results,
+                include_paths,
+                vault
+            ))?
+        );
         return Ok(());
     }
 
@@ -281,16 +260,7 @@ fn render_results(
     match format {
         OutputFormat::Human => {
             for result in results {
-                let title = result
-                    .title
-                    .as_deref()
-                    .or_else(|| {
-                        result
-                            .metadata
-                            .get("title")
-                            .and_then(|value| value.as_str())
-                    })
-                    .unwrap_or("-");
+                let title = result_title(result).unwrap_or("-");
                 let bm25_display = result
                     .bm25_score()
                     .map(|score| format!("{score:.2}"))
@@ -326,6 +296,54 @@ fn render_results(
     Ok(())
 }
 
+fn search_results_json_payload(
+    results: &[SearchResult],
+    include_paths: bool,
+    vault: &Vault,
+) -> serde_json::Value {
+    let items = results
+        .iter()
+        .map(|result| {
+            let mut object = json!({
+                "id": result.note_id,
+                "title": result_title(result),
+                "score": result.score,
+                "relative_path": result.relative_path,
+                "preview": result.preview,
+                "reason": result.reason,
+            });
+
+            if include_paths {
+                if let serde_json::Value::Object(ref mut map) = object {
+                    map.insert(
+                        "absolute_path".to_string(),
+                        json!(
+                            note_absolute_path(vault, result)
+                                .map(|path| path.display().to_string())
+                        ),
+                    );
+                }
+            }
+
+            object
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "total": items.len(),
+        "results": items,
+    })
+}
+
+fn result_title(result: &SearchResult) -> Option<&str> {
+    result.title.as_deref().or_else(|| {
+        result
+            .metadata
+            .get("title")
+            .and_then(|value| value.as_str())
+    })
+}
+
 fn note_absolute_path(vault: &Vault, result: &SearchResult) -> Option<PathBuf> {
     if let Some(relative) = result.relative_path.as_deref() {
         Some(vault.note_path(relative))
@@ -341,6 +359,7 @@ mod tests {
 
     use arrowhead_core::ActivityState;
     use arrowhead_daemon::{DaemonRuntimeBuilder, WatcherStrategy};
+    use serde_json::json;
     use tempfile::TempDir;
 
     use crate::commands::CommandContext;
@@ -447,5 +466,54 @@ mod tests {
         run(&ctx, &command).await.expect("fts search executes");
 
         handle.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[test]
+    fn search_json_payload_is_wrapped_and_normalized() {
+        let vault_dir = TempDir::new().expect("vault");
+        let vault = Vault::new(VaultConfig::new(vault_dir.path().to_path_buf())).expect("vault");
+        let payload = search_results_json_payload(
+            &[SearchResult {
+                note_id: "Sample".to_string(),
+                score: 0.75,
+                bm25: 2.0,
+                relative_path: Some("Projects/Sample.md".to_string()),
+                preview: Some("Preview text".to_string()),
+                reason: Some("Hybrid blend".to_string()),
+                metadata: [("title".to_string(), json!("Metadata Title"))]
+                    .into_iter()
+                    .collect(),
+                title: None,
+            }],
+            true,
+            &vault,
+        );
+
+        assert_eq!(payload.get("total").and_then(|value| value.as_u64()), Some(1));
+        let results = payload
+            .get("results")
+            .and_then(|value| value.as_array())
+            .expect("results array");
+        assert_eq!(results.len(), 1);
+
+        let item = results[0].as_object().expect("result object");
+        assert_eq!(item.get("id"), Some(&json!("Sample")));
+        assert_eq!(item.get("title"), Some(&json!("Metadata Title")));
+        assert_eq!(item.get("score"), Some(&json!(0.75)));
+        assert_eq!(item.get("relative_path"), Some(&json!("Projects/Sample.md")));
+        assert_eq!(item.get("preview"), Some(&json!("Preview text")));
+        assert_eq!(item.get("reason"), Some(&json!("Hybrid blend")));
+        assert_eq!(
+            item.get("absolute_path"),
+            Some(&json!(
+                vault
+                    .note_path("Projects/Sample.md")
+                    .display()
+                    .to_string()
+            ))
+        );
+        assert!(!item.contains_key("note_id"));
+        assert!(!item.contains_key("bm25"));
+        assert!(!item.contains_key("metadata"));
     }
 }

@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, fs, sync::Arc};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Duration, NaiveDate, Utc};
 use clap::{Args, Subcommand};
-use serde_json::Value as JsonValue;
+use serde_json::{Value as JsonValue, json};
 use tracing::info;
 
 use super::{
@@ -16,8 +16,9 @@ use crate::logging;
 use arrowhead_core::{
     DEFAULT_CONTEXT_METRIC_LIMIT, MetadataMap, Vault, VaultConfig,
     query::{
-        DateRange, DateRangeBound, parse_absolute_date, parse_relative_range, range_from_lower,
-        range_from_parsed_date, range_from_upper,
+        DateRange, DateRangeBound, parse_absolute_date, parse_month_date_lower_bound,
+        parse_month_date_range, parse_month_date_upper_bound, parse_relative_range,
+        range_from_lower, range_from_parsed_date, range_from_upper,
     },
     sqlite::IndexDatabase,
 };
@@ -61,6 +62,9 @@ pub struct ListArgs {
     /// Only return note identifiers.
     #[arg(long)]
     pub ids_only: bool,
+    /// Emit structured JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
     /// Filter notes by the `category` metadata field.
     #[arg(long)]
     pub category: Option<String>,
@@ -164,6 +168,7 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
         NoteAction::List(args) => {
             info!(
                 ids_only = args.ids_only,
+                json = args.json,
                 category = ?args.category,
                 status = ?args.status,
                 date_range = ?args.date_range,
@@ -171,11 +176,18 @@ pub async fn run(ctx: &CommandContext, command: &NotesCommand) -> Result<()> {
                 "listing notes"
             );
             let items = collect_note_list(vault.as_ref(), args)?;
-            for (id, title) in items {
-                if let Some(title) = title {
-                    println!("{id}\t{title}");
-                } else {
-                    println!("{id}");
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&note_list_json_payload(items))?
+                );
+            } else {
+                for (id, title) in items {
+                    if let Some(title) = title {
+                        println!("{id}\t{title}");
+                    } else {
+                        println!("{id}");
+                    }
                 }
             }
             Ok(())
@@ -250,6 +262,15 @@ fn collect_note_list(vault: &Vault, args: &ListArgs) -> Result<Vec<(String, Opti
         }
     }
     Ok(results)
+}
+
+fn note_list_json_payload(items: Vec<(String, Option<String>)>) -> JsonValue {
+    json!({
+        "notes": items
+            .into_iter()
+            .map(|(id, title)| json!({ "id": id, "title": title }))
+            .collect::<Vec<_>>()
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,6 +364,10 @@ fn parse_note_date_filter(input: &str) -> Result<DateRange> {
         return Ok(range);
     }
 
+    if let Some(range) = parse_month_date_range(trimmed)? {
+        return Ok(range);
+    }
+
     if let Some((lower, upper)) = trimmed.split_once("..") {
         let lower = lower.trim();
         let upper = upper.trim();
@@ -351,6 +376,10 @@ fn parse_note_date_filter(input: &str) -> Result<DateRange> {
             bail!("date range `{trimmed}` must include at least one bound");
         }
         if lower.is_empty() {
+            if let Some(bound) = parse_month_date_upper_bound(upper)? {
+                return Ok(range_from_upper(bound));
+            }
+
             let parsed = parse_absolute_date(upper)
                 .with_context(|| format!("invalid date range `{trimmed}`"))?;
             return Ok(range_from_upper(DateRangeBound {
@@ -359,6 +388,10 @@ fn parse_note_date_filter(input: &str) -> Result<DateRange> {
             }));
         }
         if upper.is_empty() {
+            if let Some(bound) = parse_month_date_lower_bound(lower)? {
+                return Ok(range_from_lower(bound));
+            }
+
             let parsed = parse_absolute_date(lower)
                 .with_context(|| format!("invalid date range `{trimmed}`"))?;
             return Ok(range_from_lower(DateRangeBound {
@@ -367,18 +400,28 @@ fn parse_note_date_filter(input: &str) -> Result<DateRange> {
             }));
         }
 
-        let lower_range = range_from_lower(DateRangeBound {
-            value: parse_absolute_date(lower)
-                .with_context(|| format!("invalid date range `{trimmed}`"))?
-                .instant,
-            inclusive: true,
-        });
-        let upper_range = range_from_upper(DateRangeBound {
-            value: parse_absolute_date(upper)
-                .with_context(|| format!("invalid date range `{trimmed}`"))?
-                .instant,
-            inclusive: true,
-        });
+        let lower_bound = if let Some(bound) = parse_month_date_lower_bound(lower)? {
+            bound
+        } else {
+            DateRangeBound {
+                value: parse_absolute_date(lower)
+                    .with_context(|| format!("invalid date range `{trimmed}`"))?
+                    .instant,
+                inclusive: true,
+            }
+        };
+        let upper_bound = if let Some(bound) = parse_month_date_upper_bound(upper)? {
+            bound
+        } else {
+            DateRangeBound {
+                value: parse_absolute_date(upper)
+                    .with_context(|| format!("invalid date range `{trimmed}`"))?
+                    .instant,
+                inclusive: true,
+            }
+        };
+        let lower_range = range_from_lower(lower_bound);
+        let upper_range = range_from_upper(upper_bound);
         return lower_range
             .intersect(&upper_range)
             .with_context(|| format!("date range `{trimmed}` resolves to an empty range"));
@@ -446,16 +489,17 @@ fn update_note(vault: &Vault, args: &UpdateArgs) -> Result<()> {
 
     if let Some(title) = &args.title {
         if title.trim().is_empty() {
-            metadata.remove("title");
-        } else {
-            metadata.insert("title".to_string(), JsonValue::String(title.clone()));
+            bail!(
+                "empty note title updates are not allowed; omit `--title` to keep the current title"
+            );
         }
+        metadata.insert("title".to_string(), JsonValue::String(title.clone()));
     }
 
     merge_metadata_json(&mut metadata, &args.metadata)?;
 
     let body = if args.content.is_some() || args.file.is_some() {
-        load_content(args.content.as_ref(), args.file.as_ref())?
+        load_update_content(args.content.as_ref(), args.file.as_ref())?
     } else {
         note.content.clone()
     };
@@ -539,6 +583,16 @@ fn load_content(inline: Option<&String>, file: Option<&String>) -> Result<String
     }
 
     Ok(inline.cloned().unwrap_or_default())
+}
+
+fn load_update_content(inline: Option<&String>, file: Option<&String>) -> Result<String> {
+    let content = load_content(inline, file)?;
+    if content.is_empty() {
+        bail!(
+            "empty note content updates are not allowed; omit `--content`/`--file` to keep the current body"
+        );
+    }
+    Ok(content)
 }
 
 fn merge_metadata_json(metadata: &mut MetadataMap, payload: &Option<String>) -> Result<()> {
@@ -628,6 +682,7 @@ mod tests {
             &vault,
             &ListArgs {
                 ids_only: true,
+                json: false,
                 category: None,
                 status: None,
                 date_range: None,
@@ -646,6 +701,7 @@ mod tests {
             &vault,
             &ListArgs {
                 ids_only: false,
+                json: false,
                 category: None,
                 status: None,
                 date_range: None,
@@ -707,6 +763,7 @@ mod tests {
             &vault,
             &ListArgs {
                 ids_only: false,
+                json: false,
                 category: Some("project".to_string()),
                 status: Some("active".to_string()),
                 date_range: Some("2026-04-10..2026-04-18".to_string()),
@@ -718,6 +775,42 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "2026-04-14");
         assert_eq!(entries[0].1.as_deref(), Some("April 14"));
+    }
+
+    #[test]
+    fn parse_note_date_filter_supports_month_shorthand() {
+        let range = parse_note_date_filter("2026-04").expect("month range");
+
+        assert!(date_range_contains(
+            &range,
+            NaiveDate::from_ymd_opt(2026, 4, 1).expect("valid date")
+        ));
+        assert!(date_range_contains(
+            &range,
+            NaiveDate::from_ymd_opt(2026, 4, 30).expect("valid date")
+        ));
+        assert!(!date_range_contains(
+            &range,
+            NaiveDate::from_ymd_opt(2026, 5, 1).expect("valid date")
+        ));
+    }
+
+    #[test]
+    fn note_list_json_payload_includes_ids_and_titles() {
+        let payload = note_list_json_payload(vec![
+            ("2026-04-14".to_string(), Some("April 14".to_string())),
+            ("Reference".to_string(), None),
+        ]);
+
+        assert_eq!(
+            payload,
+            json!({
+                "notes": [
+                    { "id": "2026-04-14", "title": "April 14" },
+                    { "id": "Reference", "title": null }
+                ]
+            })
+        );
     }
 
     #[test]
@@ -792,6 +885,75 @@ mod tests {
             Some("done")
         );
         assert!(updated.content.contains("Updated body"));
+    }
+
+    #[test]
+    fn update_note_rejects_empty_content_replacement() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(VaultConfig::new(temp_dir.path().to_path_buf())).expect("vault");
+
+        let create_args = CreateArgs {
+            id: Some("Note".to_string()),
+            title: Some("Original".to_string()),
+            category: None,
+            content: Some("Original body".to_string()),
+            file: None,
+            metadata: None,
+        };
+        create_note(&vault, &create_args).expect("create");
+
+        let update_args = UpdateArgs {
+            note_id: "Note".to_string(),
+            content: Some(String::new()),
+            file: None,
+            title: None,
+            metadata: None,
+        };
+
+        let err = update_note(&vault, &update_args).expect_err("empty content should fail");
+        assert!(
+            err.to_string()
+                .contains("empty note content updates are not allowed"),
+            "unexpected error: {err:#}"
+        );
+
+        let updated = vault.load_note("Note").expect("load note");
+        assert!(updated.content.contains("Original body"));
+    }
+
+    #[test]
+    fn update_note_rejects_empty_title_replacement() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault = Vault::new(VaultConfig::new(temp_dir.path().to_path_buf())).expect("vault");
+
+        let create_args = CreateArgs {
+            id: Some("Note".to_string()),
+            title: Some("Original".to_string()),
+            category: None,
+            content: Some("Original body".to_string()),
+            file: None,
+            metadata: None,
+        };
+        create_note(&vault, &create_args).expect("create");
+
+        let update_args = UpdateArgs {
+            note_id: "Note".to_string(),
+            content: None,
+            file: None,
+            title: Some(String::new()),
+            metadata: None,
+        };
+
+        let err = update_note(&vault, &update_args).expect_err("empty title should fail");
+        assert!(
+            err.to_string()
+                .contains("empty note title updates are not allowed"),
+            "unexpected error: {err:#}"
+        );
+
+        let updated = vault.load_note("Note").expect("load note");
+        assert_eq!(updated.title.as_deref(), Some("Original"));
+        assert!(updated.content.contains("Original body"));
     }
 
     #[test]

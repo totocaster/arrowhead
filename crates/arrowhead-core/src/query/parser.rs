@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 
 use super::time::{
-    DateRange, DateRangeBound, parse_absolute_date, parse_relative_range, range_from_lower,
+    DateRange, DateRangeBound, parse_absolute_date, parse_month_date_lower_bound,
+    parse_month_date_range, parse_month_date_upper_bound, parse_relative_range, range_from_lower,
     range_from_parsed_date, range_from_upper,
 };
 
@@ -131,6 +132,12 @@ enum FilterKind {
     Modified(DateRange),
     Created(DateRange),
     MetadataDate { field: String, range: DateRange },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateBoundSide {
+    Lower,
+    Upper,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -753,7 +760,7 @@ impl Parser {
 
     fn parse_date_filter(&mut self, field: &str) -> Result<DateRange> {
         if self.matches(TokenKind::Range) {
-            let end = self.parse_optional_date_operand(true)?;
+            let end = self.parse_optional_date_operand(DateBoundSide::Upper, true)?;
             if end.is_none() {
                 bail!("open range `..` must include an upper bound");
             }
@@ -762,21 +769,22 @@ impl Parser {
 
         if self.matches(TokenKind::Ge) || self.matches(TokenKind::Gt) {
             let inclusive = self.previous().kind == TokenKind::Ge;
-            let bound = self.parse_date_operand(inclusive)?;
+            let bound = self.parse_date_operand(DateBoundSide::Lower, inclusive)?;
             return Ok(range_from_lower(bound));
         }
 
         if self.matches(TokenKind::Le) || self.matches(TokenKind::Lt) {
             let inclusive = self.previous().kind == TokenKind::Le;
-            let bound = self.parse_date_operand(inclusive)?;
+            let bound = self.parse_date_operand(DateBoundSide::Upper, inclusive)?;
             return Ok(range_from_upper(bound));
         }
 
         let first = self.parse_value_token()?;
 
         if self.matches(TokenKind::Range) {
-            let end = self.parse_optional_date_operand(true)?;
-            let start = self.convert_value_to_range_bound(first.as_str(), true)?;
+            let end = self.parse_optional_date_operand(DateBoundSide::Upper, true)?;
+            let start =
+                self.convert_value_to_range_bound(first.as_str(), DateBoundSide::Lower, true)?;
             let range = match end {
                 Some(bound) => DateRange::new(Some(start), Some(bound)),
                 None => DateRange::new(Some(start), None),
@@ -788,12 +796,20 @@ impl Parser {
             return Ok(range);
         }
 
+        if let Some(range) = parse_month_date_range(first.as_str())? {
+            return Ok(range);
+        }
+
         let parsed = parse_absolute_date(first.as_str())
             .with_context(|| format!("invalid date literal for `{field}`"))?;
         Ok(range_from_parsed_date(parsed))
     }
 
-    fn parse_optional_date_operand(&mut self, inclusive: bool) -> Result<Option<DateRangeBound>> {
+    fn parse_optional_date_operand(
+        &mut self,
+        side: DateBoundSide,
+        inclusive: bool,
+    ) -> Result<Option<DateRangeBound>> {
         if matches!(
             self.peek_kind(),
             Some(TokenKind::Eof | TokenKind::RParen | TokenKind::And | TokenKind::Or)
@@ -801,29 +817,56 @@ impl Parser {
             return Ok(None);
         }
         let token = self.parse_value_token()?;
-        self.convert_value_to_range_bound(token.as_str(), inclusive)
+        self.convert_value_to_range_bound(token.as_str(), side, inclusive)
             .map(Some)
     }
 
-    fn parse_date_operand(&mut self, inclusive: bool) -> Result<DateRangeBound> {
+    fn parse_date_operand(
+        &mut self,
+        side: DateBoundSide,
+        inclusive: bool,
+    ) -> Result<DateRangeBound> {
         let token = self.parse_value_token()?;
-        self.convert_value_to_range_bound(token.as_str(), inclusive)
+        self.convert_value_to_range_bound(token.as_str(), side, inclusive)
     }
 
-    fn convert_value_to_range_bound(&self, value: &str, inclusive: bool) -> Result<DateRangeBound> {
+    fn convert_value_to_range_bound(
+        &self,
+        value: &str,
+        side: DateBoundSide,
+        inclusive: bool,
+    ) -> Result<DateRangeBound> {
         if let Some(range) = parse_relative_range(value, self.now)? {
             let start = range.start;
             let end = range.end;
-            let chosen = if inclusive {
-                end.or(start)
-                    .context("relative date range missing upper bound")?
-            } else {
-                start
+            let chosen = match (side, inclusive) {
+                (DateBoundSide::Lower, true) => start
                     .or(end)
-                    .context("relative date range missing lower bound")?
+                    .context("relative date range missing lower bound")?,
+                (DateBoundSide::Lower, false) => end
+                    .or(start)
+                    .context("relative date range missing upper bound")?,
+                (DateBoundSide::Upper, true) => end
+                    .or(start)
+                    .context("relative date range missing upper bound")?,
+                (DateBoundSide::Upper, false) => start
+                    .or(end)
+                    .context("relative date range missing lower bound")?,
             };
             return Ok(DateRangeBound {
                 value: chosen.value,
+                inclusive,
+            });
+        }
+
+        if let Some(bound) = match (side, inclusive) {
+            (DateBoundSide::Lower, true) => parse_month_date_lower_bound(value)?,
+            (DateBoundSide::Lower, false) => parse_month_date_upper_bound(value)?,
+            (DateBoundSide::Upper, true) => parse_month_date_upper_bound(value)?,
+            (DateBoundSide::Upper, false) => parse_month_date_lower_bound(value)?,
+        } {
+            return Ok(DateRangeBound {
+                value: bound.value,
                 inclusive,
             });
         }
@@ -1016,6 +1059,20 @@ mod tests {
         assert!(parsed.filters.modified.is_some());
         let another = parse("created:lastweek");
         assert!(another.filters.created.is_some());
+    }
+
+    #[test]
+    fn month_shorthand_date_filters_supported() {
+        let parsed = parse("created:2024-05");
+        let range = parsed.filters.created.as_ref().expect("created range");
+        assert_eq!(
+            range.start.unwrap().value,
+            Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap()
+        );
+        assert_eq!(
+            range.end.unwrap().value,
+            Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap() - chrono::Duration::microseconds(1)
+        );
     }
 
     #[test]

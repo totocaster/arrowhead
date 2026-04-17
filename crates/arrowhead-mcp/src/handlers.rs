@@ -3406,10 +3406,11 @@ fn update_note_in_vault(
 
     if let Some(title_value) = title {
         if title_value.trim().is_empty() {
-            metadata_map.remove("title");
-        } else {
-            metadata_map.insert("title".to_string(), Value::String(title_value));
+            return Err(ProtocolError::invalid_params(
+                "empty note title updates are not allowed; omit `title` to keep the current title",
+            ));
         }
+        metadata_map.insert("title".to_string(), Value::String(title_value));
     }
 
     merge_metadata_map(&mut metadata_map, metadata);

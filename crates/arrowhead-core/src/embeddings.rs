@@ -657,6 +657,31 @@ impl EmbeddingStore {
         Ok(())
     }
 
+    /// Return whether the active model already has a stored embedding for a note.
+    pub async fn has_embedding_for_note(&self, note_id: &str) -> Result<bool> {
+        let database = Arc::clone(&self.database);
+        let note_id = note_id.to_string();
+        let model_id = self.model_id.clone();
+
+        task::spawn_blocking(move || -> Result<bool> {
+            let conn = database
+                .connection()
+                .context("failed to open SQLite connection for embedding presence check")?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT 1 FROM {EMBEDDING_TABLE_NAME} \
+                 WHERE note_id = ?1 AND model = ?2 \
+                 LIMIT 1"
+            ))?;
+            let present = stmt
+                .query_row(params![&note_id, &model_id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            Ok(present)
+        })
+        .await
+        .context("embedding presence task aborted")?
+    }
+
     /// Retrieve the stored embedding vector for a note, when available.
     pub async fn vector_for_note(&self, note_id: &str) -> Result<Option<Vec<f32>>> {
         let database = Arc::clone(&self.database);
@@ -958,6 +983,28 @@ mod tests {
         let missing = store.vector_for_note("missing").await?;
         assert!(missing.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn has_embedding_for_note_reports_presence() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path)?);
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+
+        assert!(!store.has_embedding_for_note("note-1").await?);
+
+        let record = EmbeddingRecord {
+            note_id: "note-1".to_string(),
+            vector: unit_vector(descriptor.dimension(), 0.5),
+            indexed_at: Utc::now(),
+        };
+        store.upsert_embeddings(&[record]).await?;
+
+        assert!(store.has_embedding_for_note("note-1").await?);
+        assert!(!store.has_embedding_for_note("missing").await?);
         Ok(())
     }
 

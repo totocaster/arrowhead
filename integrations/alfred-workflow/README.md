@@ -48,29 +48,28 @@ Ready-to-install build: `workflow/arrowhead-search.alfredworkflow`. Double-click
 - JSON output mirrors the CLI `render_results` structure:
 
   ```json
-  [
-    {
-      "note_id": "20230815T103210Z",
-      "title": "Project Roadmap",
-      "score": 0.812345,
-      "bm25": 2.0,
-      "relative_path": "Projects/Roadmap.md",
-      "preview": "…important milestones captured here…",
-      "reason": "Hybrid blend: FTS rank 3, semantic boost 0.18",
-      "metadata": {
-        "tags": ["planning", "q3"],
-        "category": "project"
+  {
+    "total": 1,
+    "results": [
+      {
+        "id": "20230815T103210Z",
+        "title": "Project Roadmap",
+        "score": 0.812345,
+        "relative_path": "Projects/Roadmap.md",
+        "absolute_path": "/vault/Projects/Roadmap.md",
+        "preview": "…important milestones captured here…",
+        "reason": "Hybrid blend: FTS rank 3, semantic boost 0.18"
       }
-    }
-  ]
+    ]
+  }
   ```
 
 - Field mapping:
-  - `title` (fallback to `metadata.title` or `note_id`) → Alfred item title.
+  - `title` (fallback to `id`) → Alfred item title.
   - `preview` snippet → Alfred subtitle.
   - `relative_path` combined with the vault root → Alfred argument/copy text.
   - `reason` → ⌘ modifier subtitle explaining the ranking.
-  - `note_id` → Alfred UID for knowledge-based ordering.
+  - `id` → Alfred UID for knowledge-based ordering.
 
 ## Packaging
 

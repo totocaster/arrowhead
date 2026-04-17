@@ -166,6 +166,36 @@ pub fn parse_absolute_date(value: &str) -> Result<ParsedDate> {
     bail!("invalid date literal `{value}`")
 }
 
+/// Attempt to parse a month shorthand literal (`YYYY-MM`) into a full-month range.
+pub fn parse_month_date_range(value: &str) -> Result<Option<DateRange>> {
+    let Some(start) = parse_month_start(value)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(month_range(start)))
+}
+
+/// Attempt to parse a month shorthand literal (`YYYY-MM`) into a lower-bound timestamp.
+pub fn parse_month_date_lower_bound(value: &str) -> Result<Option<DateRangeBound>> {
+    let Some(start) = parse_month_start(value)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(DateRangeBound {
+        value: start,
+        inclusive: true,
+    }))
+}
+
+/// Attempt to parse a month shorthand literal (`YYYY-MM`) into an upper-bound timestamp.
+pub fn parse_month_date_upper_bound(value: &str) -> Result<Option<DateRangeBound>> {
+    let Some(range) = parse_month_date_range(value)? else {
+        return Ok(None);
+    };
+
+    Ok(range.end)
+}
+
 /// Parse a relative-date shorthand (e.g. `past7d`, `next2w`).
 pub fn parse_relative_range(value: &str, now: DateTime<Utc>) -> Result<Option<DateRange>> {
     let lowered = value.trim().to_ascii_lowercase();
@@ -318,6 +348,15 @@ fn parse_named_range(name: &str, now: DateTime<Utc>) -> Result<Option<DateRange>
     Ok(range)
 }
 
+fn parse_month_start(value: &str) -> Result<Option<DateTime<Utc>>> {
+    let Ok(date) = NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d") else {
+        return Ok(None);
+    };
+
+    let naive = date.and_hms_opt(0, 0, 0).context("invalid month start")?;
+    Ok(Some(Utc.from_utc_datetime(&naive)))
+}
+
 fn day_range(start: DateTime<Utc>) -> DateRange {
     let end = end_of_day(start);
     DateRange::new(
@@ -449,6 +488,27 @@ mod tests {
         assert!(parse_absolute_date("2024-01-10T12:30").is_ok());
         assert!(parse_absolute_date("2024-01-10T12:30:45Z").is_ok());
         assert!(parse_absolute_date("2024-01-10 12:30:45").is_ok());
+    }
+
+    #[test]
+    fn parse_month_date_range_variants() {
+        let month = parse_month_date_range("2024-02")
+            .expect("month parses")
+            .expect("month range");
+        assert_eq!(
+            month.start.unwrap().value,
+            Utc.with_ymd_and_hms(2024, 2, 1, 0, 0, 0).unwrap()
+        );
+        assert_eq!(
+            month.end.unwrap().value,
+            Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap() - Duration::microseconds(1)
+        );
+
+        assert!(
+            parse_month_date_range("2024-02-10")
+                .expect("non-month parses")
+                .is_none()
+        );
     }
 
     #[test]

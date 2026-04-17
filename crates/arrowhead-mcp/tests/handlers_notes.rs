@@ -1076,6 +1076,39 @@ async fn notes_create_update_delete_round_trip() {
 }
 
 #[tokio::test]
+async fn notes_update_rejects_empty_title() {
+    let temp_dir = copy_fixture();
+    let handler = build_handler(&temp_dir).await;
+
+    let _created = call_tool_structured(
+        &handler,
+        "notes_create",
+        json!({
+            "noteId": "Projects/Test Plan",
+            "title": "Original",
+            "content": "Body"
+        }),
+    )
+    .await;
+
+    let err = call_tool_error(
+        &handler,
+        "notes_update",
+        json!({
+            "noteId": "Projects/Test Plan",
+            "title": ""
+        }),
+    )
+    .await;
+
+    assert!(
+        err.to_string()
+            .contains("empty note title updates are not allowed"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[tokio::test]
 async fn notes_delete_requires_confirmation_flag() {
     let temp_dir = copy_fixture();
     let handler = build_handler(&temp_dir).await;

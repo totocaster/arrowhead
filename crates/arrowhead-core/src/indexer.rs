@@ -18,7 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     IndexingStats, MetricsFileEntry, NoteRecord, Vault,
-    embeddings::{EmbeddingPipeline, EmbeddingRecord},
+    embeddings::{EmbeddingPipeline, EmbeddingRecord, EmbeddingStore},
     graph::{LinkReason, LinkResolutionRecord, normalise_link_lookup},
     metadata::{MetadataExtraction, MetadataExtractor, WikiLink},
     metrics::parse_metrics_file,
@@ -681,11 +681,24 @@ impl Indexer {
         index_states: Arc<HashMap<String, NoteIndexState>>,
         write_tx: WriteSender,
     ) -> Result<NoteProcessing> {
+        let missing_embedding = note_requires_embedding_backfill(
+            self.embeddings.as_ref().map(|pipeline| pipeline.store()),
+            self.config.force,
+            &entry,
+            index_states.get(&entry.id),
+        )
+        .await?;
         let indexer = self.clone();
         let dispatch = tracing::dispatcher::get_default(|current| current.clone());
         task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                indexer.process_note(&entry, &resolution, &index_states, &write_tx)
+                indexer.process_note(
+                    &entry,
+                    &resolution,
+                    &index_states,
+                    &write_tx,
+                    missing_embedding,
+                )
             })
         })
         .await
@@ -714,6 +727,7 @@ impl Indexer {
         resolution: &ResolutionContext,
         index_states: &HashMap<String, NoteIndexState>,
         write_tx: &WriteSender,
+        missing_embedding: bool,
     ) -> Result<NoteProcessing> {
         let note = self
             .vault
@@ -726,13 +740,8 @@ impl Indexer {
         );
 
         let state = index_states.get(&entry.id).cloned();
-        let is_stale = if self.config.force {
-            true
-        } else if let Some(state) = state {
-            state.file_modified_at < entry.file_modified_at
-        } else {
-            true
-        };
+        let is_stale =
+            note_requires_reindex(self.config.force, entry, state.as_ref(), missing_embedding);
 
         if !is_stale {
             debug!(note_id = %entry.id, "note unchanged since last index; skipping");
@@ -960,6 +969,54 @@ fn submit_write(write_tx: &WriteSender, op: WriteOperation) -> Result<WriteAck> 
         .blocking_recv()
         .map_err(|err| anyhow!("writer task dropped response: {err}"))??;
     Ok(ack)
+}
+
+fn note_requires_reindex(
+    force: bool,
+    entry: &NoteInventoryEntry,
+    state: Option<&NoteIndexState>,
+    missing_embedding: bool,
+) -> bool {
+    if force || missing_embedding {
+        return true;
+    }
+
+    match state {
+        Some(state) => state.file_modified_at < entry.file_modified_at,
+        None => true,
+    }
+}
+
+async fn note_requires_embedding_backfill(
+    store: Option<&EmbeddingStore>,
+    force: bool,
+    entry: &NoteInventoryEntry,
+    state: Option<&NoteIndexState>,
+) -> Result<bool> {
+    let Some(store) = store else {
+        return Ok(false);
+    };
+
+    if force {
+        return Ok(false);
+    }
+
+    let Some(state) = state else {
+        return Ok(false);
+    };
+
+    if state.file_modified_at < entry.file_modified_at {
+        return Ok(false);
+    }
+
+    let missing_embedding = !store.has_embedding_for_note(&entry.id).await?;
+    if missing_embedding {
+        debug!(
+            note_id = %entry.id,
+            "note is indexed but missing embeddings; scheduling backfill"
+        );
+    }
+    Ok(missing_embedding)
 }
 
 async fn run_writer(
@@ -1291,6 +1348,70 @@ mod tests {
         let second = indexer.index_all().await.expect("second index");
         assert_eq!(second.indexed, 0);
         assert_eq!(second.skipped, first.total_notes);
+    }
+
+    #[test]
+    fn note_requires_reindex_when_embeddings_are_missing() {
+        let (vault, _database, _note_path) = temp_vault_with_note();
+        let entry = vault
+            .inventory()
+            .expect("inventory")
+            .into_iter()
+            .find(|entry| entry.id == "Sample")
+            .expect("sample note entry");
+        let state = NoteIndexState {
+            file_modified_at: entry.file_modified_at,
+            indexed_at: entry.file_modified_at,
+        };
+
+        assert!(!note_requires_reindex(false, &entry, Some(&state), false));
+        assert!(note_requires_reindex(false, &entry, Some(&state), true));
+    }
+
+    #[tokio::test]
+    async fn note_requires_embedding_backfill_for_fresh_indexed_notes_without_vectors() {
+        let (vault, database, _note_path) = temp_vault_with_note();
+        let entry = vault
+            .inventory()
+            .expect("inventory")
+            .into_iter()
+            .find(|entry| entry.id == "Sample")
+            .expect("sample note entry");
+        let state = NoteIndexState {
+            file_modified_at: entry.file_modified_at,
+            indexed_at: entry.file_modified_at,
+        };
+
+        let descriptor = crate::embeddings::EmbeddingDescriptor::resolve("fast")
+            .expect("resolve embedding descriptor");
+        let (store, _) =
+            crate::embeddings::EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor)
+                .await
+                .expect("bootstrap embedding store");
+
+        assert!(
+            note_requires_embedding_backfill(Some(&store), false, &entry, Some(&state))
+                .await
+                .expect("backfill check"),
+            "fresh indexed note without an embedding should be reindexed"
+        );
+
+        let record = EmbeddingRecord {
+            note_id: entry.id.clone(),
+            vector: vec![0.25; descriptor.dimension()],
+            indexed_at: entry.file_modified_at,
+        };
+        store
+            .upsert_embeddings(&[record])
+            .await
+            .expect("upsert embedding");
+
+        assert!(
+            !note_requires_embedding_backfill(Some(&store), false, &entry, Some(&state))
+                .await
+                .expect("backfill check"),
+            "fresh indexed note with an embedding should stay skippable"
+        );
     }
 
     #[tokio::test]
