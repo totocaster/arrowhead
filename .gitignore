@@ -28,10 +28,6 @@ config.toml
 .env
 .env.local
 
-# Alfred workflow bundle
-integrations/alfred-workflow/workflow/arrowhead-search.alfredworkflow
-integrations/alfred-workflow/workflow/arrowhead-notes.alfredworkflow
-
 # Build artifacts
 /dist/
 /release/

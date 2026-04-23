@@ -5280,6 +5280,16 @@ mod tests {
     #[tokio::test]
     async fn changed_context_surfaces_recent_note_activity() {
         let (_dir, service) = build_service();
+        let now = Utc::now();
+        insert_note_fixture(
+            &service,
+            "Recent Activity",
+            Some("Recent Activity"),
+            "Freshly changed note for the rolling changed window.",
+            Some(now - Duration::hours(2)),
+            now - Duration::minutes(30),
+        );
+
         let payload = service
             .changed(3, Some(5), Some(5))
             .await
@@ -5287,7 +5297,11 @@ mod tests {
 
         assert_eq!(payload.summary.kind, ContextTargetKind::Changed);
         assert!(
-            !payload.activity.notes.is_empty(),
+            payload
+                .activity
+                .notes
+                .iter()
+                .any(|note| note.note_id == "Recent Activity"),
             "expected recent note activity in changed context"
         );
     }

@@ -13,7 +13,7 @@ BIN_DIR := $(PREFIX)/bin
 CARGO_LOCKED := $(if $(filter 0,$(LOCKED)),,--locked)
 CARGO_FORCE := $(if $(filter 1,$(FORCE)),--force,)
 
-.PHONY: install clean alfred-workflow
+.PHONY: install clean
 install:
 	@set -euo pipefail; \
 	BIN_DIR="$(BIN_DIR)"; \
@@ -62,12 +62,8 @@ clean:
 	@echo "Cleaning workspace"
 	@"$(CARGO)" clean
 
-alfred-workflow:
-	@bash scripts/package-alfred-workflow.sh
-
 .PHONY: help
 help:
 	@printf 'Available targets:\n'
 	@printf '  install    Build and install arrowhead-cli and arrowheadd (uses --locked by default; override PREFIX, LOCKED=0, FORCE=1 only when needed)\n'
 	@printf '  clean      Remove target artifacts via cargo clean\n'
-	@printf '  alfred-workflow  Package integrations/alfred-workflow into workflow/arrowhead-search.alfredworkflow\n'
