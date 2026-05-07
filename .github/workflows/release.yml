@@ -155,6 +155,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Determine version
         id: vars
@@ -208,9 +210,21 @@ jobs:
           echo "intel_url=${intel_url}" >> "${GITHUB_OUTPUT}"
           echo "intel_sha=${intel_sha}" >> "${GITHUB_OUTPUT}"
 
+      - name: Write release notes
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          ARM_URL: ${{ steps.metadata.outputs.arm_url }}
+          ARM_SHA: ${{ steps.metadata.outputs.arm_sha }}
+          INTEL_URL: ${{ steps.metadata.outputs.intel_url }}
+          INTEL_SHA: ${{ steps.metadata.outputs.intel_sha }}
+        run: |
+          set -euo pipefail
+          ./scripts/write-release-notes.sh release-notes.md "${VERSION}" "${ARM_URL}" "${ARM_SHA}" "${INTEL_URL}" "${INTEL_SHA}"
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: release-notes.md
           files: |
             dist/*.tar.gz
             dist/*.sha256

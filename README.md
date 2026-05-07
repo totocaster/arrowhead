@@ -367,8 +367,9 @@ Active roadmap items are tracked on GitHub and currently include:
 ## Release Process
 
 - Tag the commit you want to ship with `vX.Y.Z`; pushing the tag triggers the `Release` workflow.
-- The workflow re-runs formatting, clippy, and tests on Ubuntu, then builds macOS Intel (macos-12) and Apple Silicon (macos-14) binaries with `cargo build --release`.
-- Binaries are packaged as `arrowhead-<version>-<target>.tar.gz` with `bin/arrowhead` plus the project README and uploaded to the GitHub release.
+- The workflow re-runs formatting, clippy, and tests on Ubuntu, then builds macOS Intel and Apple Silicon binaries with `cargo build --release`.
+- Binaries are packaged as `arrowhead-<version>-<target>.tar.gz` with `bin/arrowhead`, `bin/arrowheadd`, and the project README.
+- The GitHub release body includes install instructions, artifact SHA256 sums, and conventional-commit changelog notes since the previous tag.
 - Set a personal access token with `repo` scope as the `HOMEBREW_TAP_TOKEN` repository secret so the workflow can push tap updates to `totocaster/homebrew-tap`.
 - The tap formula is rewritten automatically to point at the new release URLs and SHA256 sums for both macOS architectures.
 
