@@ -24,7 +24,7 @@ use tokio::{
     sync::{Mutex, broadcast, mpsc},
     task::JoinHandle,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::control::{ControlRequest, ControlResponse, run_control_server, send_control_request};
 use crate::watcher::{WatcherHandle, WatcherStrategy, start_watcher};
@@ -328,7 +328,29 @@ impl DaemonRuntime {
                     }
 
                     let queue_len = self.event_rx.len();
-                    self.process_paths(paths.into_iter().collect(), queue_len).await?;
+                    // A failing batch (e.g. a permission error while inspecting
+                    // one file) must not take the daemon down; record the issue
+                    // and keep watching.
+                    if let Err(err) = self.process_paths(paths.into_iter().collect(), queue_len).await {
+                        error!(error = ?err, "failed to process watcher event batch; daemon continues");
+                        let detail = format!("{err:#}");
+                        if let Err(persist_err) = self
+                            .persist_status(|status| {
+                                status.activity = ActivityStatus::idle();
+                                status.issues.retain(|issue| issue.code != WATCHER_ERROR_CODE);
+                                let mut issue = StatusIssue::new(
+                                    WATCHER_ERROR_CODE,
+                                    "failed to process a filesystem event batch",
+                                    IssueSeverity::Error,
+                                );
+                                issue.detail = Some(detail.clone());
+                                status.issues.push(issue);
+                            })
+                            .await
+                        {
+                            warn!(error = ?persist_err, "failed to persist watcher error status");
+                        }
+                    }
                 }
                 else => break,
             }
@@ -521,6 +543,10 @@ impl DaemonRuntime {
         self.persist_status(|status| {
             status.indexed_notes = indexed_notes;
             update_index_error_issue(status, stats.errors);
+            // A successful batch clears any earlier batch-processing failure.
+            status
+                .issues
+                .retain(|issue| issue.code != WATCHER_ERROR_CODE);
             status.activity = ActivityStatus::idle();
         })
         .await?;
@@ -1045,6 +1071,7 @@ where
 }
 
 const INDEX_ERROR_CODE: &str = "index_errors";
+const WATCHER_ERROR_CODE: &str = "watcher_errors";
 const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
 const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
 

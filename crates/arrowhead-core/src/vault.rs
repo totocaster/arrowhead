@@ -663,13 +663,23 @@ impl Vault {
             self.settings.ignored_folders(),
         )? {
             let note_id = derive_note_id(&relative_path)?;
-            if ids.contains_key(&note_id) {
+            if let Some(existing_index) = ids.get(&note_id) {
+                // A single odd file must not take the whole vault down: every
+                // operation starts from inventory, so failing here would brick
+                // search, indexing, and the MCP server alike. Keep the first
+                // entry (paths are sorted, so this is deterministic) and skip
+                // the duplicate with a warning.
+                let existing = entries
+                    .get(*existing_index)
+                    .map(|entry: &NoteInventoryEntry| entry.relative_path.display().to_string())
+                    .unwrap_or_default();
                 warn!(
                     note_id = %note_id,
                     path = %relative_path.display(),
-                    "duplicate note identifier detected during inventory"
+                    kept = %existing,
+                    "duplicate note identifier detected during inventory; skipping this file"
                 );
-                bail!("duplicate note identifier detected: {note_id}");
+                continue;
             }
 
             let absolute_path = self.note_path(&relative_path);
@@ -928,6 +938,39 @@ mod tests {
         );
         let updated = fs::read_to_string(&note_path).expect("read updated note");
         assert!(updated.contains("Updated body"));
+    }
+
+    #[test]
+    fn inventory_skips_duplicate_note_ids_instead_of_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Both file names derive the id "Note" (derive_note_id trims the
+        // surrounding whitespace), which previously aborted the entire
+        // inventory build and with it every vault operation.
+        fs::write(dir.path().join("Note.md"), "# First").expect("write note");
+        fs::write(dir.path().join(" Note.md"), "# Duplicate").expect("write duplicate");
+        fs::write(dir.path().join("Other.md"), "# Other").expect("write other");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let inventory = vault
+            .inventory()
+            .expect("inventory must tolerate duplicate note ids");
+
+        let matching: Vec<_> = inventory
+            .iter()
+            .filter(|entry| entry.id == "Note")
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one entry per note id");
+        // Markdown files are collected in sorted order, so the first path
+        // wins deterministically (" Note.md" sorts before "Note.md").
+        assert_eq!(matching[0].relative_path, PathBuf::from(" Note.md"));
+
+        // The rest of the vault keeps working.
+        let ids = vault.list_note_ids().expect("listing succeeds");
+        assert!(ids.contains(&"Other".to_string()));
+        assert_eq!(ids.iter().filter(|id| *id == "Note").count(), 1);
+        let note = vault.load_note("Other").expect("unaffected notes load");
+        assert!(note.content.contains("# Other"));
     }
 
     #[test]

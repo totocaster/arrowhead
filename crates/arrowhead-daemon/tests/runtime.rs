@@ -92,6 +92,94 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn watcher_batch_errors_do_not_kill_the_daemon() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _log_guard = TEST_LOG_MUTEX.lock().await;
+    let (temp_dir, vault_root) = prepare_vault()?;
+
+    // A note inside a subdirectory that will later become unreadable.
+    let locked_dir = vault_root.join("Locked");
+    fs::create_dir_all(&locked_dir)?;
+    fs::write(
+        locked_dir.join("Secret.md"),
+        "# Secret\n\nHidden content.\n",
+    )?;
+
+    let handle = DaemonRuntimeBuilder::new(&vault_root)
+        .disable_embeddings()
+        .watcher_strategy(WatcherStrategy::Poll {
+            interval: Duration::from_millis(50),
+        })
+        .spawn()
+        .await?;
+
+    let db = handle.database();
+    let initial_state = wait_for_note_state(db.clone(), "Minimal Note").await?;
+    wait_for_note_state(db.clone(), "Locked/Secret").await?;
+
+    // Making the directory unreadable delivers remove events for its children;
+    // inspecting those paths then fails with PermissionDenied (not NotFound),
+    // which aborts the watcher batch.
+    fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000))?;
+
+    // The daemon must record the failure as a status issue instead of dying.
+    let status = match wait_for_status_issue(handle.status_path(), "watcher_errors", true).await {
+        Ok(status) => status,
+        Err(err) => {
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).ok();
+            let log = fs::read_to_string(vault_root.join(".arrowhead/logs/daemon.log"))
+                .unwrap_or_default();
+            panic!("{err}; daemon log:\n{log}");
+        }
+    };
+    let issue = status
+        .issues
+        .iter()
+        .find(|issue| issue.code == "watcher_errors")
+        .expect("watcher issue present");
+    assert!(issue.detail.is_some(), "issue should carry error detail");
+
+    // Restoring access lets the next batch succeed and clear the issue.
+    fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755))?;
+    wait_for_status_issue(handle.status_path(), "watcher_errors", false).await?;
+
+    // The event loop must still be alive: a normal edit gets reindexed.
+    let note_path = vault_root.join("Minimal Note.md");
+    let mut content = fs::read_to_string(&note_path)?;
+    sleep(Duration::from_millis(1100)).await;
+    content.push_str("\n\nDaemon resilience test update.\n");
+    fs::write(&note_path, content)?;
+
+    let updated_state =
+        wait_for_updated_note_state(db.clone(), "Minimal Note", initial_state.indexed_at).await?;
+    assert!(
+        updated_state.indexed_at > initial_state.indexed_at,
+        "daemon should keep indexing after a failed watcher batch"
+    );
+
+    handle.shutdown().await?;
+    drop(temp_dir);
+
+    Ok(())
+}
+
+async fn wait_for_status_issue(path: &Path, code: &str, present: bool) -> Result<DaemonStatus> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = load_status(path)? {
+            if status.issues.iter().any(|issue| issue.code == code) == present {
+                return Ok(status);
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("status issue `{code}` did not become present={present} before timeout");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn control_socket_status_and_shutdown() -> Result<()> {
     let _log_guard = TEST_LOG_MUTEX.lock().await;
     let (temp_dir, vault_root) = prepare_vault()?;
