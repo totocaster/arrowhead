@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    ffi::OsString,
     fs,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
@@ -402,15 +403,13 @@ impl Vault {
 
     /// Resolve a note identifier to an absolute path including the `.md` extension.
     pub fn note_file_path(&self, note_id: &str) -> Result<PathBuf> {
-        let mut relative = self.relative_path_from_id(note_id)?;
-        relative.set_extension("md");
+        let relative = append_md_extension(self.relative_path_from_id(note_id)?);
         Ok(self.note_path(relative))
     }
 
     /// Write the supplied metadata/body to the given note identifier, creating parent directories.
     pub fn write_note(&self, note_id: &str, metadata: &MetadataMap, body: &str) -> Result<()> {
-        let mut relative = self.relative_path_from_id(note_id)?;
-        relative.set_extension("md");
+        let relative = append_md_extension(self.relative_path_from_id(note_id)?);
         let absolute = self.note_path(&relative);
 
         info!(
@@ -900,6 +899,63 @@ mod tests {
     }
 
     #[test]
+    fn note_ids_with_dots_round_trip_to_the_same_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let note_path = dir.path().join("Meeting 2024.01.md");
+        fs::write(&note_path, "---\ntitle: Dotted\n---\n\nBody\n").expect("write note");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+
+        // The id derived during inventory must resolve back to the same file.
+        let inventory = vault.inventory().expect("inventory builds");
+        let entry = inventory
+            .iter()
+            .find(|entry| entry.relative_path == PathBuf::from("Meeting 2024.01.md"))
+            .expect("dotted note discovered");
+        assert_eq!(entry.id, "Meeting 2024.01");
+
+        let resolved = vault.note_file_path(&entry.id).expect("path resolves");
+        assert_eq!(resolved, fs::canonicalize(&note_path).expect("canonical"));
+
+        // Writing through the id must update the original file, not create a sibling.
+        vault
+            .write_note(&entry.id, &MetadataMap::default(), "Updated body\n")
+            .expect("write note");
+        assert!(
+            !dir.path().join("Meeting 2024.md").exists(),
+            "write must not target a truncated path"
+        );
+        let updated = fs::read_to_string(&note_path).expect("read updated note");
+        assert!(updated.contains("Updated body"));
+    }
+
+    #[test]
+    fn append_md_extension_handles_dotted_and_plain_names() {
+        assert_eq!(
+            append_md_extension(PathBuf::from("Meeting 2024.01")),
+            PathBuf::from("Meeting 2024.01.md")
+        );
+        assert_eq!(
+            append_md_extension(PathBuf::from("Plain Note")),
+            PathBuf::from("Plain Note.md")
+        );
+        assert_eq!(
+            append_md_extension(PathBuf::from("Nested/Notes v1.2")),
+            PathBuf::from("Nested/Notes v1.2.md")
+        );
+        // Paths that already carry the extension are left untouched.
+        assert_eq!(
+            append_md_extension(PathBuf::from("Already.md")),
+            PathBuf::from("Already.md")
+        );
+        assert_eq!(
+            append_md_extension(PathBuf::from("Upper.MD")),
+            PathBuf::from("Upper.MD")
+        );
+    }
+
+    #[test]
     fn list_note_ids_respects_ignored_folders() {
         let vault = build_vault();
         let ids = vault.list_note_ids().expect("listing succeeds");
@@ -1362,6 +1418,26 @@ fn metadata_to_yaml(metadata: &MetadataMap) -> Result<String> {
 
     let yaml = serde_yaml::to_string(&mapping)?;
     Ok(yaml.trim_end().to_string() + "\n")
+}
+
+/// Append the `.md` extension to a note-id-derived relative path.
+///
+/// Note ids may contain dots (`Meeting 2024.01`), so `Path::set_extension`
+/// must not be used here: it would replace everything after the last dot and
+/// point at a different file. This is the inverse of [`derive_note_id`].
+fn append_md_extension(mut relative: PathBuf) -> PathBuf {
+    let already_md = relative
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if already_md {
+        return relative;
+    }
+
+    let mut file_name = relative.file_name().map(OsString::from).unwrap_or_default();
+    file_name.push(".md");
+    relative.set_file_name(file_name);
+    relative
 }
 
 fn derive_note_id(path: &Path) -> Result<NoteId> {

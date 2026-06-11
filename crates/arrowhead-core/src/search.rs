@@ -688,8 +688,11 @@ fn rank_to_score(rank: f64) -> f32 {
         return 0.0;
     }
 
-    let adjusted = rank.max(0.0);
-    (-adjusted).exp() as f32
+    // SQLite's bm25() reports values <= 0.0 where more negative means a
+    // better match. Map the magnitude onto (0, 1) so stronger matches score
+    // higher; positive ranks (which bm25 never produces) clamp to 0.
+    let magnitude = (-rank).max(0.0);
+    (1.0 - (-magnitude).exp()) as f32
 }
 
 fn collect_excluded_ids(database: &IndexDatabase, excludes: &[String]) -> Result<HashSet<String>> {
@@ -925,6 +928,26 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].note_id, "Journal");
         assert_eq!(results[0].reason.as_deref(), Some("Filter match"));
+    }
+
+    #[test]
+    fn rank_to_score_orders_bm25_ranks() {
+        // bm25 ranks are negative; more negative means a better match and
+        // must therefore produce a higher score.
+        let strong = rank_to_score(-5.0);
+        let medium = rank_to_score(-1.0);
+        let weak = rank_to_score(-0.1);
+
+        assert!(strong > medium, "strong match must outscore medium");
+        assert!(medium > weak, "medium match must outscore weak");
+        assert!(weak > 0.0, "any match must score above zero");
+        assert!(strong < 1.0, "scores stay below 1.0");
+
+        // Degenerate inputs collapse to zero instead of saturating at 1.0.
+        assert_eq!(rank_to_score(0.0), 0.0);
+        assert_eq!(rank_to_score(3.0), 0.0);
+        assert_eq!(rank_to_score(f64::NAN), 0.0);
+        assert_eq!(rank_to_score(f64::INFINITY), 0.0);
     }
 
     #[tokio::test]

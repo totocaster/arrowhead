@@ -24,7 +24,7 @@ use tokio::{
 };
 use tower_http::{
     limit::RequestBodyLimitLayer,
-    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+    trace::{DefaultOnResponse, TraceLayer},
 };
 use tracing::{Instrument, Level, debug, error, info, trace, warn};
 
@@ -161,8 +161,17 @@ where
             self.ip_allowlist.clone(),
         );
 
+        // Build spans manually instead of using DefaultMakeSpan: the default
+        // records the full request URI, which embeds the raw secret in
+        // link-token mode (`/rpc/<token>`).
         let trace_layer = TraceLayer::new_for_http()
-            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+            .make_span_with(|request: &axum::http::Request<Body>| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %redact_request_path(request.uri().path()),
+                )
+            })
             .on_response(
                 DefaultOnResponse::new()
                     .level(Level::INFO)
@@ -299,7 +308,11 @@ async fn process_rpc<H>(
 where
     H: MessageHandler,
 {
-    trace!(remote = %client_addr, ?token_path, "received HTTP RPC request");
+    trace!(
+        remote = %client_addr,
+        link_token_supplied = token_path.is_some(),
+        "received HTTP RPC request"
+    );
 
     if !state.allows_ip(client_addr.ip()) {
         warn!(remote = %client_addr, "rejecting request from disallowed IP address");
@@ -372,6 +385,14 @@ where
             error!(error = %error, "failed to process JSON-RPC request");
             HttpResponse::status(StatusCode::INTERNAL_SERVER_ERROR)
         }
+    }
+}
+
+/// Replace link-token path segments with a placeholder before logging.
+fn redact_request_path(path: &str) -> &str {
+    match path.strip_prefix("/rpc/") {
+        Some(rest) if !rest.is_empty() => "/rpc/<redacted>",
+        _ => path,
     }
 }
 
@@ -639,6 +660,14 @@ mod tests {
 
     fn bearer_header() -> String {
         format!("Bearer {TEST_TOKEN}")
+    }
+
+    #[test]
+    fn redacts_link_token_paths_for_logging() {
+        assert_eq!(redact_request_path("/rpc/super-secret"), "/rpc/<redacted>");
+        assert_eq!(redact_request_path("/rpc"), "/rpc");
+        assert_eq!(redact_request_path("/rpc/"), "/rpc/");
+        assert_eq!(redact_request_path("/health"), "/health");
     }
 
     #[tokio::test]

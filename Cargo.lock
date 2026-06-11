@@ -136,7 +136,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "arrowhead-cli"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "arrowhead-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "arrowhead-core"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "arrowhead-daemon"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "arrowhead-core",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "arrowhead-mcp"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "arrowhead-core",

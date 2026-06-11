@@ -139,13 +139,15 @@ impl IndexDatabase {
                     "rebuilding index database due to schema version mismatch"
                 );
                 drop(conn);
-                fs::remove_file(&path).with_context(|| {
-                    format!("failed to remove incompatible database {}", path.display())
-                })?;
+                remove_database_files(&path)?;
             }
         }
 
-        let manager = SqliteConnectionManager::file(&path);
+        // Pragmas are per-connection in SQLite, so every pooled connection must
+        // run them: without `foreign_keys` the ON DELETE CASCADE clauses are
+        // silently ignored, and without `busy_timeout` concurrent access fails
+        // immediately with SQLITE_BUSY.
+        let manager = SqliteConnectionManager::file(&path).with_init(init_connection);
         let pool = Pool::builder()
             .max_size(32)
             .connection_timeout(Duration::from_secs(120))
@@ -156,7 +158,6 @@ impl IndexDatabase {
             let conn = pool
                 .get()
                 .context("failed to obtain SQLite connection for migrations")?;
-            init_connection(&conn)?;
             apply_migrations(&conn)?;
         }
 
@@ -1232,16 +1233,11 @@ impl IndexDatabase {
     }
 }
 
-fn init_connection(conn: &Connection) -> Result<()> {
-    ensure_sqlite_vec_registered()?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .context("failed to set journal_mode")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
-        .context("failed to set synchronous")?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .context("failed to enable foreign keys")?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .context("failed to set busy_timeout")?;
+fn init_connection(conn: &mut Connection) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
     Ok(())
 }
 
@@ -1380,6 +1376,36 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
     conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
         .context("failed to set schema version")
+}
+
+/// Remove a SQLite database along with its WAL/SHM companion files.
+///
+/// The database runs in WAL mode, so deleting only the main file can leave a
+/// stale `-wal` journal behind that SQLite would replay into a freshly created
+/// database of the same name.
+fn remove_database_files(path: &Path) -> Result<()> {
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove incompatible database {}", path.display()))?;
+
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = path.as_os_str().to_os_string();
+        companion.push(suffix);
+        let companion = std::path::PathBuf::from(companion);
+        match fs::remove_file(&companion) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to remove stale database companion {}",
+                        companion.display()
+                    )
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_sqlite_vec_registered() -> Result<()> {
@@ -1981,6 +2007,124 @@ mod tests {
         let database =
             IndexDatabase::open(dir.path().join(".arrowhead/index.db")).expect("database opens");
         (dir, vault, database)
+    }
+
+    #[test]
+    fn pooled_connections_apply_session_pragmas() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        let db = IndexDatabase::open(&db_path).expect("database opens");
+
+        // Pin one connection so the pool must hand out others. Regression:
+        // session pragmas ran only on the first pooled connection, so every
+        // other connection kept SQLite's zero busy timeout and failed
+        // immediately with SQLITE_BUSY under concurrent daemon/CLI access.
+        let _pinned = db.connection().expect("pin first connection");
+        // Hold every borrowed connection so each loop iteration draws a
+        // genuinely distinct connection from the pool.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let conn = db.connection().expect("pooled connection");
+            let busy_timeout: i64 = conn
+                .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+                .expect("read busy_timeout");
+            assert_eq!(
+                busy_timeout, 5000,
+                "every pooled connection must carry the configured busy timeout"
+            );
+            let foreign_keys: i64 = conn
+                .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                .expect("read foreign_keys");
+            assert_eq!(foreign_keys, 1, "foreign key enforcement must be enabled");
+            held.push(conn);
+        }
+    }
+
+    #[test]
+    fn remove_note_cascades_metadata_on_fresh_connections() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        let db = IndexDatabase::open(&db_path).expect("database opens");
+
+        // Pin the first pooled connection so the rest of the test runs on
+        // freshly created ones; CASCADE cleanup must work on all of them.
+        let _pinned = db.connection().expect("pin first connection");
+
+        let note = load_note("Photography Equipment");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("metadata extracts");
+        let links = make_resolved_links(&extraction);
+        db.upsert_note(&note, &extraction, &links, Utc::now())
+            .expect("note upserts");
+
+        assert!(db.remove_note(&note.id).expect("note removes"));
+
+        let conn = db.connection().expect("verification connection");
+        let queries = [
+            (
+                "metadata",
+                "SELECT COUNT(*) FROM metadata WHERE note_id = ?1",
+            ),
+            (
+                "metadata_dates",
+                "SELECT COUNT(*) FROM metadata_dates WHERE note_id = ?1",
+            ),
+            (
+                "note_links",
+                "SELECT COUNT(*) FROM note_links WHERE source_id = ?1",
+            ),
+        ];
+        for (table, sql) in queries {
+            let count: i64 = conn
+                .query_row(sql, [&note.id], |row| row.get(0))
+                .expect("count query");
+            assert_eq!(count, 0, "{table} rows must cascade when a note is removed");
+        }
+    }
+
+    #[test]
+    fn remove_database_files_deletes_wal_companions() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        let wal_path = dir.path().join("index.db-wal");
+        let shm_path = dir.path().join("index.db-shm");
+        fs::write(&db_path, b"db").expect("write db");
+        fs::write(&wal_path, b"wal").expect("write wal");
+        fs::write(&shm_path, b"shm").expect("write shm");
+
+        remove_database_files(&db_path).expect("removal succeeds");
+        assert!(!db_path.exists());
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+
+        // Missing companions must not be treated as errors.
+        fs::write(&db_path, b"db").expect("rewrite db");
+        remove_database_files(&db_path).expect("removal without companions succeeds");
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn schema_mismatch_rebuild_handles_stale_wal_companions() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        drop(IndexDatabase::open(&db_path).expect("database opens"));
+
+        // Downgrade the stored schema version and plant leftover companions.
+        {
+            let conn = Connection::open(&db_path).expect("raw connection");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("set version");
+        }
+        fs::write(dir.path().join("index.db-wal"), b"").expect("plant wal");
+        fs::write(dir.path().join("index.db-shm"), b"").expect("plant shm");
+
+        let db = IndexDatabase::open(&db_path).expect("database rebuilds");
+        let conn = db.connection().expect("connection");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version");
+        assert_eq!(version, INDEX_SCHEMA_VERSION);
     }
 
     #[test]
