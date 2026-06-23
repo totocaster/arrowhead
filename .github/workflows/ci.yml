@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
@@ -15,6 +16,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/local/lib/android /usr/share/dotnet
+          df -h
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
