@@ -214,7 +214,7 @@ fn resolve_bind_address(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<
 fn parse_socket_addr(value: &str) -> Result<SocketAddr> {
     value
         .parse()
-        .map_err(|err| anyhow!("invalid bind address '{}': {}", value, err))
+        .map_err(|err| anyhow!("invalid bind address '{value}': {err}"))
 }
 
 fn resolve_auth_mode(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<AuthMode> {
@@ -236,7 +236,7 @@ fn build_allow_list(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<IpAl
     match IpAllowList::from_strings(entries) {
         Ok(list) => Ok(list),
         Err(NetworkError::InvalidCidr { input, source }) => {
-            Err(anyhow!("invalid CIDR entry '{}': {}", input, source))
+            Err(anyhow!("invalid CIDR entry '{input}': {source}"))
         }
     }
 }
@@ -257,7 +257,7 @@ fn collect_tokens(
             .add_hashed_token_hex(hash)
             .map_err(|err| match err {
                 TokenError::InvalidDigest { input, source } => {
-                    anyhow!("invalid token hash '{}': {}", input, source)
+                    anyhow!("invalid token hash '{input}': {source}")
                 }
                 other => anyhow!(other),
             })?;
@@ -343,15 +343,12 @@ fn generate_token_value() -> String {
 }
 
 fn print_generated_token(token: &str, digest: TokenDigest, bind: SocketAddr, mode: AuthMode) {
-    let base = format!("http://{}", bind);
+    let base = format!("http://{bind}");
     println!("Generated MCP token\n");
     println!("  Token: {token}");
     println!("  SHA-256: {}", digest.to_hex());
     println!("\nThe digest has been stored in your configuration file.");
-    println!(
-        "Authorization header example: curl -H \"Authorization: Bearer {token}\" {}/rpc",
-        base
-    );
+    println!("Authorization header example: curl -H \"Authorization: Bearer {token}\" {base}/rpc");
     if mode.accepts_link_tokens() {
         println!("Link token URL: {base}/rpc/{token}");
     }

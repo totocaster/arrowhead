@@ -270,7 +270,7 @@ fn render_results(
                     result.note_id, result.score, bm25_display, title
                 );
                 if let Some(reason) = &result.reason {
-                    println!("  Reason: {}", reason);
+                    println!("  Reason: {reason}");
                 }
                 if let Some(preview) = &result.preview {
                     println!("  {}", preview.trim());

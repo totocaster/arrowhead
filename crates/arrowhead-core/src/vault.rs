@@ -251,7 +251,7 @@ impl Vault {
             bail!("{} is not a directory", root.display());
         }
 
-        let arrowhead_dir = config.resolve_arrowhead_dir();
+        let arrowhead_dir = root.join(&config.arrowhead_dir_name);
         let obsidian_dir = root.join(".obsidian");
         let workspace_file_path = arrowhead_dir.join(WORKSPACE_CONFIG_FILE);
         let obsidian_present = obsidian_dir.exists();
@@ -974,6 +974,31 @@ mod tests {
     }
 
     #[test]
+    fn vault_internal_paths_follow_canonical_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(dir.path().join("Note.md"), "# Note").expect("write note");
+
+        let non_normal_root = nested.join("..");
+        let vault = Vault::new(VaultConfig::new(non_normal_root)).expect("vault initialises");
+        let canonical_root = fs::canonicalize(dir.path()).expect("canonical root");
+
+        assert_eq!(vault.paths().root, canonical_root);
+        assert_eq!(
+            vault.paths().arrowhead_dir,
+            canonical_root.join(".arrowhead")
+        );
+        assert_eq!(vault.paths().obsidian_dir, canonical_root.join(".obsidian"));
+        assert!(
+            vault
+                .resolve_relative_note_path(vault.paths().arrowhead_dir.join("index.db"))
+                .is_none(),
+            "internal Arrowhead paths must stay outside note operations"
+        );
+    }
+
+    #[test]
     fn append_md_extension_handles_dotted_and_plain_names() {
         assert_eq!(
             append_md_extension(PathBuf::from("Meeting 2024.01")),
@@ -1145,7 +1170,9 @@ mod tests {
 
         assert_eq!(
             metrics.source,
-            MetricsConventionsSource::ArrowheadWorkspace(workspace_path)
+            MetricsConventionsSource::ArrowheadWorkspace(
+                fs::canonicalize(workspace_path).expect("canonical workspace path")
+            )
         );
         assert_eq!(metrics.root, PathBuf::from("Health"));
         assert_eq!(metrics.extensions, vec![".health.ndjson".to_string()]);
@@ -1493,7 +1520,7 @@ fn derive_note_id(path: &Path) -> Result<NoteId> {
         .to_string();
 
     if id.is_empty() {
-        bail!("note path {:?} does not produce a valid identifier", path);
+        bail!("note path {path:?} does not produce a valid identifier");
     }
 
     Ok(id)

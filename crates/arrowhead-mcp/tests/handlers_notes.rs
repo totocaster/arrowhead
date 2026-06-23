@@ -1124,7 +1124,7 @@ async fn notes_delete_requires_confirmation_flag() {
         ProtocolError::InvalidParams { message } => {
             assert!(message.contains("confirm"), "unexpected message: {message}");
         }
-        other => panic!("expected invalid params error, got {:?}", other),
+        other => panic!("expected invalid params error, got {other:?}"),
     }
 }
 

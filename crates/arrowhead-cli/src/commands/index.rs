@@ -370,20 +370,16 @@ async fn handle_stop(ctx: &mut CommandContext) -> Result<()> {
             println!("shutdown signal sent to arrowhead indexer");
         }
         Ok(other) => {
-            bail!("unexpected response from indexer: {:?}", other);
+            bail!("unexpected response from indexer: {other:?}");
         }
         Err(err) => {
             if paths.socket_path.exists() {
                 println!(
-                    "control socket exists but the indexer is unreachable; removing stale socket ({})",
-                    err
+                    "control socket exists but the indexer is unreachable; removing stale socket ({err})"
                 );
                 remove_stale_socket(&paths.socket_path)?;
             } else {
-                println!(
-                    "no active indexer detected; cleaning up stale metadata ({})",
-                    err
-                );
+                println!("no active indexer detected; cleaning up stale metadata ({err})");
             }
         }
     }
@@ -436,10 +432,7 @@ async fn handle_status(ctx: &CommandContext, args: &IndexStatusArgs) -> Result<(
                 } else if stdout_is_tty {
                     status_ui::run_status_ui(None, Some(status)).await?;
                 } else {
-                    println!(
-                        "Indexer stream unavailable ({}). Showing latest snapshot.\n",
-                        err
-                    );
+                    println!("Indexer stream unavailable ({err}). Showing latest snapshot.\n");
                     render_snapshot(&status, stdout_is_tty);
                 }
                 Ok(())
@@ -553,14 +546,11 @@ pub(crate) async fn handle_reset(ctx: &mut CommandContext) -> Result<()> {
                 bail!("indexer reported an error during shutdown: {message}");
             }
             Ok(other) => {
-                bail!("unexpected response from indexer: {:?}", other);
+                bail!("unexpected response from indexer: {other:?}");
             }
             Err(err) => {
                 if paths.socket_path.exists() {
-                    println!(
-                        "failed to contact arrowhead indexer ({}); continuing with reset",
-                        err
-                    );
+                    println!("failed to contact arrowhead indexer ({err}); continuing with reset");
                 }
             }
         }
@@ -1059,9 +1049,9 @@ fn render_snapshot(status: &DaemonStatus, tty: bool) {
         .description
         .as_deref()
         .unwrap_or_else(|| describe_activity(status.activity.state));
-    println!("Activity: {}", activity_label);
+    println!("Activity: {activity_label}");
     if let Some(note_id) = &status.activity.note_id {
-        println!("  Note: {}", note_id);
+        println!("  Note: {note_id}");
     }
     if status.activity.queued_jobs > 0 {
         println!("  Queue: {}", status.activity.queued_jobs);
@@ -1104,7 +1094,7 @@ fn render_snapshot(status: &DaemonStatus, tty: bool) {
                 issue.message
             );
             if let Some(detail) = &issue.detail {
-                println!("    {}", detail);
+                println!("    {detail}");
             }
         }
     }

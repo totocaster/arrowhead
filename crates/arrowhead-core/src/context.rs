@@ -1107,7 +1107,7 @@ impl ContextService {
             .collect::<Vec<_>>();
         let attention = attention_items_for_metrics(&all_metrics);
         let links = build_window_links(
-            &format!("week:{}..{}", start, end),
+            &format!("week:{start}..{end}"),
             "Requested week contains note activity",
             &related_notes,
             "Requested week contains metric activity",
@@ -1240,7 +1240,7 @@ impl ContextService {
             .collect::<Vec<_>>();
         let attention = attention_items_for_metrics(&all_metrics);
         let links = build_window_links(
-            &format!("month:{}..{}", start, end),
+            &format!("month:{start}..{end}"),
             "Requested month contains note activity",
             &related_notes,
             "Requested month contains metric activity",
@@ -4563,15 +4563,15 @@ mod tests {
             .map(|note| note.note_id.as_str())
             .collect::<Vec<_>>();
         assert!(
-            note_ids.iter().any(|note_id| *note_id == "Project Hub"),
+            note_ids.contains(&"Project Hub"),
             "expected explicit note evidence to remain present"
         );
         assert!(
-            note_ids.iter().any(|note_id| *note_id == "2026-04-14"),
+            note_ids.contains(&"2026-04-14"),
             "expected structural same-day note evidence to remain present"
         );
         assert!(
-            note_ids.iter().any(|note_id| *note_id == "Weight Lexicon"),
+            note_ids.contains(&"Weight Lexicon"),
             "expected exact metric-key notes to surface as explicit evidence"
         );
         assert_eq!(
@@ -4857,11 +4857,11 @@ mod tests {
             .map(|note| note.note_id.as_str())
             .collect::<Vec<_>>();
         assert!(
-            note_ids.iter().any(|note_id| *note_id == "Related Note"),
+            note_ids.contains(&"Related Note"),
             "expected explicit source note evidence to remain present"
         );
         assert!(
-            note_ids.iter().any(|note_id| *note_id == "2026-04-14"),
+            note_ids.contains(&"2026-04-14"),
             "expected same-day source note evidence to remain present"
         );
         assert!(
@@ -5312,12 +5312,10 @@ mod tests {
         let today = Utc::now().date_naive();
         let yesterday = today - Duration::days(1);
         let row_one = format!(
-            r#"{{"id":"01RECENT001","ts":"{}T08:30:00Z","date":"{}","key":"body.weight","value":104.0,"unit":"kg","source":"withings","note":"Recent weigh-in"}}"#,
-            yesterday, yesterday
+            r#"{{"id":"01RECENT001","ts":"{yesterday}T08:30:00Z","date":"{yesterday}","key":"body.weight","value":104.0,"unit":"kg","source":"withings","note":"Recent weigh-in"}}"#
         );
         let row_two = format!(
-            r#"{{"id":"01RECENT002","ts":"{}T08:45:00Z","date":"{}","key":"body.weight","value":103.8,"unit":"kg","source":"withings","note":"Today weigh-in"}}"#,
-            today, today
+            r#"{{"id":"01RECENT002","ts":"{today}T08:45:00Z","date":"{today}","key":"body.weight","value":103.8,"unit":"kg","source":"withings","note":"Today weigh-in"}}"#
         );
         insert_metric_rows(
             &service,

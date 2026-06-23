@@ -1125,10 +1125,8 @@ impl IndexDatabase {
 
         let conn = self.connection()?;
         let placeholders = vec!["?"; note_ids.len()].join(", ");
-        let sql = format!(
-            "SELECT note_id, key, value FROM metadata WHERE note_id IN ({})",
-            placeholders
-        );
+        let sql =
+            format!("SELECT note_id, key, value FROM metadata WHERE note_id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params_from_iter(note_ids.iter().map(|id| id.as_str())),
@@ -1160,7 +1158,7 @@ impl IndexDatabase {
 
         let conn = self.connection()?;
         let placeholders = vec!["?"; note_ids.len()].join(", ");
-        let sql = format!("SELECT id, title FROM notes WHERE id IN ({})", placeholders);
+        let sql = format!("SELECT id, title FROM notes WHERE id IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params_from_iter(note_ids.iter().map(|id| id.as_str())),
@@ -1188,10 +1186,7 @@ impl IndexDatabase {
 
         let conn = self.connection()?;
         let placeholders = vec!["?"; note_ids.len()].join(", ");
-        let sql = format!(
-            "SELECT id, relative_path FROM notes WHERE id IN ({})",
-            placeholders
-        );
+        let sql = format!("SELECT id, relative_path FROM notes WHERE id IN ({placeholders})");
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
@@ -1678,8 +1673,7 @@ fn load_metric_record_entry(
         )
         .with_context(|| {
             format!(
-                "failed to load metric record {}:{}",
-                source_file, source_line
+                "failed to load metric record {source_file}:{source_line}"
             )
         })?;
 
@@ -1705,20 +1699,14 @@ fn load_metric_record_entry(
         .map(serde_json::from_str::<serde_json::Map<String, Value>>)
         .transpose()
         .with_context(|| {
-            format!(
-                "failed to parse stored metric context for {}:{}",
-                source_file, source_line
-            )
+            format!("failed to parse stored metric context for {source_file}:{source_line}")
         })?;
     let tags = tags_json
         .as_deref()
         .map(serde_json::from_str::<Vec<String>>)
         .transpose()
         .with_context(|| {
-            format!(
-                "failed to parse stored metric tags for {}:{}",
-                source_file, source_line
-            )
+            format!("failed to parse stored metric tags for {source_file}:{source_line}")
         })?
         .unwrap_or_default();
     let extra_fields = extra_fields_json
@@ -1726,10 +1714,7 @@ fn load_metric_record_entry(
         .map(serde_json::from_str::<BTreeMap<String, Value>>)
         .transpose()
         .with_context(|| {
-            format!(
-                "failed to parse stored metric extra fields for {}:{}",
-                source_file, source_line
-            )
+            format!("failed to parse stored metric extra fields for {source_file}:{source_line}")
         })?
         .unwrap_or_default();
 
@@ -1739,10 +1724,7 @@ fn load_metric_record_entry(
         record: MetricRecord {
             id,
             ts: DateTime::parse_from_rfc3339(&ts).with_context(|| {
-                format!(
-                    "failed to parse stored metric timestamp for {}:{}",
-                    source_file, source_line
-                )
+                format!("failed to parse stored metric timestamp for {source_file}:{source_line}")
             })?,
             key,
             value,
@@ -1752,10 +1734,7 @@ fn load_metric_record_entry(
                 .map(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
                 .transpose()
                 .with_context(|| {
-                    format!(
-                        "failed to parse stored metric date for {}:{}",
-                        source_file, source_line
-                    )
+                    format!("failed to parse stored metric date for {source_file}:{source_line}")
                 })?,
             unit,
             origin_id,
@@ -1893,7 +1872,7 @@ fn append_metadata_value(parts: &mut Vec<String>, key: &str, value: &Value) {
                 push_metadata_tokens(parts, key, &serialised);
             }
             for (nested_key, nested_value) in map {
-                let nested = format!("{key}.{}", nested_key);
+                let nested = format!("{key}.{nested_key}");
                 append_metadata_value(parts, &nested, nested_value);
             }
         }

@@ -976,16 +976,14 @@ async fn consume_download_events(
                     entry.state = DownloadState::Failed;
                     entry.message = Some(message.clone());
                     snapshot.activity = ActivityStatus::running(ActivityState::Faulted, None, 0);
-                    snapshot.activity.description = Some(format!(
-                        "failed to download embeddings for {}",
-                        descriptor_id
-                    ));
+                    snapshot.activity.description =
+                        Some(format!("failed to download embeddings for {descriptor_id}"));
                     snapshot
                         .issues
                         .retain(|issue| issue.code != EMBEDDING_DOWNLOAD_ISSUE_CODE);
                     let mut issue = StatusIssue::new(
                         EMBEDDING_DOWNLOAD_ISSUE_CODE,
-                        format!("failed to download embedding assets for {}", descriptor_id),
+                        format!("failed to download embedding assets for {descriptor_id}"),
                         IssueSeverity::Error,
                     );
                     issue.detail = Some(message.clone());
@@ -1035,10 +1033,7 @@ async fn record_embedding_failure(
         }
         let mut issue = StatusIssue::new(
             EMBEDDING_INIT_ISSUE_CODE,
-            format!(
-                "semantic embeddings unavailable for model {}",
-                descriptor_id
-            ),
+            format!("semantic embeddings unavailable for model {descriptor_id}"),
             IssueSeverity::Error,
         );
         issue.detail = Some(detail.clone());

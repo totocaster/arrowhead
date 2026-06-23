@@ -163,8 +163,7 @@ fn resolve_action(action: &Option<GraphAction>) -> Result<ResolvedGraphAction> {
             }
             if values.len() > 1 {
                 bail!(
-                    "unexpected arguments {:?}. Provide a single note identifier or choose a subcommand.",
-                    values
+                    "unexpected arguments {values:?}. Provide a single note identifier or choose a subcommand."
                 );
             }
             Ok(ResolvedGraphAction::Context(values[0].clone()))
@@ -205,11 +204,11 @@ fn render_forward_links(
     match format {
         GraphOutputFormat::Human => {
             if edges.is_empty() {
-                println!("No outbound links from {}.", note_id);
+                println!("No outbound links from {note_id}.");
                 return Ok(());
             }
 
-            println!("Forward links from {}:", note_id);
+            println!("Forward links from {note_id}:");
             for edge in edges {
                 let label = format_edge_label(edge, LinkDirection::Forward);
                 println!("- {} ({})", label, describe_edge(edge));
@@ -218,7 +217,7 @@ fn render_forward_links(
         }
         GraphOutputFormat::Ids => {
             for identifier in forward_link_identifiers(edges) {
-                println!("{}", identifier);
+                println!("{identifier}");
             }
             Ok(())
         }
@@ -244,11 +243,11 @@ fn render_backlinks(
     match format {
         GraphOutputFormat::Human => {
             if edges.is_empty() {
-                println!("No backlinks found for {}.", note_id);
+                println!("No backlinks found for {note_id}.");
                 return Ok(());
             }
 
-            println!("Backlinks to {}:", note_id);
+            println!("Backlinks to {note_id}:");
             for edge in edges {
                 println!(
                     "- {} ({})",
@@ -260,7 +259,7 @@ fn render_backlinks(
         }
         GraphOutputFormat::Ids => {
             for identifier in backlink_identifiers(edges) {
-                println!("{}", identifier);
+                println!("{identifier}");
             }
             Ok(())
         }
@@ -286,13 +285,13 @@ fn render_orphans(note_ids: &[String], json_output: bool, format: GraphOutputFor
 
             println!("Orphan notes:");
             for note_id in note_ids {
-                println!("- {}", note_id);
+                println!("- {note_id}");
             }
             Ok(())
         }
         GraphOutputFormat::Ids => {
             for identifier in note_ids {
-                println!("{}", identifier);
+                println!("{identifier}");
             }
             Ok(())
         }
@@ -327,7 +326,7 @@ fn render_unresolved(
             }
 
             for (source, items) in grouped {
-                println!("- {}:", source);
+                println!("- {source}:");
                 for item in items {
                     println!("  - [[{}]]", item.raw);
                 }
@@ -336,7 +335,7 @@ fn render_unresolved(
         }
         GraphOutputFormat::Ids => {
             for identifier in unresolved_identifiers(edges) {
-                println!("{}", identifier);
+                println!("{identifier}");
             }
             Ok(())
         }
@@ -353,11 +352,11 @@ fn describe_edge(edge: &LinkEdge) -> String {
     }
 
     if let Some(display) = &edge.display_text {
-        parts.push(format!("display \"{}\"", display));
+        parts.push(format!("display \"{display}\""));
     }
 
     if let Some(heading) = &edge.heading {
-        parts.push(format!("heading #{}", heading));
+        parts.push(format!("heading #{heading}"));
     }
 
     if parts.is_empty() {

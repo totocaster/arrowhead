@@ -738,7 +738,7 @@ fn print_note_line(note: &arrowhead_core::ContextNoteItem) {
         .unwrap_or_default();
     let reason =
         render_reason_and_evidence(note.reason.as_deref(), note.evidence_kind, note.confidence);
-    println!("- Note: {}{}{}", label, path, reason);
+    println!("- Note: {label}{path}{reason}");
 }
 
 fn print_optional_timestamp(label: &str, value: Option<chrono::DateTime<chrono::Utc>>) {

@@ -513,7 +513,7 @@ fn vault_slug(vault_path: &Path) -> Result<String> {
     let short = &digest[..6];
     let mut hash = String::new();
     for byte in short {
-        write!(&mut hash, "{:02x}", byte).expect("format hash");
+        write!(&mut hash, "{byte:02x}").expect("format hash");
     }
 
     let name = vault_path

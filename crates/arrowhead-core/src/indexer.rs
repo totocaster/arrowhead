@@ -42,7 +42,7 @@ struct PreparedNote {
 
 #[derive(Debug)]
 enum WriteOperation {
-    Upsert(PreparedNote),
+    Upsert(Box<PreparedNote>),
     Remove { note_id: String },
 }
 
@@ -787,7 +787,7 @@ impl Indexer {
             embedding,
         };
 
-        match submit_write(write_tx, WriteOperation::Upsert(prepared))? {
+        match submit_write(write_tx, WriteOperation::Upsert(Box::new(prepared)))? {
             WriteAck::Upsert => {
                 info!(
                     note_id = %entry.id,
@@ -1037,7 +1037,7 @@ async fn run_writer(
                         resolved_links,
                         indexed_at,
                         embedding,
-                    } = prepared;
+                    } = *prepared;
                     db.upsert_note(&note, &extraction, &resolved_links, indexed_at)?;
                     Ok(WriterResult::Upsert { embedding })
                 }
@@ -1141,7 +1141,7 @@ fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) ->
         let mut pairs: Vec<String> = extraction
             .metadata
             .iter()
-            .map(|(key, value)| format!("{}: {}", key, value))
+            .map(|(key, value)| format!("{key}: {value}"))
             .collect();
         pairs.sort();
         sections.push(format!("Metadata:\n{}", pairs.join("\n")));

@@ -76,13 +76,11 @@ async fn reindex_updates_status_with_poll_watcher() -> Result<()> {
     if let Ok(log_contents) = fs::read_to_string(&log_path) {
         assert!(
             log_contents.contains("watcher resolved note ids for reindex"),
-            "daemon log should record watcher target resolution\n{}",
-            log_contents
+            "daemon log should record watcher target resolution\n{log_contents}"
         );
         assert!(
             log_contents.contains("reindexed note from targeted paths"),
-            "daemon log should record note-level reindexing\n{}",
-            log_contents
+            "daemon log should record note-level reindexing\n{log_contents}"
         );
     }
 
@@ -362,7 +360,7 @@ async fn wait_for_note_state(
             return Ok(state);
         }
         if Instant::now() >= deadline {
-            bail!("note state for {} not available", note_id);
+            bail!("note state for {note_id} not available");
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -382,7 +380,7 @@ async fn wait_for_updated_note_state(
             }
         }
         if Instant::now() >= deadline {
-            bail!("note {} was not reindexed before timeout", note_id);
+            bail!("note {note_id} was not reindexed before timeout");
         }
         sleep(Duration::from_millis(100)).await;
     }

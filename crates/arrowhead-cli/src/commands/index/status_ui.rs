@@ -340,7 +340,7 @@ impl StatusApp {
                         .unwrap_or_else(|| "?".to_string())
                 );
                 if let Some(message) = &download.message {
-                    text.push_str(&format!(" – {}", message));
+                    text.push_str(&format!(" – {message}"));
                 }
                 items.push(ListItem::new(text));
             }

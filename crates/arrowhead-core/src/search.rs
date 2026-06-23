@@ -332,7 +332,7 @@ impl SearchService {
                 bm25: f32::MAX,
                 relative_path,
                 preview,
-                reason: Some(format!("Semantic similarity {:.2}", similarity)),
+                reason: Some(format!("Semantic similarity {similarity:.2}")),
                 metadata,
                 title,
             });
@@ -471,7 +471,7 @@ impl SearchService {
                 bm25: f32::MAX,
                 relative_path,
                 preview,
-                reason: Some(format!("Semantic similarity {:.2}", similarity)),
+                reason: Some(format!("Semantic similarity {similarity:.2}")),
                 metadata,
                 title,
             });
@@ -634,11 +634,10 @@ impl SearchService {
                     fts.score = combined_score;
                     fts.reason = if semantic > 0.0 {
                         Some(format!(
-                            "Hybrid match (FTS {:.2}, semantic {:.2})",
-                            base_fts_score, semantic
+                            "Hybrid match (FTS {base_fts_score:.2}, semantic {semantic:.2})"
                         ))
                     } else {
-                        Some(format!("Full-text match (score {:.2})", base_fts_score))
+                        Some(format!("Full-text match (score {base_fts_score:.2})"))
                     };
                     results.push(fts);
                 }
@@ -655,7 +654,7 @@ impl SearchService {
                             bm25: f32::MAX,
                             relative_path,
                             preview,
-                            reason: Some(format!("Semantic similarity {:.2}", semantic)),
+                            reason: Some(format!("Semantic similarity {semantic:.2}")),
                             metadata,
                             title,
                         });

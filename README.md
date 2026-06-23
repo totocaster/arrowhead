@@ -161,7 +161,7 @@ arrowhead/
 
 ## Technology Stack
 
-- **Language**: Rust 1.86 (2024 edition) with `anyhow`/`thiserror` for rich errors.
+- **Language**: Rust 1.88 (2024 edition) with `anyhow`/`thiserror` for rich errors.
 - **CLI**: `clap` 4.5+, `tracing` for structured diagnostics.
 - **Daemon runtime**: `tokio` 1.40+ with `notify`-backed filesystem watching.
 - **Database**: SQLite (`rusqlite`) with FTS5 and JSON metadata columns.

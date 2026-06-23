@@ -579,7 +579,7 @@ fn clean_note_id(raw: &str) -> Result<String> {
 fn load_content(inline: Option<&String>, file: Option<&String>) -> Result<String> {
     if let Some(path) = file {
         return fs::read_to_string(path)
-            .with_context(|| format!("failed to read content file {}", path));
+            .with_context(|| format!("failed to read content file {path}"));
     }
 
     Ok(inline.cloned().unwrap_or_default())

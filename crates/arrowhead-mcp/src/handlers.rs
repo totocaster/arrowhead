@@ -550,7 +550,7 @@ impl HandlerRegistry {
                 .load_note(&note_id)
                 .map_err(|err| map_note_load_error(err, &note_id))?;
             let raw_path = vault.note_file_path(&note_id).map_err(|err| {
-                ProtocolError::internal(format!("failed to resolve note path {}: {err}", note_id))
+                ProtocolError::internal(format!("failed to resolve note path {note_id}: {err}"))
             })?;
             let raw_content = std::fs::read_to_string(&raw_path).map_err(|err| {
                 ProtocolError::internal(format!(

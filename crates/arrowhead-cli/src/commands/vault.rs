@@ -56,7 +56,7 @@ fn handle_status(ctx: &CommandContext) -> Result<()> {
     print_cache_entry("daemon log", &paths.log_path);
 
     if let Some(db_size) = file_size(paths.arrowhead_dir.join("index.db")) {
-        println!("Index size: {} bytes", db_size);
+        println!("Index size: {db_size} bytes");
     }
 
     if let Some(auto) = ctx.config.daemon.auto_start_enabled {
