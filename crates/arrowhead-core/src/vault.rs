@@ -397,8 +397,14 @@ impl Vault {
 
     /// Resolve a note identifier to a relative path inside the vault (without extension).
     pub fn relative_path_from_id(&self, note_id: &str) -> Result<PathBuf> {
-        normalise_relative_path(Path::new(note_id))
-            .ok_or_else(|| anyhow!("invalid note id: {note_id}"))
+        let relative = normalise_relative_path(Path::new(note_id))
+            .ok_or_else(|| anyhow!("invalid note id: {note_id}"))?;
+
+        if self.is_reserved_note_path(&relative) {
+            bail!("invalid note id: {note_id} points to an internal or ignored vault path");
+        }
+
+        Ok(relative)
     }
 
     /// Resolve a note identifier to an absolute path including the `.md` extension.
@@ -583,6 +589,30 @@ impl Vault {
         }
 
         Some(relative)
+    }
+
+    fn is_reserved_note_path(&self, relative: &Path) -> bool {
+        if let Ok(arrowhead_relative) = self.paths.arrowhead_dir.strip_prefix(&self.paths.root) {
+            if relative.starts_with(arrowhead_relative) {
+                return true;
+            }
+        }
+
+        if let Ok(obsidian_relative) = self.paths.obsidian_dir.strip_prefix(&self.paths.root) {
+            if relative.starts_with(obsidian_relative) {
+                return true;
+            }
+        }
+
+        if let Some(attachments_dir) = &self.paths.attachments_dir {
+            if let Ok(attachments_relative) = attachments_dir.strip_prefix(&self.paths.root) {
+                if relative.starts_with(attachments_relative) {
+                    return true;
+                }
+            }
+        }
+
+        is_ignored(relative, self.settings.ignored_folders())
     }
 
     /// Load a note by its identifier.
@@ -1020,6 +1050,46 @@ mod tests {
         assert_eq!(
             append_md_extension(PathBuf::from("Upper.MD")),
             PathBuf::from("Upper.MD")
+        );
+    }
+
+    #[test]
+    fn note_id_resolution_rejects_internal_and_ignored_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".obsidian")).expect("obsidian dir");
+        fs::write(
+            dir.path().join(".obsidian/app.json"),
+            r#"{
+  "attachmentFolderPath": "Attachments",
+  "userIgnoreFilters": ["Private/"]
+}"#,
+        )
+        .expect("write app config");
+
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+
+        assert!(
+            vault.relative_path_from_id(".arrowhead/debug").is_err(),
+            "note mutations must not target Arrowhead internals"
+        );
+        assert!(
+            vault.relative_path_from_id(".obsidian/app").is_err(),
+            "note mutations must not target Obsidian internals"
+        );
+        assert!(
+            vault.relative_path_from_id("Attachments/image").is_err(),
+            "note mutations must not target attachment directories"
+        );
+        assert!(
+            vault.relative_path_from_id("Private/draft").is_err(),
+            "note mutations must not target ignored folders"
+        );
+        assert_eq!(
+            vault
+                .relative_path_from_id("Projects/Launch Plan")
+                .expect("normal note id resolves"),
+            PathBuf::from("Projects/Launch Plan")
         );
     }
 
