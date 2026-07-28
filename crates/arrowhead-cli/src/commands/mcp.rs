@@ -306,12 +306,15 @@ fn read_lines_trimmed(path: &Path) -> Result<Vec<String>> {
     let file = fs::File::open(path)
         .with_context(|| format!("failed to read token file {}", path.display()))?;
     let reader = io::BufReader::new(file);
-    Ok(reader
-        .lines()
-        .map_while(|line| line.ok())
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect())
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read line from {}", path.display()))?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            lines.push(trimmed.to_string());
+        }
+    }
+    Ok(lines)
 }
 
 fn generate_and_store_token(ctx: &mut CommandContext, cli: &McpServerCliArgs) -> Result<()> {
@@ -366,4 +369,33 @@ fn build_runtime_options(ctx: &CommandContext, vault_path: PathBuf) -> RuntimeOp
         .with_embedding_model(ctx.config.embedding_model.clone())
         .with_daemon_socket(ctx.config.daemon.socket_path.clone())
         .with_daemon_status(ctx.config.daemon.status_path.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_lines_trimmed;
+
+    #[test]
+    fn read_lines_trimmed_filters_comments_and_blank_lines() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("tokens.txt");
+        std::fs::write(&path, "  alpha  \n\n# comment\nbravo\n").expect("write tokens");
+
+        let lines = read_lines_trimmed(&path).expect("read token lines");
+
+        assert_eq!(lines, vec!["alpha", "bravo"]);
+    }
+
+    #[test]
+    fn read_lines_trimmed_reports_open_errors() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let missing = temp_dir.path().join("missing.txt");
+
+        let err = read_lines_trimmed(&missing).expect_err("missing file should fail");
+
+        assert!(
+            err.to_string().contains("failed to read token file"),
+            "{err}"
+        );
+    }
 }
