@@ -134,13 +134,9 @@ pub async fn run_server(ctx: &mut CommandContext, cli: &McpServerCliArgs) -> Res
         setup.auth_mode
     );
     if setup.auth_mode.accepts_link_tokens() {
-        if let Some(token) = setup.display_tokens.first() {
-            println!("Link token URL: {base_url}/rpc/{token}");
-        } else {
-            println!(
-                "link-token mode active; generate a token with `arrowhead --mcp-server --generate-token` to obtain a shareable URL"
-            );
-        }
+        println!(
+            "link-token mode active; raw tokens are not printed at startup. Run `arrowhead --mcp-server --generate-token --auth-mode link-token` to generate and display a shareable URL once."
+        );
     }
     println!(
         "Reminder: run mcp.discovery.get_vault_conventions before creating, updating, or deleting notes."
@@ -163,14 +159,13 @@ struct ServerSetup {
     http_config: HttpServerConfig,
     bind: SocketAddr,
     auth_mode: AuthMode,
-    display_tokens: Vec<String>,
 }
 
 fn prepare_http_server(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<ServerSetup> {
     let bind = resolve_bind_address(ctx, cli)?;
     let auth_mode = resolve_auth_mode(ctx, cli)?;
     let allow_list = build_allow_list(ctx, cli)?;
-    let (token_store, display_tokens) = collect_tokens(ctx, cli)?;
+    let token_store = collect_tokens(ctx, cli)?;
 
     let mut http_config = HttpServerConfig {
         bind_address: bind,
@@ -189,7 +184,6 @@ fn prepare_http_server(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<S
         http_config,
         bind,
         auth_mode,
-        display_tokens,
     })
 }
 
@@ -244,9 +238,8 @@ fn build_allow_list(ctx: &CommandContext, cli: &McpServerCliArgs) -> Result<IpAl
 fn collect_tokens(
     ctx: &CommandContext,
     cli: &McpServerCliArgs,
-) -> Result<(arrowhead_mcp::auth::TokenStore, Vec<String>)> {
+) -> Result<arrowhead_mcp::auth::TokenStore> {
     let mut sources = TokenSources::new();
-    let mut display = Vec::new();
 
     for digest in &ctx.config.mcp.tokens {
         sources.add_hashed_token(*digest);
@@ -269,7 +262,6 @@ fn collect_tokens(
             continue;
         }
         sources.add_raw_token(trimmed.to_owned());
-        display.push(trimmed.to_owned());
     }
 
     for path in &cli.token_file {
@@ -277,8 +269,7 @@ fn collect_tokens(
             if token.is_empty() {
                 continue;
             }
-            sources.add_raw_token(token.clone());
-            display.push(token);
+            sources.add_raw_token(token);
         }
     }
 
@@ -289,12 +280,11 @@ fn collect_tokens(
                 continue;
             }
             sources.add_raw_token(trimmed.to_owned());
-            display.push(trimmed.to_owned());
         }
     }
 
     match sources.load() {
-        Ok(store) => Ok((store, display)),
+        Ok(store) => Ok(store),
         Err(TokenError::EmptyStore) => bail!(
             "no authentication tokens configured. Provide --token, --token-hash, or stored hashes in the config, or run with --generate-token"
         ),

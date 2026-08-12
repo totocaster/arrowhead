@@ -24,6 +24,7 @@ use tracing::{debug, info};
 
 use crate::{
     MetadataMap, NoteRecord,
+    embeddings::EMBEDDING_TABLE_NAME,
     graph::{LinkResolutionRecord, normalise_link_lookup},
     metadata::MetadataExtraction,
     metrics::{
@@ -657,12 +658,29 @@ impl IndexDatabase {
         Ok(maps)
     }
 
-    /// Remove a note (and associated metadata) from the index.
+    /// Remove a note and all associated text, metadata, link, and vector rows.
     pub fn remove_note(&self, note_id: &str) -> Result<bool> {
         let mut conn = self.connection_for_thread()?;
         let tx = conn
             .transaction()
             .context("failed to start removal transaction")?;
+
+        let embeddings_present = tx
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [EMBEDDING_TABLE_NAME],
+                |_| Ok(()),
+            )
+            .optional()
+            .context("failed to inspect embedding table during note removal")?
+            .is_some();
+        if embeddings_present {
+            tx.execute(
+                &format!("DELETE FROM {EMBEDDING_TABLE_NAME} WHERE note_id = ?1"),
+                [note_id],
+            )
+            .context("failed to remove note from vector index")?;
+        }
 
         tx.execute("DELETE FROM notes_fts WHERE id = ?1", [note_id])
             .context("failed to remove note from FTS index")?;

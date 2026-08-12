@@ -309,7 +309,7 @@ Semantic and hybrid tools require embeddings; discovery fallbacks lean on graph 
 ### Transport modes
 
 - **stdio (`arrowhead --mcp`)**: newline-delimited JSON-RPC 2.0 over stdin/stdout with a bounded request queue (64 pending by default). When the queue or worker pool is saturated the server returns a `RateLimited` error and logs summary metrics on shutdown.
-- **HTTP (`arrowhead --mcp-server`)**: JSON-RPC 2.0 on `POST /rpc` with identical handler logic, request limits, and error mapping; malformed JSON produces `400`, authentication failures produce `401`/`403`, and backpressure surfaces as HTTP 429. `GET /health` offers a readiness probe.
+- **HTTP (`arrowhead --mcp-server`)**: JSON-RPC 2.0 on `POST /rpc` with identical handler logic, request limits, and error mapping; malformed JSON produces `400`, authentication failures produce `401`/`403`, and backpressure surfaces as HTTP 429. `GET /health` offers an unauthenticated readiness probe that still enforces the configured CIDR allowlist.
 
 Both transports share the handlers defined in `crates/arrowhead-mcp`, so behaviour is consistent regardless of client wiring.
 
@@ -319,6 +319,7 @@ Both transports share the handlers defined in `crates/arrowhead-mcp`, so behavio
 - Bearer mode (default) expects `Authorization: Bearer <token>` headers; link-token mode accepts `/rpc/<token>` paths while still honouring bearer headers. Prefer HTTPS when using link-token to keep credentials out of plaintext URLs.
 - `--generate-token` prints a one-time secret and stores only the digest; record the raw value immediately.
 - The HTTP transport allows only localhost traffic by default (`127.0.0.0/8`, `::1/128`). Extend access with `--allow`, `--allow-file`, or corresponding config entries so that non-local clients are admitted intentionally.
+- `/health` does not require a bearer or link token, but it uses the same CIDR allowlist as `/rpc`. External monitors must add their source CIDR explicitly or reach the loopback-only endpoint through a local reverse proxy.
 
 ### Example request
 
@@ -356,13 +357,11 @@ Keep the Arrowhead allowlist scoped to loopback so all external traffic is funne
 
 ## Roadmap
 
-Active roadmap items are tracked on GitHub and currently include:
+Active roadmap work is tracked on GitHub. Current maintenance priorities include:
 
-- Adding MCP transport metrics with TLS/reverse-proxy guidance.
-- Expanding graph diagnostics for large vaults.
-- Hardening semantic and hybrid search scoring.
-- Improving embedding model management UX.
-- Tracking sqlite-vec dependency health and minimum supported Rust version updates.
+- Vault and HTTP security hardening ([#24](https://github.com/totocaster/arrowhead/issues/24), [#26](https://github.com/totocaster/arrowhead/issues/26), [#27](https://github.com/totocaster/arrowhead/issues/27)).
+- Daemon, watcher, and embedding-index consistency ([#25](https://github.com/totocaster/arrowhead/issues/25), [#29](https://github.com/totocaster/arrowhead/issues/29), [#30](https://github.com/totocaster/arrowhead/issues/30)).
+- Dependency, CI, and Rust-version health ([#20](https://github.com/totocaster/arrowhead/issues/20), [#21](https://github.com/totocaster/arrowhead/issues/21), [#22](https://github.com/totocaster/arrowhead/issues/22), [#28](https://github.com/totocaster/arrowhead/issues/28), [#31](https://github.com/totocaster/arrowhead/issues/31)).
 
 ## Release Process
 

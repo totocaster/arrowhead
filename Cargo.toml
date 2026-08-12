@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.5"
+version = "0.11.6"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Arrowhead Contributors"]
@@ -48,7 +48,7 @@ r2d2_sqlite = "0.31.0"
 # Pin fastembed to 5.2.0 because newer releases pull image/zune-jpeg combos that fail on stable CI.
 fastembed = "=5.2.0"
 ndarray = "0.16.1"
-sqlite-vec = "0.1.6"
+sqlite-vec = "0.1.9"
 zerocopy = "0.7"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 

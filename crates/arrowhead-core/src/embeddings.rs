@@ -381,7 +381,7 @@ fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
     Ok(vector)
 }
 
-const EMBEDDING_TABLE_NAME: &str = "note_embeddings";
+pub(crate) const EMBEDDING_TABLE_NAME: &str = "note_embeddings";
 const EMBEDDING_METADATA_SINGLETON: i64 = 1;
 
 /// Embedding payload captured during indexing for a single note.
@@ -983,6 +983,31 @@ mod tests {
         let missing = store.vector_for_note("missing").await?;
         assert!(missing.is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn database_note_removal_cleans_up_orphaned_embedding() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let database = Arc::new(IndexDatabase::open(dir.path().join("index.db"))?);
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        let note_id = "orphaned-note";
+
+        store
+            .upsert_embeddings(&[EmbeddingRecord {
+                note_id: note_id.to_string(),
+                vector: unit_vector(descriptor.dimension(), 0.5),
+                indexed_at: Utc::now(),
+            }])
+            .await?;
+        assert!(store.has_embedding_for_note(note_id).await?);
+
+        assert!(
+            !database.remove_note(note_id)?,
+            "the regression fixture intentionally has no text-index row"
+        );
+        assert!(!store.has_embedding_for_note(note_id).await?);
         Ok(())
     }
 

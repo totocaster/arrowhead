@@ -136,7 +136,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "arrowhead-cli"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "anyhow",
  "arrowhead-core",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "arrowhead-core"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "arrowhead-daemon"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "anyhow",
  "arrowhead-core",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "arrowhead-mcp"
-version = "0.11.5"
+version = "0.11.6"
 dependencies = [
  "anyhow",
  "arrowhead-core",
@@ -227,7 +227,6 @@ dependencies = [
  "chrono",
  "hex",
  "ipnet",
- "once_cell",
  "regex",
  "reqwest",
  "serde",
@@ -3249,9 +3248,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-vec"
-version = "0.1.6"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ec77b84fb8dd5f0f8def127226db83b5d1152c5bf367f09af03998b76ba554a"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
 dependencies = [
  "cc",
 ]

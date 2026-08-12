@@ -6,6 +6,7 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -179,7 +180,7 @@ where
             );
 
         Router::new()
-            .route("/health", get(handle_health))
+            .route("/health", get(handle_health::<H>))
             .route("/rpc", post(handle_rpc::<H>))
             .route("/rpc/{token}", post(handle_rpc_with_token::<H>))
             .with_state(state)
@@ -196,6 +197,7 @@ where
     concurrency: Arc<Semaphore>,
     authenticator: Authenticator,
     ip_allowlist: IpAllowList,
+    started_at: Instant,
 }
 
 impl<H> Clone for HttpServerState<H>
@@ -208,6 +210,7 @@ where
             concurrency: Arc::clone(&self.concurrency),
             authenticator: self.authenticator.clone(),
             ip_allowlist: self.ip_allowlist.clone(),
+            started_at: self.started_at,
         }
     }
 }
@@ -228,6 +231,7 @@ where
             concurrency,
             authenticator,
             ip_allowlist,
+            started_at: Instant::now(),
         }
     }
 
@@ -254,21 +258,46 @@ where
     fn mode(&self) -> AuthMode {
         self.authenticator.mode()
     }
+
+    fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
 }
 
-async fn handle_health() -> impl IntoResponse {
+async fn handle_health<H>(
+    State(state): State<HttpServerState<H>>,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+) -> HttpResponse
+where
+    H: MessageHandler,
+{
     #[derive(Serialize)]
     struct HealthResponse<'a> {
         status: &'a str,
         uptime: u64,
     }
 
+    #[derive(Serialize)]
+    struct HealthErrorResponse<'a> {
+        status: &'a str,
+    }
+
+    if !state.allows_ip(client_addr.ip()) {
+        warn!(remote = %client_addr, "rejecting health check from disallowed IP address");
+        return HttpResponse::json(
+            StatusCode::FORBIDDEN,
+            HealthErrorResponse {
+                status: "forbidden",
+            },
+        );
+    }
+
     let body = HealthResponse {
         status: "ok",
-        uptime: current_unix_timestamp(),
+        uptime: state.uptime_secs(),
     };
 
-    (StatusCode::OK, axum::Json(body))
+    HttpResponse::json(StatusCode::OK, body)
 }
 
 async fn handle_rpc<H>(
@@ -582,13 +611,6 @@ impl IntoResponse for HttpResponse {
     }
 }
 
-fn current_unix_timestamp() -> u64 {
-    // Placeholder for a more meaningful uptime/health metric. Tracks seconds since process start.
-    static START: once_cell::sync::Lazy<std::time::Instant> =
-        once_cell::sync::Lazy::new(std::time::Instant::now);
-    START.elapsed().as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +690,76 @@ mod tests {
         assert_eq!(redact_request_path("/rpc"), "/rpc");
         assert_eq!(redact_request_path("/rpc/"), "/rpc/");
         assert_eq!(redact_request_path("/health"), "/health");
+    }
+
+    #[tokio::test]
+    async fn health_allows_permitted_ip_without_authentication() {
+        let handler = Arc::new(EchoHandler);
+        let auth = build_auth_config(AuthMode::Bearer);
+        let server = build_server(handler, auth, IpAllowList::default());
+        let app = router_with_client(server, SocketAddr::from(([127, 0, 0, 1], 3999)));
+
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert!(value["uptime"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn health_allows_explicitly_allowlisted_non_loopback_ip_without_authentication() {
+        let handler = Arc::new(EchoHandler);
+        let auth = build_auth_config(AuthMode::Bearer);
+        let ip_allowlist = IpAllowList::from_strings(["10.20.0.0/16"]).unwrap();
+        let server = build_server(handler, auth, ip_allowlist);
+        let app = router_with_client(server, SocketAddr::from(([10, 20, 30, 40], 3999)));
+
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert!(value["uptime"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn health_rejects_disallowed_ip() {
+        let handler = Arc::new(EchoHandler);
+        let auth = build_auth_config(AuthMode::Bearer);
+        let ip_allowlist = IpAllowList::from_strings(["::1/128"]).unwrap();
+        let server = build_server(handler, auth, ip_allowlist);
+        let app = router_with_client(server, SocketAddr::from(([10, 0, 0, 5], 3999)));
+
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value, json!({"status": "forbidden"}));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 use std::sync::Mutex as StdMutex;
 use std::{
     collections::HashSet,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -181,10 +182,7 @@ impl DaemonHandle {
 
     /// Wait for the runtime task to finish.
     pub async fn join(self) -> Result<()> {
-        match self.task.await {
-            Ok(result) => result,
-            Err(err) => Err(anyhow!("daemon task aborted: {err}")),
-        }
+        daemon_task_result(self.task.await)
     }
 
     /// Request a graceful shutdown and wait for completion.
@@ -211,6 +209,15 @@ impl DaemonHandle {
         }
 
         self.join().await
+    }
+}
+
+fn daemon_task_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(err) => Err(anyhow!("daemon task aborted: {err}")),
     }
 }
 
@@ -435,8 +442,10 @@ impl DaemonRuntime {
                 });
             })
             .await?;
+        let indexed_notes =
+            initial_indexed_note_count(self.config.database.note_count(), stats.total_notes);
         self.persist_status(|status| {
-            status.indexed_notes = stats.total_notes;
+            status.indexed_notes = indexed_notes;
             update_index_error_issue(status, stats.errors);
             status.activity = ActivityStatus::idle();
         })
@@ -1070,6 +1079,20 @@ const WATCHER_ERROR_CODE: &str = "watcher_errors";
 const EMBEDDING_DOWNLOAD_ISSUE_CODE: &str = "embedding_download";
 const EMBEDDING_INIT_ISSUE_CODE: &str = "embedding_pipeline";
 
+fn initial_indexed_note_count(note_count: Result<u64>, fallback: u64) -> u64 {
+    match note_count {
+        Ok(count) => count,
+        Err(err) => {
+            warn!(
+                error = ?err,
+                fallback,
+                "failed to count indexed notes after initial indexing; using scan total"
+            );
+            fallback
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "arrowheadd", version)]
 struct DaemonCliArgs {
@@ -1175,28 +1198,60 @@ fn resolve_daemon_cli() -> Result<ResolvedDaemonCli> {
     resolve_daemon_cli_args(cli, env_vault, env_embedding_model.as_deref())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliWaitOutcome {
+    RuntimeFinished,
+    ShutdownSignalReceived,
+}
+
+async fn wait_for_runtime_or_shutdown_signal<F>(
+    runtime_task: &mut JoinHandle<Result<()>>,
+    shutdown_signal: F,
+) -> Result<CliWaitOutcome>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    tokio::pin!(shutdown_signal);
+    tokio::select! {
+        signal = &mut shutdown_signal => {
+            signal.context("failed to listen for ctrl-c")?;
+            Ok(CliWaitOutcome::ShutdownSignalReceived)
+        }
+        result = runtime_task => {
+            daemon_task_result(result)?;
+            Ok(CliWaitOutcome::RuntimeFinished)
+        }
+    }
+}
+
 /// Default CLI entrypoint used by the binary.
 pub async fn cli_main() -> Result<()> {
     let cli = resolve_daemon_cli()?;
 
-    let handle = DaemonRuntimeBuilder::new(cli.vault_root)
+    let mut handle = DaemonRuntimeBuilder::new(cli.vault_root)
         .embedding_model(cli.embedding_model)
         .spawn()
         .await?;
     info!("arrowhead daemon started; waiting for shutdown signal");
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("failed to listen for ctrl-c")?;
-
-    info!("shutdown signal received; stopping daemon");
-    handle.shutdown().await
+    match wait_for_runtime_or_shutdown_signal(&mut handle.task, tokio::signal::ctrl_c()).await? {
+        CliWaitOutcome::RuntimeFinished => {
+            info!("arrowhead daemon runtime stopped");
+            Ok(())
+        }
+        CliWaitOutcome::ShutdownSignalReceived => {
+            info!("shutdown signal received; stopping daemon");
+            handle.shutdown().await
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+    use tempfile::tempdir;
+    use tokio::time::{sleep, timeout};
 
     #[test]
     fn resolve_daemon_cli_prefers_flags_over_env() {
@@ -1259,5 +1314,71 @@ mod tests {
                 format!("arrowheadd {}\n", env!("CARGO_PKG_VERSION"))
             );
         }
+    }
+
+    #[test]
+    fn initial_index_count_falls_back_when_database_count_fails() {
+        assert_eq!(initial_indexed_note_count(Ok(7), 11), 7);
+        assert_eq!(
+            initial_indexed_note_count(Err(anyhow!("database unavailable")), 11),
+            11
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cli_wait_finishes_after_control_shutdown() -> Result<()> {
+        let vault = tempdir().context("failed to create temporary vault")?;
+        std::fs::write(vault.path().join("Note.md"), "# Note\n")?;
+
+        let mut handle = DaemonRuntimeBuilder::new(vault.path())
+            .disable_embeddings()
+            .watcher_strategy(WatcherStrategy::Poll {
+                interval: Duration::from_millis(50),
+            })
+            .spawn()
+            .await?;
+        let socket_path = handle.socket_path().to_path_buf();
+
+        let shutdown_request = tokio::spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match send_control_request(&socket_path, ControlRequest::Shutdown).await {
+                        Ok(response) => return Ok::<_, anyhow::Error>(response),
+                        Err(err) if Instant::now() < deadline => {
+                            sleep(Duration::from_millis(25)).await;
+                            debug!(error = ?err, "control socket not ready yet");
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(15),
+            wait_for_runtime_or_shutdown_signal(
+                &mut handle.task,
+                std::future::pending::<std::io::Result<()>>(),
+            ),
+        )
+        .await
+        .context("CLI wait did not finish after control shutdown")??;
+
+        assert_eq!(outcome, CliWaitOutcome::RuntimeFinished);
+        assert_eq!(
+            shutdown_request
+                .await
+                .context("shutdown request task aborted")??,
+            ControlResponse::ShutdownAck
+        );
+        assert!(
+            !socket_path.exists(),
+            "control socket should be removed after shutdown"
+        );
+
+        Ok(())
     }
 }

@@ -509,16 +509,6 @@ impl Indexer {
         let existed = self.database.remove_note(note_id)?;
 
         if existed {
-            if let Some(pipeline) = &self.embeddings {
-                pipeline
-                    .store()
-                    .delete_embeddings(&[note_id.to_string()])
-                    .await
-                    .with_context(|| format!("failed to delete embeddings for note {note_id}"))?;
-            }
-        }
-
-        if existed {
             info!(note_id = note_id, "removed note from index");
         } else {
             debug!(
