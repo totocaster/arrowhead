@@ -84,33 +84,57 @@ fn verbosity_to_level(verbosity: u8) -> Level {
 }
 
 fn prune_old_logs(log_root: &Path, primary: &str) -> Result<()> {
-    let now = SystemTime::now();
-
-    for entry in fs::read_dir(log_root)
-        .with_context(|| format!("failed to read log directory {}", log_root.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+    let path = log_root.join(primary);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect log {}", path.display()));
         }
-
-        let metadata = entry.metadata()?;
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let age = now.duration_since(modified).unwrap_or_default();
-
-        let is_primary = path
-            .file_name()
-            .map(|name| name == primary)
-            .unwrap_or(false);
-
-        let too_old = age > MAX_LOG_AGE;
-        let too_large = is_primary && metadata.len() > MAX_LOG_SIZE_BYTES;
-
-        if !is_primary || too_old || too_large {
-            let _ = fs::remove_file(&path);
-        }
+    };
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    if age > MAX_LOG_AGE || metadata.len() > MAX_LOG_SIZE_BYTES {
+        let _ = fs::remove_file(&path);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_a_cli_logger_preserves_other_logs_and_expires_its_own() {
+        let dir = tempfile::tempdir().expect("log folder");
+        let old = SystemTime::now() - MAX_LOG_AGE - Duration::from_secs(60);
+        for name in ["cli.log", "daemon.log", "mcp.log", "unrelated.txt"] {
+            let path = dir.path().join(name);
+            fs::write(&path, "previous log\n").expect("write log");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open log")
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .expect("age log");
+        }
+
+        let logger = scoped_file_logging(dir.path(), 0).expect("start logger");
+        tracing::info!("current command");
+        drop(logger);
+
+        for name in ["daemon.log", "mcp.log", "unrelated.txt"] {
+            assert_eq!(
+                fs::read_to_string(dir.path().join(name)).expect("other log preserved"),
+                "previous log\n"
+            );
+        }
+        let log = fs::read_to_string(dir.path().join("cli.log")).expect("CLI log");
+        assert!(log.contains("current command"));
+        assert!(!log.contains("previous log"));
+    }
 }
