@@ -260,6 +260,35 @@ Blocking policy for v1:
 - duplicate `origin_id` values should surface clearly but should not block CRUD
   on their own
 
+### One metrics writer at a time per vault
+
+Every metrics mutation, from the CLI or MCP, takes an exclusive `flock` on
+`.arrowhead/metrics.lock` before it looks up rows or checks ids. It holds the
+lock until the index refresh finishes. Arrowhead writers in one process or in
+separate processes therefore run one at a time. No writer overwrites another
+writer's change, and racing creates cannot store the same `id` twice. A CLI
+writer that has to wait logs `waiting for another Arrowhead writer to finish a
+metrics change` in `.arrowhead/logs/cli.log`.
+
+The wait has no timeout. A suspended or stalled writer blocks later mutations
+until it releases the lock. A client timeout does not cancel a mutation already
+running in a blocking task, so that mutation can still complete later.
+
+The OS releases the lock when the holding process closes the file, exits, or
+crashes. The lock file stays on disk and holds no lock by itself. Each rewrite
+goes to a uniquely named temporary file that Arrowhead renames over the target,
+so a reader sees either the old file or the new file.
+
+Editors, sync tools, and scripts that write metrics files without Arrowhead do
+not take the lock. If one of them saves a metrics file while Arrowhead rewrites
+the same file, one of the two changes can be lost. Arrowhead implements the lock
+only on Unix. On other platforms, metrics mutations fail with an error instead
+of writing without the lock.
+
+The lock coordinates writers; it does not confine metrics paths to the vault.
+Metrics file operations still follow symlinks. The no-follow rules in the
+[note mutation contract](note_mutations.md) apply only to Markdown notes.
+
 ## CLI Feature Set
 
 ### Metrics command family

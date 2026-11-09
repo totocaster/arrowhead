@@ -1,8 +1,14 @@
 //! Safe metrics file mutation helpers.
+//!
+//! Every mutation holds the vault's metrics write lock (`.arrowhead/metrics.lock`) from row
+//! lookup and id checks through the file write and index refresh, so concurrent Arrowhead
+//! writers in one process or across processes never lose each other's changes. Editors and
+//! scripts that write metrics files without Arrowhead do not take this lock.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -180,40 +186,36 @@ impl MetricsMutationService {
 
     /// Create a new metrics record in the target NDJSON file and refresh the index.
     pub async fn create(&self, input: MetricCreateRequest) -> Result<MetricRecordEntry> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
-        task::spawn_blocking(move || create_record(vault.as_ref(), database.as_ref(), input))
-            .await
-            .context("metrics create task aborted")?
+        self.run_exclusive("create", move |vault, database| {
+            create_record(vault, database, input)
+        })
+        .await
     }
 
     /// Update an existing metrics record by stable id and refresh the index.
     pub async fn update(&self, input: MetricUpdateRequest) -> Result<MetricRecordEntry> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
-        task::spawn_blocking(move || update_record(vault.as_ref(), database.as_ref(), input))
-            .await
-            .context("metrics update task aborted")?
+        self.run_exclusive("update", move |vault, database| {
+            update_record(vault, database, input)
+        })
+        .await
     }
 
     /// Delete a metrics record by stable id and refresh the index.
     pub async fn delete(&self, metric_ref: &str) -> Result<DeletedMetricRecord> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
         let metric_ref = metric_ref.to_string();
-        task::spawn_blocking(move || delete_record(vault.as_ref(), database.as_ref(), &metric_ref))
-            .await
-            .context("metrics delete task aborted")?
+        self.run_exclusive("delete", move |vault, database| {
+            delete_record(vault, database, &metric_ref)
+        })
+        .await
     }
 
     /// Create an empty metrics file and refresh the index entry.
     pub async fn create_file(&self, path: &Path) -> Result<CreatedMetricFile> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
         let path = path.to_path_buf();
-        task::spawn_blocking(move || create_metrics_file(vault.as_ref(), database.as_ref(), &path))
-            .await
-            .context("metrics file create task aborted")?
+        self.run_exclusive("file create", move |vault, database| {
+            create_metrics_file(vault, database, &path)
+        })
+        .await
     }
 
     /// Rename a metrics file and refresh its indexed location.
@@ -222,25 +224,21 @@ impl MetricsMutationService {
         source: &Path,
         destination: &Path,
     ) -> Result<RenamedMetricFile> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
         let source = source.to_path_buf();
         let destination = destination.to_path_buf();
-        task::spawn_blocking(move || {
-            rename_metrics_file(vault.as_ref(), database.as_ref(), &source, &destination)
+        self.run_exclusive("file rename", move |vault, database| {
+            rename_metrics_file(vault, database, &source, &destination)
         })
         .await
-        .context("metrics file rename task aborted")?
     }
 
     /// Delete a metrics file and remove its indexed rows.
     pub async fn delete_file(&self, path: &Path) -> Result<DeletedMetricFile> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
         let path = path.to_path_buf();
-        task::spawn_blocking(move || delete_metrics_file(vault.as_ref(), database.as_ref(), &path))
-            .await
-            .context("metrics file delete task aborted")?
+        self.run_exclusive("file delete", move |vault, database| {
+            delete_metrics_file(vault, database, &path)
+        })
+        .await
     }
 
     /// Assign generated ids to legacy rows that are missing them.
@@ -248,14 +246,29 @@ impl MetricsMutationService {
         &self,
         path: Option<&Path>,
     ) -> Result<AssignedMetricIdsSummary> {
-        let vault = Arc::clone(&self.vault);
-        let database = Arc::clone(&self.database);
         let path = path.map(Path::to_path_buf);
-        task::spawn_blocking(move || {
-            assign_missing_metric_ids(vault.as_ref(), database.as_ref(), path.as_deref())
+        self.run_exclusive("assign-missing-ids", move |vault, database| {
+            assign_missing_metric_ids(vault, database, path.as_deref())
         })
         .await
-        .context("metrics assign-missing-ids task aborted")?
+    }
+
+    async fn run_exclusive<T, F>(&self, operation: &'static str, mutate: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Vault, &IndexDatabase) -> Result<T> + Send + 'static,
+    {
+        let vault = Arc::clone(&self.vault);
+        let database = Arc::clone(&self.database);
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let _lock = lock_metrics_writes(&vault)?;
+                mutate(&vault, &database)
+            })
+        })
+        .await
+        .with_context(|| format!("metrics {operation} task aborted"))?
     }
 }
 
@@ -720,21 +733,99 @@ fn write_string_atomic(path: &Path, content: &str) -> Result<()> {
     }
 
     let temp_name = format!(
-        ".{}.arrowhead.{}.tmp",
+        ".{}.arrowhead.{}.{:016x}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("metrics"),
-        std::process::id()
+        std::process::id(),
+        rand::random::<u64>()
     );
     let temp_path = path.with_file_name(temp_name);
-    fs::write(&temp_path, content).with_context(|| {
+    let mut temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .with_context(|| {
+            format!(
+                "failed to create temporary metrics file {}",
+                temp_path.display()
+            )
+        })?;
+    let written = temp_file.write_all(content.as_bytes());
+    drop(temp_file);
+    let replaced = written
+        .with_context(|| {
+            format!(
+                "failed to write temporary metrics file {}",
+                temp_path.display()
+            )
+        })
+        .and_then(|()| {
+            fs::rename(&temp_path, path)
+                .with_context(|| format!("failed to replace metrics file {}", path.display()))
+        });
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    replaced
+}
+
+/// Blocks until the caller holds the vault's exclusive metrics write lock. Dropping the
+/// returned file releases it.
+///
+/// `flock` locks belong to an open file description, so two service instances in one process
+/// exclude each other just as two processes do, and the OS releases the lock when its holder
+/// exits or crashes. The file stays on disk between writes. Deleting it would let one writer
+/// lock the old inode while another locks a newly created file.
+fn lock_metrics_writes(vault: &Vault) -> Result<fs::File> {
+    let arrowhead_dir = &vault.paths().arrowhead_dir;
+    fs::create_dir_all(arrowhead_dir).with_context(|| {
         format!(
-            "failed to write temporary metrics file {}",
-            temp_path.display()
+            "failed to create arrowhead directory {}",
+            arrowhead_dir.display()
         )
     })?;
-    fs::rename(&temp_path, path)
-        .with_context(|| format!("failed to replace metrics file {}", path.display()))
+    let path = arrowhead_dir.join("metrics.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open metrics write lock {}", path.display()))?;
+    lock_exclusive(&file, &path)
+        .with_context(|| format!("failed to acquire metrics write lock {}", path.display()))?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &fs::File, path: &Path) -> io::Result<()> {
+    use rustix::{
+        fs::{FlockOperation, flock},
+        io::Errno,
+    };
+
+    let mut operation = FlockOperation::NonBlockingLockExclusive;
+    loop {
+        match flock(file, operation) {
+            Err(Errno::WOULDBLOCK) => {
+                tracing::info!(
+                    lock = %path.display(),
+                    "waiting for another Arrowhead writer to finish a metrics change"
+                );
+                operation = FlockOperation::LockExclusive;
+            }
+            Err(Errno::INTR) => {}
+            result => return result.map_err(io::Error::from),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &fs::File, _path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "metrics writes need advisory file locking, which Arrowhead implements only on Unix",
+    ))
 }
 
 fn refresh_index_for_file(
@@ -951,15 +1042,180 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let vault_root = dir.path().join("vault");
         fs::create_dir_all(&vault_root).expect("create vault");
+        let (mutation, read) = open_service(&vault_root);
+        (dir, mutation, read)
+    }
 
-        let vault = Arc::new(Vault::new(VaultConfig::new(vault_root)).expect("vault"));
+    /// Opens an independent vault handle and index connection pool, as a separate
+    /// MCP runtime or CLI invocation would.
+    fn open_service(vault_root: &Path) -> (MetricsMutationService, MetricsService) {
+        let vault =
+            Arc::new(Vault::new(VaultConfig::new(vault_root.to_path_buf())).expect("vault"));
         vault.ensure_arrowhead_dirs().expect("arrowhead dirs");
         let database = Arc::new(
             IndexDatabase::open(vault.paths().arrowhead_dir.join("index.db")).expect("database"),
         );
-        let mutation = MetricsMutationService::new(Arc::clone(&vault), Arc::clone(&database));
-        let read = MetricsService::new(database);
-        (dir, mutation, read)
+        let mutation = MetricsMutationService::new(vault, Arc::clone(&database));
+        (mutation, MetricsService::new(database))
+    }
+
+    fn create_request(file: &str, id: &str, value: f64) -> MetricCreateRequest {
+        MetricCreateRequest {
+            file: Some(PathBuf::from(file)),
+            id: Some(id.to_string()),
+            ts: DateTime::parse_from_rfc3339("2026-04-14T08:30:00+04:00").expect("ts"),
+            key: "body.weight".to_string(),
+            value,
+            source: "withings".to_string(),
+            date: None,
+            unit: Some("kg".to_string()),
+            origin_id: None,
+            note: None,
+            context: None,
+            tags: Vec::new(),
+            extra_fields: BTreeMap::new(),
+        }
+    }
+
+    fn metric_values_on_disk(vault_root: &Path) -> BTreeMap<String, Vec<f64>> {
+        let vault = Vault::new(VaultConfig::new(vault_root.to_path_buf())).expect("vault");
+        let mut values = BTreeMap::<String, Vec<f64>>::new();
+        for file in vault.metrics_files().expect("metrics files") {
+            for row in parse_metrics_file(&file.absolute_path).expect("parse metrics file") {
+                let record = row.record.expect("structurally valid row");
+                values.entry(record.id).or_default().push(record.value);
+            }
+        }
+        values
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_writers_from_separate_services_keep_every_accepted_change() {
+        const FILE: &str = "Metrics/Shared.metrics.ndjson";
+        const PAIRS: usize = 8;
+        let (dir, seed_service, read) = build_service();
+        let vault_root = dir.path().join("vault");
+        for index in 0..PAIRS {
+            seed_service
+                .create(create_request(
+                    FILE,
+                    &format!("01SEED{index}"),
+                    index as f64,
+                ))
+                .await
+                .expect("seed record");
+        }
+
+        let services = (0..4)
+            .map(|_| open_service(&vault_root).0)
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(tokio::sync::Barrier::new(PAIRS * 2));
+        let mut tasks = Vec::new();
+        for index in 0..PAIRS {
+            let creator = services[index % services.len()].clone();
+            let updater = services[(index + 1) % services.len()].clone();
+            let create_barrier = Arc::clone(&barrier);
+            let update_barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                create_barrier.wait().await;
+                let id = format!("01NEW{index}");
+                let request = create_request(FILE, &id, 200.0 + index as f64);
+                creator
+                    .create(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("create {id}: {err:#}"))
+            }));
+            tasks.push(tokio::spawn(async move {
+                update_barrier.wait().await;
+                let id = format!("01SEED{index}");
+                let request = MetricUpdateRequest {
+                    metric_id: id.clone(),
+                    value: Some(100.0 + index as f64),
+                    ..MetricUpdateRequest::default()
+                };
+                updater
+                    .update(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("update {id}: {err:#}"))
+            }));
+        }
+        let mut failures = Vec::new();
+        for task in tasks {
+            if let Err(message) = task.await.expect("join writer") {
+                failures.push(message);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "rejected concurrent writes: {failures:#?}"
+        );
+
+        let expected = (0..PAIRS)
+            .flat_map(|index| {
+                [
+                    (format!("01SEED{index}"), vec![100.0 + index as f64]),
+                    (format!("01NEW{index}"), vec![200.0 + index as f64]),
+                ]
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(metric_values_on_disk(&vault_root), expected);
+
+        let files = read.list_files().await.expect("list files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].record_count, expected.len() as u64);
+        for (id, values) in &expected {
+            let indexed = read
+                .read_record(id)
+                .await
+                .expect("read indexed record")
+                .unwrap_or_else(|| panic!("index is missing {id}"));
+            assert_eq!(indexed.record.value, values[0], "index value for {id}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn racing_creates_with_the_same_id_accept_exactly_one() {
+        const RACERS: usize = 8;
+        const CONTESTED: &str = "01CONTESTED000000000000000";
+        let (dir, _service, _read) = build_service();
+        let vault_root = dir.path().join("vault");
+        let services = (0..4)
+            .map(|_| open_service(&vault_root).0)
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+        let tasks = (0..RACERS)
+            .map(|index| {
+                let service = services[index % services.len()].clone();
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    let file = format!("Metrics/Racer{index}.metrics.ndjson");
+                    service
+                        .create(create_request(&file, CONTESTED, index as f64))
+                        .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut accepted = 0;
+        let mut unexpected_errors = Vec::new();
+        for task in tasks {
+            match task.await.expect("join racer") {
+                Ok(_) => accepted += 1,
+                Err(err) if err.to_string().contains("already exists") => {}
+                Err(err) => unexpected_errors.push(format!("{err:#}")),
+            }
+        }
+        let stored_rows = metric_values_on_disk(&vault_root)
+            .get(CONTESTED)
+            .map_or(0, Vec::len);
+        assert_eq!(
+            (accepted, stored_rows, unexpected_errors),
+            (1, 1, Vec::<String>::new()),
+            "(accepted creates, stored rows, non-duplicate errors) for the contested id"
+        );
     }
 
     #[tokio::test]

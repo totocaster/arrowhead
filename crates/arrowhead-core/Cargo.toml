@@ -47,6 +47,10 @@ regex.workspace = true
 rand.workspace = true
 once_cell = "1.19"
 
+[target.'cfg(unix)'.dependencies]
+# No-follow note operations and metrics locks; std `File::lock` needs Rust 1.89.
+rustix = { version = "1.1.2", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3.8"
 tokio = { workspace = true, features = ["test-util", "macros"] }
