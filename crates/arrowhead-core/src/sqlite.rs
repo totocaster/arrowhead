@@ -2582,13 +2582,14 @@ mod tests {
     fn schema_mismatch_rebuild_handles_stale_wal_companions() {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("index.db");
-        drop(IndexDatabase::open(&db_path).expect("database opens"));
-
-        // Downgrade the stored schema version and plant leftover companions.
+        // A raw connection closes synchronously, before its sidecar files are
+        // truncated. A pool can still have connections closing on worker threads.
         {
             let conn = Connection::open(&db_path).expect("raw connection");
-            conn.pragma_update(None, "user_version", 1)
-                .expect("set version");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("enable WAL");
+            conn.execute_batch("CREATE TABLE legacy (id TEXT); PRAGMA user_version = 1;")
+                .expect("create old schema");
         }
         fs::write(dir.path().join("index.db-wal"), b"").expect("plant wal");
         fs::write(dir.path().join("index.db-shm"), b"").expect("plant shm");
