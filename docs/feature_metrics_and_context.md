@@ -285,9 +285,9 @@ the same file, one of the two changes can be lost. Arrowhead implements the lock
 only on Unix. On other platforms, metrics mutations fail with an error instead
 of writing without the lock.
 
-The lock coordinates writers; it does not confine metrics paths to the vault.
-Metrics file operations still follow symlinks. The no-follow rules in the
-[note mutation contract](note_mutations.md) apply only to Markdown notes.
+The lock coordinates writers but does not confine paths. Metrics changes never
+follow symlinks and need the exact spelling of existing folders and files, as
+[Vault write containment](vault_write_containment.md) describes.
 
 ## CLI Feature Set
 

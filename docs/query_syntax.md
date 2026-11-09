@@ -22,6 +22,7 @@ This document captures the planned extensions to Arrowhead search syntax so desi
 - Parentheses may be nested to override default precedence.
 - Operators are case-insensitive; the parser normalises them.
 - `NOT` must appear alongside at least one positive clause (e.g. `foo NOT bar` is treated as `foo AND NOT bar`). Placing `NOT` directly inside an `OR` expression is not supported.
+- Full-text and filter-only searches remove `NOT` matches before the result limit applies, so `--limit 1` returns the best-ranked note that no `NOT` clause matches. Semantic search, and the semantic half of hybrid search, still remove `NOT` matches after the nearest-neighbour lookup and can return fewer notes than the limit.
 
 | Example | Meaning |
 | --- | --- |

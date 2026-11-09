@@ -324,8 +324,7 @@ impl DaemonRuntime {
                     break;
                 }
                 Some(batch) = self.event_rx.recv() => {
-                    let mut paths: HashSet<PathBuf> =
-                        batch.into_iter().filter(|path| path.exists() || path.extension().is_some()).collect();
+                    let mut paths: HashSet<PathBuf> = batch.into_iter().collect();
                     while let Ok(next) = self.event_rx.try_recv() {
                         paths.extend(next);
                     }
@@ -483,36 +482,20 @@ impl DaemonRuntime {
     }
 
     async fn process_paths(&self, paths: Vec<PathBuf>, queued_jobs: usize) -> Result<()> {
-        let mut targets = HashSet::new();
-
-        for path in paths {
-            if let Some(entry) = self.config.vault.inventory_entry_for_path(&path)? {
-                targets.insert(entry.absolute_path.clone());
-                continue;
-            }
-
-            if let Some((_, relative)) = self.config.vault.normalise_note_path(&path) {
-                let absolute = self.config.vault.note_path(&relative);
-                targets.insert(absolute);
-                continue;
-            }
-
-            if let Some(relative) = self.config.vault.resolve_relative_metrics_path(&path) {
-                let absolute = self.config.vault.note_path(&relative);
-                targets.insert(absolute);
-            }
-        }
-
-        if targets.is_empty() {
+        let indexer = self
+            .indexer
+            .as_ref()
+            .expect("indexer should be initialised before reindexing");
+        // Event kinds are unreliable (FSEvents reports a folder rename as two
+        // bare folder paths), so every path is reconciled as a subtree.
+        let plan = indexer.plan_paths(&paths).await?;
+        // Arrowhead's own status and log writes raise events too; they plan
+        // nothing and must not write status or logs again.
+        if plan.is_empty() {
             return Ok(());
         }
 
-        let target_list: Vec<PathBuf> = targets.into_iter().collect();
-        let mut target_ids: Vec<String> = target_list
-            .iter()
-            .filter_map(|path| self.config.vault.note_id_from_path(path))
-            .collect();
-        target_ids.sort();
+        let target_ids = plan.note_ids();
         let active_note = target_ids.first().cloned();
 
         if !target_ids.is_empty() {
@@ -530,23 +513,20 @@ impl DaemonRuntime {
             debug!(targets = ?target_ids, "watcher resolved note ids");
         }
 
+        let file_count = plan.len();
         self.persist_status(|status| {
             status.activity =
                 ActivityStatus::running(ActivityState::Indexing, active_note.clone(), queued_jobs);
-            status.activity.description = Some(format!("processing {} file(s)", target_list.len()));
+            status.activity.description = Some(format!("processing {file_count} file(s)"));
         })
         .await?;
         info!(
             queued = queued_jobs,
-            targets = target_list.len(),
+            targets = file_count,
             "processing watcher event batch"
         );
 
-        let indexer = self
-            .indexer
-            .as_ref()
-            .expect("indexer should be initialised before reindexing");
-        let stats = indexer.reindex_paths(&target_list).await?;
+        let stats = indexer.apply_plan(plan).await?;
         let indexed_notes = self.config.database.note_count()?;
 
         self.persist_status(|status| {

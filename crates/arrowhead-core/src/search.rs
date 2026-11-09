@@ -123,13 +123,6 @@ impl SearchService {
         let limit = limit.max(1);
         let filter_count = filters.active_count();
         let database = Arc::clone(&self.database);
-        let filters_clone = filters.clone();
-        let excludes_clone = excludes.clone();
-        let fetch_limit = if excludes.is_empty() {
-            limit
-        } else {
-            limit * 3
-        };
         info!(query = query, limit, "executing full-text search");
         if let Some(ref fts_expr) = fts {
             debug!(
@@ -150,15 +143,8 @@ impl SearchService {
             let mut results = Vec::new();
 
             if let Some(fts_expr) = &fts {
-                let mut matches =
-                    database.search_fts_with_filters(fts_expr, fetch_limit, &filters_clone)?;
-                if !excludes_clone.is_empty() {
-                    let exclude_ids = collect_excluded_ids(&database, &excludes_clone)?;
-                    matches.retain(|item| !exclude_ids.contains(&item.note_id));
-                }
-                if matches.len() > limit {
-                    matches.truncate(limit);
-                }
+                let matches =
+                    database.search_fts_with_filters(fts_expr, limit, &filters, &excludes)?;
 
                 let note_ids: Vec<String> =
                     matches.iter().map(|item| item.note_id.clone()).collect();
@@ -183,19 +169,7 @@ impl SearchService {
                     });
                 }
             } else {
-                let fetch_limit = if excludes_clone.is_empty() {
-                    fetch_limit
-                } else {
-                    limit * 3
-                };
-                let mut note_ids = database.notes_for_filters(&filters_clone, fetch_limit)?;
-                if !excludes_clone.is_empty() {
-                    let exclude_ids = collect_excluded_ids(&database, &excludes_clone)?;
-                    note_ids.retain(|id| !exclude_ids.contains(id));
-                }
-                if note_ids.len() > limit {
-                    note_ids.truncate(limit);
-                }
+                let note_ids = database.notes_for_filters(&filters, &excludes, limit)?;
 
                 if note_ids.is_empty() {
                     return Ok(Vec::new());
@@ -726,7 +700,13 @@ fn semantic_embedding_text(fts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, fs, path::Path, sync::Arc};
+    use std::{
+        collections::HashSet,
+        fs,
+        path::Path,
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
 
     use tempfile::TempDir;
 
@@ -892,6 +872,179 @@ mod tests {
             .await
             .expect("negative-only search succeeds");
         assert!(negative_only.iter().all(|r| r.note_id != "Digital"));
+    }
+
+    struct TestNote {
+        id: String,
+        body: String,
+        modified: Option<SystemTime>,
+    }
+
+    fn note(id: impl Into<String>, body: impl Into<String>) -> TestNote {
+        TestNote {
+            id: id.into(),
+            body: body.into(),
+            modified: None,
+        }
+    }
+
+    fn note_modified_at(id: impl Into<String>, body: &str, modified: SystemTime) -> TestNote {
+        TestNote {
+            modified: Some(modified),
+            ..note(id, body)
+        }
+    }
+
+    async fn indexed_temp_vault(notes: &[TestNote]) -> (TempDir, SearchService) {
+        let vault_dir = TempDir::new().expect("vault");
+        for note in notes {
+            let path = vault_dir.path().join(format!("{}.md", note.id));
+            fs::write(&path, &note.body).expect("write note");
+            if let Some(modified) = note.modified {
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .expect("open note")
+                    .set_times(fs::FileTimes::new().set_modified(modified))
+                    .expect("set note mtime");
+            }
+        }
+
+        let vault = Arc::new(
+            Vault::new(VaultConfig::new(vault_dir.path().to_path_buf()))
+                .expect("vault initialises"),
+        );
+        vault.ensure_arrowhead_dirs().expect("arrowhead dirs");
+        let db_path = vault.paths().arrowhead_dir.join("index.db");
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("database opens"));
+        Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        )
+        .index_all()
+        .await
+        .expect("indexing succeeds");
+
+        (
+            vault_dir,
+            SearchService::new(database, SearchConfig::default(), None),
+        )
+    }
+
+    fn result_ids(results: &[SearchResult]) -> Vec<&str> {
+        results
+            .iter()
+            .map(|result| result.note_id.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn not_clause_excludes_before_the_limit_applies() {
+        let mut notes: Vec<TestNote> = (0..10)
+            .map(|i| note(format!("Banned{i}"), "alpha banned"))
+            .collect();
+        notes.push(note("Good", format!("alpha {}", "filler ".repeat(100))));
+        let (_vault, service) = indexed_temp_vault(&notes).await;
+
+        let unfiltered = service.search_fts("alpha", Some(1)).await.expect("search");
+        assert_ne!(
+            result_ids(&unfiltered),
+            vec!["Good"],
+            "fixture must rank excluded notes above the valid one"
+        );
+
+        let results = service
+            .search_fts("alpha NOT banned", Some(1))
+            .await
+            .expect("search succeeds");
+        assert_eq!(result_ids(&results), vec!["Good"]);
+    }
+
+    #[tokio::test]
+    async fn multiple_not_clauses_all_apply_before_the_limit() {
+        let mut notes: Vec<TestNote> = (0..5)
+            .flat_map(|i| {
+                [
+                    note(format!("Banned{i}"), "alpha banned"),
+                    note(format!("Blocked{i}"), "alpha blocked"),
+                ]
+            })
+            .collect();
+        notes.push(note("Good", format!("alpha {}", "filler ".repeat(100))));
+        let (_vault, service) = indexed_temp_vault(&notes).await;
+
+        let one_clause = service
+            .search_fts("alpha NOT banned", Some(5))
+            .await
+            .expect("search succeeds");
+        assert!(
+            result_ids(&one_clause)
+                .iter()
+                .any(|id| id.starts_with("Blocked")),
+            "a single NOT clause must keep notes matched only by the other clause"
+        );
+
+        let results = service
+            .search_fts("alpha NOT banned NOT blocked", Some(1))
+            .await
+            .expect("search succeeds");
+        assert_eq!(result_ids(&results), vec!["Good"]);
+    }
+
+    #[tokio::test]
+    async fn not_clause_keeps_rank_order_and_requested_limit() {
+        let mut notes: Vec<TestNote> = (0..6)
+            .map(|i| note(format!("Banned{i}"), "alpha alpha alpha banned"))
+            .collect();
+        notes.push(note("Strong", "alpha alpha keep"));
+        notes.push(note(
+            "Medium",
+            format!("alpha keep {}", "filler ".repeat(20)),
+        ));
+        notes.push(note(
+            "Weak",
+            format!("alpha keep {}", "filler ".repeat(200)),
+        ));
+        let (_vault, service) = indexed_temp_vault(&notes).await;
+
+        let results = service
+            .search_fts("alpha NOT banned", Some(2))
+            .await
+            .expect("search succeeds");
+        assert_eq!(result_ids(&results), vec!["Strong", "Medium"]);
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[tokio::test]
+    async fn filter_only_not_clause_excludes_before_the_limit_applies() {
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let mut notes = vec![
+            note_modified_at("Older", "plain note", now - 3 * hour),
+            note_modified_at("Valid", "plain note", now - 2 * hour),
+        ];
+        notes.extend((1..=4).map(|minutes| {
+            note_modified_at(
+                format!("Recent{minutes}"),
+                "banned content",
+                now - Duration::from_secs(60 * minutes),
+            )
+        }));
+        let (_vault, service) = indexed_temp_vault(&notes).await;
+
+        let results = service
+            .search_fts("modified:past30d NOT banned", Some(1))
+            .await
+            .expect("filter-only search succeeds");
+        assert_eq!(result_ids(&results), vec!["Valid"]);
+
+        let two = service
+            .search_fts("modified:past30d NOT banned", Some(2))
+            .await
+            .expect("filter-only search succeeds");
+        assert_eq!(result_ids(&two), vec!["Valid", "Older"]);
     }
 
     #[tokio::test]

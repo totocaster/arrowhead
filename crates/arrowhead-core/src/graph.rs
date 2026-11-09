@@ -1,18 +1,122 @@
 //! WikiLink graph persistence and query services.
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::{task, try_join};
 
 use crate::{
     NoteId,
-    sqlite::{IndexDatabase, LinkResolutionMaps},
+    metadata::WikiLink,
+    sqlite::IndexDatabase,
+    vault::{normalise_relative_path, normalise_relative_str},
 };
 
 /// Canonicalise link keys for case-insensitive lookups.
 pub fn normalise_link_lookup(value: &str) -> String {
     value.trim().replace('\\', "/").to_lowercase()
+}
+
+/// The notes WikiLinks can resolve to, keyed the way links look them up.
+///
+/// A link's resolution depends only on this set, so the index re-resolves its
+/// stored links whenever the set changes instead of re-reading their notes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LinkTargets {
+    ids: BTreeSet<NoteId>,
+    ids_by_key: BTreeMap<String, BTreeSet<NoteId>>,
+    titles: BTreeMap<String, BTreeSet<NoteId>>,
+    aliases: BTreeMap<String, BTreeSet<NoteId>>,
+}
+
+impl LinkTargets {
+    /// Add a note with the title and aliases links may use to reach it.
+    pub fn insert_note(&mut self, note_id: &str, title: Option<&str>, aliases: &[String]) {
+        self.ids.insert(note_id.to_string());
+        insert_key(&mut self.ids_by_key, note_id, note_id);
+        if let Some(title) = title {
+            insert_key(&mut self.titles, title, note_id);
+        }
+        for alias in aliases {
+            insert_key(&mut self.aliases, alias, note_id);
+        }
+    }
+
+    /// Resolve a link target to a note id: the exact id, then a case-insensitive
+    /// id, then a title, then an alias. When several notes share a
+    /// case-insensitive id or a title, the smallest id wins; an alias claimed by
+    /// several notes resolves to none of them.
+    pub fn resolve(&self, link_target: &str) -> (Option<NoteId>, LinkReason) {
+        let Some(candidate) = normalise_link(link_target) else {
+            return (None, LinkReason::Unresolved);
+        };
+        if self.ids.contains(&candidate) {
+            return (Some(candidate), LinkReason::Direct);
+        }
+        let key = normalise_link_lookup(&candidate);
+        if let Some(id) = self.ids_by_key.get(&key).and_then(BTreeSet::first) {
+            return (Some(id.clone()), LinkReason::Direct);
+        }
+        if let Some(id) = self.titles.get(&key).and_then(BTreeSet::first) {
+            return (Some(id.clone()), LinkReason::Title);
+        }
+        match self.aliases.get(&key) {
+            Some(ids) if ids.len() == 1 => (ids.first().cloned(), LinkReason::Alias),
+            _ => (None, LinkReason::Unresolved),
+        }
+    }
+
+    /// Resolve each extracted link, keeping its raw text, heading, and display text.
+    pub fn resolve_links(&self, links: &[WikiLink]) -> Vec<LinkResolutionRecord> {
+        links
+            .iter()
+            .map(|link| {
+                let (target, reason) = self.resolve(&link.target);
+                LinkResolutionRecord {
+                    raw: link.raw.clone(),
+                    target,
+                    display: link.display.clone(),
+                    heading: link.heading.clone(),
+                    reason,
+                }
+            })
+            .collect()
+    }
+}
+
+fn insert_key(map: &mut BTreeMap<String, BTreeSet<NoteId>>, value: &str, note_id: &str) {
+    let key = normalise_link_lookup(value);
+    if !key.is_empty() {
+        map.entry(key).or_default().insert(note_id.to_string());
+    }
+}
+
+/// Turn a link target into a note-id-shaped candidate: a clean relative path
+/// without a `.md` extension.
+fn normalise_link(link: &str) -> Option<String> {
+    let mut candidate =
+        normalise_relative_str(link).or_else(|| normalise_relative_path(Path::new(link)))?;
+
+    if candidate
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        candidate.set_extension("");
+    }
+
+    let value = candidate
+        .to_string_lossy()
+        .replace(char::from(b'\\'), "/")
+        .trim()
+        .trim_matches('/')
+        .to_string();
+
+    (!value.is_empty()).then_some(value)
 }
 
 /// Classification describing how a link target was resolved.
@@ -239,31 +343,6 @@ impl GraphService {
             backlinks,
             forward_links,
         })
-    }
-}
-
-impl LinkResolutionMaps {
-    /// Merge resolution hints extracted from a note into the cached maps.
-    pub fn ingest_note(&mut self, note_id: &str, title: Option<&str>, aliases: &[String]) {
-        if let Some(title) = title {
-            let key = normalise_link_lookup(title);
-            if !key.is_empty() {
-                self.titles
-                    .entry(key)
-                    .or_insert_with(|| note_id.to_string());
-            }
-        }
-
-        for alias in aliases {
-            let key = normalise_link_lookup(alias);
-            if key.is_empty() {
-                continue;
-            }
-            let entry = self.aliases.entry(key).or_default();
-            if !entry.iter().any(|existing| existing == note_id) {
-                entry.push(note_id.to_string());
-            }
-        }
     }
 }
 

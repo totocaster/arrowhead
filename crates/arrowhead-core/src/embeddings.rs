@@ -1,7 +1,7 @@
 //! Embedding generation, configuration, and persistence.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     fmt, fs, mem,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -15,7 +15,10 @@ use tokio::task;
 use tracing::{debug, info};
 use zerocopy::AsBytes;
 
-use crate::{Vault, sqlite::IndexDatabase};
+use crate::{
+    Vault,
+    sqlite::{IndexDatabase, NoteIndexState},
+};
 
 /// User-facing presets for embedding model quality/speed trade-offs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +394,8 @@ pub struct EmbeddingRecord {
     pub note_id: String,
     /// Normalised embedding vector produced by fastembed.
     pub vector: Vec<f32>,
-    /// Timestamp when the embedding was generated.
+    /// Index generation of the note text this vector was computed from. The vector is
+    /// current only while this equals the note row's `indexed_at`.
     pub indexed_at: DateTime<Utc>,
 }
 
@@ -518,17 +522,20 @@ impl EmbeddingStore {
     ) -> Result<(Self, bool)> {
         let descriptor_clone = descriptor.clone();
         let db_for_task = Arc::clone(&database);
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
         let model_changed = task::spawn_blocking(move || -> Result<bool> {
-            let mut conn = db_for_task
-                .connection()
-                .context("failed to open SQLite connection for embeddings")?;
-            let tx = conn
-                .transaction()
-                .context("failed to open transaction for embedding bootstrap")?;
-            let changed = ensure_embedding_schema(&tx, &descriptor_clone)?;
-            tx.commit()
-                .context("failed to commit embedding bootstrap transaction")?;
-            Ok(changed)
+            tracing::dispatcher::with_default(&dispatch, || {
+                let mut conn = db_for_task
+                    .connection()
+                    .context("failed to open SQLite connection for embeddings")?;
+                let tx = conn
+                    .transaction()
+                    .context("failed to open transaction for embedding bootstrap")?;
+                let changed = ensure_embedding_schema(&tx, &descriptor_clone)?;
+                tx.commit()
+                    .context("failed to commit embedding bootstrap transaction")?;
+                Ok(changed)
+            })
         })
         .await
         .context("embedding bootstrap task aborted")??;
@@ -657,29 +664,42 @@ impl EmbeddingStore {
         Ok(())
     }
 
-    /// Return whether the active model already has a stored embedding for a note.
-    pub async fn has_embedding_for_note(&self, note_id: &str) -> Result<bool> {
+    /// Return the ids in `notes` whose vector for the active model is missing or was written
+    /// for a different index generation than the note row's `indexed_at`.
+    ///
+    /// A text reindex without a committed vector leaves this mismatch behind: an edit indexed
+    /// with embeddings disabled, a failed vector flush, or a crash before the flush. The
+    /// mismatch is the durable repair marker the indexer acts on.
+    pub async fn stale_note_ids(
+        &self,
+        notes: &HashMap<String, NoteIndexState>,
+    ) -> Result<HashSet<String>> {
         let database = Arc::clone(&self.database);
-        let note_id = note_id.to_string();
         let model_id = self.model_id.clone();
 
-        task::spawn_blocking(move || -> Result<bool> {
+        let generations = task::spawn_blocking(move || -> Result<HashMap<String, i64>> {
             let conn = database
                 .connection()
-                .context("failed to open SQLite connection for embedding presence check")?;
+                .context("failed to open SQLite connection for embedding freshness check")?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT 1 FROM {EMBEDDING_TABLE_NAME} \
-                 WHERE note_id = ?1 AND model = ?2 \
-                 LIMIT 1"
+                "SELECT note_id, indexed_at FROM {EMBEDDING_TABLE_NAME} WHERE model = ?1"
             ))?;
-            let present = stmt
-                .query_row(params![&note_id, &model_id], |_| Ok(()))
-                .optional()?
-                .is_some();
-            Ok(present)
+            let rows = stmt.query_map([&model_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+                .context("failed to read embedding generations")
         })
         .await
-        .context("embedding presence task aborted")?
+        .context("embedding freshness task aborted")??;
+
+        Ok(notes
+            .iter()
+            .filter(|(note_id, state)| {
+                generations.get(*note_id) != Some(&state.indexed_at.timestamp_micros())
+            })
+            .map(|(note_id, _)| note_id.clone())
+            .collect())
     }
 
     /// Retrieve the stored embedding vector for a note, when available.
@@ -717,6 +737,8 @@ impl EmbeddingStore {
     }
 
     /// Execute a cosine similarity search via sqlite-vec.
+    ///
+    /// Only notes that still have an index row are returned.
     pub async fn search(
         &self,
         query: &[f32],
@@ -740,10 +762,14 @@ impl EmbeddingStore {
                  ORDER BY distance \
                  LIMIT ?3"
             ))?;
+            let mut note_exists = conn.prepare("SELECT 1 FROM notes WHERE id = ?1")?;
             let mut rows = stmt.query(params![blob.as_slice(), &model_id, limit])?;
             let mut results = Vec::new();
             while let Some(row) = rows.next()? {
                 let note_id: String = row.get(0)?;
+                if !note_exists.exists([&note_id])? {
+                    continue;
+                }
                 let distance: f32 = row.get(1)?;
                 results.push(EmbeddingMatch { note_id, distance });
             }
@@ -766,7 +792,18 @@ impl EmbeddingStore {
 #[derive(Debug, Clone)]
 struct StoredEmbeddingMetadata {
     model_id: String,
+    repository: String,
     dimension: usize,
+}
+
+impl StoredEmbeddingMetadata {
+    /// Vectors are comparable only when they came from the same preset, model repository,
+    /// and dimension.
+    fn matches(&self, descriptor: &EmbeddingDescriptor) -> bool {
+        self.model_id == descriptor.identifier()
+            && self.repository == descriptor.repository()
+            && self.dimension == descriptor.dimension()
+    }
 }
 
 fn ensure_embedding_schema(conn: &Connection, descriptor: &EmbeddingDescriptor) -> Result<bool> {
@@ -776,9 +813,7 @@ fn ensure_embedding_schema(conn: &Connection, descriptor: &EmbeddingDescriptor) 
 
     match (metadata, table_exists) {
         (Some(existing), true) => {
-            if existing.model_id != descriptor.identifier()
-                || existing.dimension != descriptor.dimension()
-            {
+            if !existing.matches(descriptor) {
                 drop_embedding_table(conn)?;
                 create_embedding_table(conn, descriptor)?;
                 model_changed = true;
@@ -798,8 +833,29 @@ fn ensure_embedding_schema(conn: &Connection, descriptor: &EmbeddingDescriptor) 
         }
     }
 
+    remove_vectors_without_notes(conn)?;
     write_embedding_metadata(conn, descriptor)?;
     Ok(model_changed)
+}
+
+/// Delete vectors whose note row is gone. Releases before v0.11.6 could remove a note and keep
+/// its vector, so indexes they wrote can still hold such rows.
+fn remove_vectors_without_notes(conn: &Connection) -> Result<()> {
+    let removed = conn
+        .execute(
+            &format!(
+                "DELETE FROM {EMBEDDING_TABLE_NAME} WHERE note_id NOT IN (SELECT id FROM notes)"
+            ),
+            [],
+        )
+        .context("failed to remove embeddings for notes missing from the index")?;
+    if removed > 0 {
+        info!(
+            removed,
+            "removed embeddings for notes missing from the index"
+        );
+    }
+    Ok(())
 }
 
 fn load_embedding_metadata(conn: &Connection) -> Result<Option<StoredEmbeddingMetadata>> {
@@ -808,10 +864,11 @@ fn load_embedding_metadata(conn: &Connection) -> Result<Option<StoredEmbeddingMe
         [EMBEDDING_METADATA_SINGLETON],
         |row| {
             let model_id: String = row.get(0)?;
-            let _repository: String = row.get(1)?;
+            let repository: String = row.get(1)?;
             let dimension: i64 = row.get(2)?;
             Ok(StoredEmbeddingMetadata {
                 model_id,
+                repository,
                 dimension: dimension as usize,
             })
         },
@@ -905,6 +962,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    use crate::{NoteRecord, metadata::MetadataExtraction};
+
     fn unit_vector(dimension: usize, fill: f32) -> Vec<f32> {
         let mut vec = vec![fill; dimension];
         let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -912,6 +971,34 @@ mod tests {
             *value /= norm;
         }
         vec
+    }
+
+    fn axis_vector(dimension: usize, axis: usize) -> Vec<f32> {
+        let mut vec = vec![0.0; dimension];
+        vec[axis] = 1.0;
+        vec
+    }
+
+    /// Write a text-index row for `note_id` and return its index generation.
+    fn index_note_row(database: &IndexDatabase, note_id: &str) -> DateTime<Utc> {
+        let indexed_at = Utc::now();
+        let note = NoteRecord::new(note_id, format!("{note_id}.md"), indexed_at, String::new());
+        database
+            .upsert_note(&note, &MetadataExtraction::default(), &[], indexed_at)
+            .expect("index note row");
+        indexed_at
+    }
+
+    fn vector_record(
+        note_id: &str,
+        vector: Vec<f32>,
+        indexed_at: DateTime<Utc>,
+    ) -> EmbeddingRecord {
+        EmbeddingRecord {
+            note_id: note_id.to_string(),
+            vector,
+            indexed_at,
+        }
     }
 
     #[tokio::test]
@@ -925,6 +1012,8 @@ mod tests {
         assert!(!changed, "unexpected model change during first bootstrap");
 
         let timestamp = Utc::now();
+        index_note_row(&database, "note-1");
+        index_note_row(&database, "note-2");
         let base_vector = unit_vector(descriptor.dimension(), 1.0);
         let alt_vector = unit_vector(descriptor.dimension(), -1.0);
 
@@ -1001,35 +1090,206 @@ mod tests {
                 indexed_at: Utc::now(),
             }])
             .await?;
-        assert!(store.has_embedding_for_note(note_id).await?);
+        assert!(store.vector_for_note(note_id).await?.is_some());
 
         assert!(
             !database.remove_note(note_id)?,
             "the regression fixture intentionally has no text-index row"
         );
-        assert!(!store.has_embedding_for_note(note_id).await?);
+        assert!(store.vector_for_note(note_id).await?.is_none());
         Ok(())
     }
 
     #[tokio::test]
-    async fn has_embedding_for_note_reports_presence() -> Result<()> {
+    async fn stale_note_ids_reports_missing_and_outdated_vectors_after_reopen() -> Result<()> {
         let dir = tempdir().expect("temp dir");
         let db_path = dir.path().join("index.db");
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let dimension = descriptor.dimension();
+        {
+            let database = Arc::new(IndexDatabase::open(&db_path)?);
+            let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+            let current = index_note_row(&database, "current");
+            let first_outdated = index_note_row(&database, "outdated");
+            index_note_row(&database, "missing");
+            store
+                .upsert_embeddings(&[
+                    vector_record("current", axis_vector(dimension, 0), current),
+                    vector_record("outdated", axis_vector(dimension, 1), first_outdated),
+                ])
+                .await?;
+            assert!(
+                store
+                    .stale_note_ids(&database.note_states()?)
+                    .await?
+                    .contains("missing")
+            );
+
+            index_note_row(&database, "outdated");
+        }
+
         let database = Arc::new(IndexDatabase::open(&db_path)?);
+        let (store, changed) =
+            EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        assert!(!changed);
+        let stale = store.stale_note_ids(&database.note_states()?).await?;
+        assert_eq!(
+            stale,
+            HashSet::from(["missing".to_string(), "outdated".to_string()]),
+            "a vector is current only for the generation of its note row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_skips_vectors_whose_note_row_is_gone() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let database = Arc::new(IndexDatabase::open(dir.path().join("index.db"))?);
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let dimension = descriptor.dimension();
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        let live = index_note_row(&database, "live");
+        let mut near_query = axis_vector(dimension, 0);
+        near_query[1] = 0.2;
+        store
+            .upsert_embeddings(&[
+                vector_record("live", normalize_vector(near_query)?, live),
+                vector_record("ghost", axis_vector(dimension, 0), live),
+            ])
+            .await?;
+
+        let matches = store.search(&axis_vector(dimension, 0), 10, 0.3).await?;
+        let ids: Vec<&str> = matches.iter().map(|item| item.note_id.as_str()).collect();
+        assert_eq!(ids, vec!["live"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bootstrap_removes_vectors_whose_note_row_is_gone() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("index.db");
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let dimension = descriptor.dimension();
+        {
+            let database = Arc::new(IndexDatabase::open(&db_path)?);
+            let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+            let live = index_note_row(&database, "live");
+            store
+                .upsert_embeddings(&[
+                    vector_record("live", axis_vector(dimension, 0), live),
+                    vector_record("ghost", axis_vector(dimension, 1), live),
+                ])
+                .await?;
+        }
+
+        let database = Arc::new(IndexDatabase::open(&db_path)?);
+        let (store, changed) =
+            EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        assert!(!changed, "removing dead vectors is not a model change");
+        assert!(store.vector_for_note("ghost").await?.is_none());
+        assert!(store.vector_for_note("live").await?.is_some());
+        Ok(())
+    }
+
+    struct RecordingSubscriber(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for RecordingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Message<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0.push(format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Message(&mut self.0.lock().expect("log buffer")));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cleanup_logs_to_the_callers_subscriber() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let database = Arc::new(IndexDatabase::open(dir.path().join("index.db"))?);
         let descriptor = EmbeddingDescriptor::resolve("fast")?;
         let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        store
+            .upsert_embeddings(&[vector_record(
+                "ghost",
+                axis_vector(descriptor.dimension(), 0),
+                Utc::now(),
+            )])
+            .await?;
 
-        assert!(!store.has_embedding_for_note("note-1").await?);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(
+            RecordingSubscriber(Arc::clone(&messages)),
+        ));
+        EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
 
-        let record = EmbeddingRecord {
-            note_id: "note-1".to_string(),
-            vector: unit_vector(descriptor.dimension(), 0.5),
-            indexed_at: Utc::now(),
-        };
-        store.upsert_embeddings(&[record]).await?;
+        assert!(
+            messages
+                .lock()
+                .expect("log buffer")
+                .iter()
+                .any(|message| message.contains("removed embeddings for notes missing")),
+            "cleanup ran on a blocking thread and its log must reach the caller's subscriber"
+        );
+        Ok(())
+    }
 
-        assert!(store.has_embedding_for_note("note-1").await?);
-        assert!(!store.has_embedding_for_note("missing").await?);
+    #[tokio::test]
+    async fn bootstrap_resets_vectors_when_the_model_repository_changes() -> Result<()> {
+        let dir = tempdir().expect("temp dir");
+        let database = Arc::new(IndexDatabase::open(dir.path().join("index.db"))?);
+        let descriptor = EmbeddingDescriptor::resolve("fast")?;
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        let generation = index_note_row(&database, "note");
+        store
+            .upsert_embeddings(&[vector_record(
+                "note",
+                axis_vector(descriptor.dimension(), 0),
+                generation,
+            )])
+            .await?;
+        database.connection()?.execute(
+            "UPDATE embedding_metadata SET repository = 'previous-org/previous-model'",
+            [],
+        )?;
+
+        let (store, changed) =
+            EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        assert!(
+            changed,
+            "vectors from another model repository must be rebuilt"
+        );
+        assert!(store.vector_for_note("note").await?.is_none());
+        assert!(
+            store
+                .stale_note_ids(&database.note_states()?)
+                .await?
+                .contains("note")
+        );
+
+        let (_, changed_again) =
+            EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor).await?;
+        assert!(!changed_again);
         Ok(())
     }
 

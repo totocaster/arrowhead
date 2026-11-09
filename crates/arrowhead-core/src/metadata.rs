@@ -32,6 +32,35 @@ pub struct WikiLink {
     pub heading: Option<String>,
 }
 
+impl WikiLink {
+    /// Parse the trimmed text between `[[` and `]]` (`target#heading|display`).
+    ///
+    /// The index stores this text, so stored links can be resolved again
+    /// without reading their notes. Returns `None` when there is no target.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (target_section, display) = match raw.split_once('|') {
+            Some((target_section, display)) => (target_section, non_empty(display)),
+            None => (raw, None),
+        };
+        let (target, heading) = match target_section.split_once('#') {
+            Some((target, heading)) => (target, non_empty(heading)),
+            None => (target_section, None),
+        };
+        let target = target.trim();
+        (!target.is_empty()).then(|| Self {
+            raw: raw.to_string(),
+            target: target.to_string(),
+            display,
+            heading,
+        })
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Parses notes and produces structured metadata for indexing.
 #[derive(Debug, Default, Clone)]
 pub struct MetadataExtractor;
@@ -250,35 +279,7 @@ fn extract_wikilinks(content: &str) -> Vec<WikiLink> {
             }
 
             if dedupe.insert(trimmed_raw.to_string()) {
-                let mut target_section = trimmed_raw;
-                let mut display = None;
-
-                if let Some((before_pipe, after_pipe)) = target_section.split_once('|') {
-                    target_section = before_pipe;
-                    let alias = after_pipe.trim();
-                    if !alias.is_empty() {
-                        display = Some(alias.to_string());
-                    }
-                }
-
-                let mut heading = None;
-                if let Some((before_hash, after_hash)) = target_section.split_once('#') {
-                    target_section = before_hash;
-                    let anchor = after_hash.trim();
-                    if !anchor.is_empty() {
-                        heading = Some(anchor.to_string());
-                    }
-                }
-
-                let target = target_section.trim();
-                if !target.is_empty() {
-                    results.push(WikiLink {
-                        raw: trimmed_raw.to_string(),
-                        target: target.to_string(),
-                        display,
-                        heading,
-                    });
-                }
+                results.extend(WikiLink::parse(trimmed_raw));
             }
 
             cursor = end + 2;

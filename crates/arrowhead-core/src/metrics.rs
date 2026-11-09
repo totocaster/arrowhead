@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 /// Default relative directory used to store metrics files.
 pub const DEFAULT_METRICS_ROOT: &str = "Metrics";
@@ -312,22 +313,60 @@ pub fn parse_metrics_reader<R: BufRead>(
 ) -> Result<Vec<ParsedMetricRow>> {
     let mut rows = Vec::new();
 
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| {
-            format!(
-                "failed to read metrics file {} at line {}",
-                source_file.display(),
-                index + 1
-            )
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        rows.push(parse_metrics_line(&line, source_file, index + 1));
+    for line in metrics_lines(reader, source_file) {
+        let (line_number, line) = line?;
+        rows.push(parse_metrics_line(&line, source_file, line_number));
     }
 
     apply_duplicate_issues(&mut rows);
     Ok(rows)
+}
+
+/// SHA-256 of the rows parsed from a metrics file: what the index stores for it.
+pub fn metrics_rows_fingerprint(rows: &[ParsedMetricRow]) -> String {
+    fingerprint_lines(
+        rows.iter()
+            .map(|row| (row.line_number, row.raw_line.as_str())),
+    )
+}
+
+/// The fingerprint [`metrics_rows_fingerprint`] gives the rows in `reader`,
+/// computed without parsing them.
+pub fn metrics_reader_fingerprint<R: BufRead>(reader: R, source_file: &Path) -> Result<String> {
+    let lines = metrics_lines(reader, source_file).collect::<Result<Vec<_>>>()?;
+    Ok(fingerprint_lines(
+        lines.iter().map(|(number, line)| (*number, line.as_str())),
+    ))
+}
+
+/// Non-blank lines with their 1-based line numbers. Both the parser and the
+/// fingerprint read lines through here, so they always agree on the rows.
+fn metrics_lines<'a, R: BufRead + 'a>(
+    reader: R,
+    source_file: &'a Path,
+) -> impl Iterator<Item = Result<(usize, String)>> + 'a {
+    reader
+        .lines()
+        .enumerate()
+        .filter_map(move |(index, line)| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            Ok(line) => Some(Ok((index + 1, line))),
+            Err(err) => Some(Err(anyhow::Error::from(err).context(format!(
+                "failed to read metrics file {} at line {}",
+                source_file.display(),
+                index + 1
+            )))),
+        })
+}
+
+fn fingerprint_lines<'a>(lines: impl IntoIterator<Item = (usize, &'a str)>) -> String {
+    let mut hasher = Sha256::new();
+    for (line_number, line) in lines {
+        hasher.update((line_number as u64).to_le_bytes());
+        hasher.update(line.as_bytes());
+        hasher.update([b'\n']);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// Parse and validate a single NDJSON row.

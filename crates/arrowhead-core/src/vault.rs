@@ -6,7 +6,7 @@
 //! live in dedicated modules so they can be unit tested independently.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     ffi::OsString,
     fs, io,
     io::ErrorKind,
@@ -33,17 +33,19 @@ use crate::workspace::{
 };
 use crate::{MetadataMap, NoteId, NoteRecord};
 
-mod note_fs;
+pub(crate) mod contained_fs;
 
 /// Why [`Vault::create_note`], [`Vault::write_note`], or [`Vault::delete_note`]
 /// was refused or failed. An I/O failure can leave a partial change.
 ///
 /// Note changes never follow symbolic links. A symlink anywhere on the note
 /// path is refused, whether it points outside the vault, inside it, or nowhere.
-/// See `docs/note_mutations.md`.
+/// See `docs/note_mutations.md` and `docs/vault_write_containment.md`.
 #[derive(Debug, thiserror::Error)]
 pub enum NoteMutationError {
-    /// The note id is malformed or names an internal, attachment, or ignored path.
+    /// The note id is malformed, or names a path that vault inventory never
+    /// lists: Arrowhead's folder, the attachments folder, a hidden folder, a
+    /// folder named `attachments`, or an ignored path.
     #[error("{0}")]
     InvalidId(String),
     /// The metadata cannot be written as YAML frontmatter.
@@ -72,6 +74,21 @@ pub enum NoteMutationError {
         /// The symlink, relative to the vault root.
         path: PathBuf,
     },
+    /// The note id reaches an existing folder or note that the vault spells
+    /// differently, as `PRIVATE/Draft` reaches the folder `Private` on a
+    /// case-insensitive filesystem.
+    #[error(
+        "refusing to change note {note_id}: {}, and note changes need the exact spelling",
+        contained_fs::describe_misspelling(path, listed.as_deref())
+    )]
+    Misspelled {
+        /// Note id as the caller supplied it.
+        note_id: String,
+        /// The misspelled path, relative to the vault root.
+        path: PathBuf,
+        /// The spelling the vault uses, when the folder listing shows it.
+        listed: Option<PathBuf>,
+    },
     /// The filesystem rejected the change.
     #[error("failed to {action} note {note_id} at {}: {error}", path.display())]
     Io {
@@ -99,6 +116,16 @@ pub struct NoteInventoryEntry {
     pub file_modified_at: DateTime<Utc>,
     /// Optional filesystem creation timestamp.
     pub created_at: Option<DateTime<Utc>>,
+}
+
+/// The notes [`Vault::inventory`] has inside some subtrees; see [`Vault::inventory_within`].
+#[derive(Debug, Clone, Default)]
+pub struct ScopedInventory {
+    /// Vault-relative subtrees, sorted, none inside another. The empty path is
+    /// the whole vault.
+    pub scopes: Vec<PathBuf>,
+    /// The inventory entries inside `scopes`.
+    pub entries: Vec<NoteInventoryEntry>,
 }
 
 /// Cached snapshot of vault inventory for fast lookups.
@@ -449,12 +476,17 @@ impl Vault {
     }
 
     /// Resolve a note identifier to a relative path inside the vault (without extension).
+    ///
+    /// Rejects ids whose note file would sit where inventory never looks, so
+    /// every accepted id names a note that inventory can list.
     pub fn relative_path_from_id(&self, note_id: &str) -> Result<PathBuf> {
         let relative = normalise_relative_path(Path::new(note_id))
             .ok_or_else(|| anyhow!("invalid note id: {note_id}"))?;
 
-        if self.is_reserved_note_path(&relative) {
-            bail!("invalid note id: {note_id} points to an internal or ignored vault path");
+        if !self.inventory_lists(&append_md_extension(relative.clone())) {
+            bail!(
+                "invalid note id: {note_id} points to an internal, hidden, attachment, or ignored vault path"
+            );
         }
 
         Ok(relative)
@@ -480,12 +512,19 @@ impl Vault {
         let relative = self.mutable_note_path(note_id)?;
         let content = compose_note_content(metadata, body)?;
         info!(note_id, path = %relative.display(), "creating note");
-        note_fs::create(&self.paths.root, &relative, content.as_bytes())
+        contained_fs::create(&self.paths.root, &relative, content.as_bytes())
             .map_err(|refusal| self.refused(refusal, note_id, "create"))
     }
 
     /// Write the supplied metadata/body to the given note identifier, replacing
     /// an existing note and creating missing parent folders.
+    ///
+    /// The new contents go to a temporary file in the note's folder, which then
+    /// replaces the note through a rename. A hard link to the old file elsewhere
+    /// keeps the old contents, and the old note stays whole if the update fails
+    /// before the rename. The note keeps its permission bits, extended
+    /// attributes, owner and group where the OS allows it, and, on macOS, its
+    /// creation time. Replacing a note needs write access to its folder.
     pub fn write_note(
         &self,
         note_id: &str,
@@ -495,7 +534,7 @@ impl Vault {
         let relative = self.mutable_note_path(note_id)?;
         let content = compose_note_content(metadata, body)?;
         info!(note_id, path = %relative.display(), "writing note to disk");
-        note_fs::replace(&self.paths.root, &relative, content.as_bytes())
+        contained_fs::replace(&self.paths.root, &relative, content.as_bytes())
             .map_err(|refusal| self.refused(refusal, note_id, "write"))
     }
 
@@ -505,7 +544,7 @@ impl Vault {
     pub fn delete_note(&self, note_id: &str) -> Result<Vec<PathBuf>, NoteMutationError> {
         let relative = self.mutable_note_path(note_id)?;
         info!(note_id, path = %relative.display(), "deleting note");
-        note_fs::remove(&self.paths.root, &relative)
+        contained_fs::remove(&self.paths.root, &relative, 0)
             .map_err(|refusal| self.refused(refusal, note_id, "delete"))
     }
 
@@ -517,16 +556,21 @@ impl Vault {
 
     fn refused(
         &self,
-        refusal: note_fs::Refusal,
+        refusal: contained_fs::Refusal,
         note_id: &str,
         action: &'static str,
     ) -> NoteMutationError {
         let note_id = note_id.to_string();
         match refusal {
-            note_fs::Refusal::Symlink(path) => NoteMutationError::Symlink { note_id, path },
-            note_fs::Refusal::Exists => NoteMutationError::AlreadyExists { note_id },
-            note_fs::Refusal::Missing => NoteMutationError::NotFound { note_id },
-            note_fs::Refusal::Io(path, error) => NoteMutationError::Io {
+            contained_fs::Refusal::Symlink(path) => NoteMutationError::Symlink { note_id, path },
+            contained_fs::Refusal::Misspelled { path, listed } => NoteMutationError::Misspelled {
+                note_id,
+                path,
+                listed,
+            },
+            contained_fs::Refusal::Exists => NoteMutationError::AlreadyExists { note_id },
+            contained_fs::Refusal::Missing => NoteMutationError::NotFound { note_id },
+            contained_fs::Refusal::Io(path, error) => NoteMutationError::Io {
                 note_id,
                 action,
                 path: self.paths.root.join(path),
@@ -543,12 +587,16 @@ impl Vault {
 
     /// List all markdown note paths relative to the vault root.
     pub fn list_markdown_paths(&self) -> Result<Vec<PathBuf>> {
-        collect_markdown_files(
-            &self.paths.root,
-            Some(&self.paths.arrowhead_dir),
-            self.paths.attachments_dir.as_deref(),
-            self.settings.ignored_folders(),
-        )
+        self.inventory_walk().collect(&self.paths.root)
+    }
+
+    fn inventory_walk(&self) -> InventoryWalk<'_> {
+        InventoryWalk {
+            root: &self.paths.root,
+            arrowhead_dir: &self.paths.arrowhead_dir,
+            attachments_dir: self.paths.attachments_dir.as_deref(),
+            ignored_folders: self.settings.ignored_folders(),
+        }
     }
 
     /// Normalise a filesystem path to a vault-relative markdown path.
@@ -692,28 +740,16 @@ impl Vault {
         Some(relative)
     }
 
-    fn is_reserved_note_path(&self, relative: &Path) -> bool {
-        if let Ok(arrowhead_relative) = self.paths.arrowhead_dir.strip_prefix(&self.paths.root) {
-            if relative.starts_with(arrowhead_relative) {
-                return true;
-            }
-        }
-
-        if let Ok(obsidian_relative) = self.paths.obsidian_dir.strip_prefix(&self.paths.root) {
-            if relative.starts_with(obsidian_relative) {
-                return true;
-            }
-        }
-
-        if let Some(attachments_dir) = &self.paths.attachments_dir {
-            if let Ok(attachments_relative) = attachments_dir.strip_prefix(&self.paths.root) {
-                if relative.starts_with(attachments_relative) {
-                    return true;
-                }
-            }
-        }
-
-        is_ignored(relative, self.settings.ignored_folders())
+    /// Whether the inventory's path rules admit this vault-relative Markdown file.
+    fn inventory_lists(&self, file: &Path) -> bool {
+        let walk = self.inventory_walk();
+        let absolute = self.paths.root.join(file);
+        walk.admits_file(&absolute)
+            && absolute
+                .ancestors()
+                .skip(1)
+                .take_while(|folder| *folder != self.paths.root)
+                .all(|folder| walk.admits_dir(folder))
     }
 
     /// Load a note by its identifier.
@@ -777,22 +813,86 @@ impl Vault {
         Ok(entries)
     }
 
-    fn build_inventory_entries(&self) -> Result<Vec<NoteInventoryEntry>> {
-        let mut entries = Vec::new();
-        let mut ids = BTreeMap::new();
+    /// The part of [`Vault::inventory`] at or below `paths`, found without
+    /// walking the rest of the vault.
+    ///
+    /// Each path is a subtree, whether it names a note, a folder, or nothing
+    /// that still exists. Paths outside the vault or inside Arrowhead's own
+    /// folder are dropped. The full inventory's rules apply to every folder
+    /// above and below each path, so a path inside a hidden, `attachments`,
+    /// ignored, or symlinked folder holds no notes. A path naming a note also
+    /// brings in the files competing with it for that note id, so each id keeps
+    /// the file a full pass keeps. Each folder is listed at most once.
+    pub fn inventory_within<P: AsRef<Path>>(&self, paths: &[P]) -> Result<ScopedInventory> {
+        let mut relative: Vec<PathBuf> = paths
+            .iter()
+            .filter_map(|path| self.scope_path(path.as_ref()))
+            .collect();
+        relative.sort();
+        // Sorting puts every path right after the folders containing it.
+        let mut scopes: Vec<PathBuf> = Vec::new();
+        for path in relative {
+            if scopes.last().is_none_or(|scope| !path.starts_with(scope)) {
+                scopes.push(path);
+            }
+        }
 
+        let walk = self.inventory_walk();
+        let mut folders = HashMap::new();
+        let mut files = Vec::new();
+        for scope in &scopes {
+            walk.collect_scope(scope, &mut folders, &mut files)?;
+        }
+        files.sort();
+        files.dedup();
+        Ok(ScopedInventory {
+            entries: self.inventory_entries(files)?,
+            scopes,
+        })
+    }
+
+    /// `path` relative to the vault root, or `None` when it lies outside the
+    /// vault or inside Arrowhead's own folder.
+    fn scope_path(&self, path: &Path) -> Option<PathBuf> {
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.paths.root).ok()?
+        } else {
+            path
+        };
+        let relative = if relative.as_os_str().is_empty() {
+            PathBuf::new()
+        } else {
+            normalise_relative_path(relative)?
+        };
+        let arrowhead = self.paths.arrowhead_dir.strip_prefix(&self.paths.root);
+        if arrowhead.is_ok_and(|arrowhead| relative.starts_with(arrowhead)) {
+            return None;
+        }
+        Some(relative)
+    }
+
+    fn build_inventory_entries(&self) -> Result<Vec<NoteInventoryEntry>> {
         debug!(
             root = %self.paths.root.display(),
             ignored = self.settings.ignored_folders().len(),
             "building vault inventory"
         );
+        let files = self.inventory_walk().collect(&self.paths.root)?;
+        debug!(
+            collected = files.len(),
+            "collected markdown files for inventory"
+        );
+        self.inventory_entries(files)
+    }
 
-        for relative_path in collect_markdown_files(
-            &self.paths.root,
-            Some(&self.paths.arrowhead_dir),
-            self.paths.attachments_dir.as_deref(),
-            self.settings.ignored_folders(),
-        )? {
+    /// Inventory entries for sorted vault-relative note paths. The first path
+    /// for each note id wins, and files that vanished since they were listed are
+    /// left out.
+    fn inventory_entries(&self, files: Vec<PathBuf>) -> Result<Vec<NoteInventoryEntry>> {
+        let mut entries = Vec::new();
+        let mut ids = BTreeMap::new();
+
+        for relative_path in files {
             let note_id = derive_note_id(&relative_path)?;
             if let Some(existing_index) = ids.get(&note_id) {
                 // A single odd file must not take the whole vault down: every
@@ -814,8 +914,15 @@ impl Vault {
             }
 
             let absolute_path = self.note_path(&relative_path);
-            let file_meta = fs::metadata(&absolute_path)
-                .with_context(|| format!("failed to stat note {}", absolute_path.display()))?;
+            let file_meta = match fs::metadata(&absolute_path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to stat note {}", absolute_path.display())
+                    });
+                }
+            };
             let modified =
                 system_time_to_utc(file_meta.modified().unwrap_or_else(|_| SystemTime::now()))?;
             let created = file_meta
@@ -1593,6 +1700,304 @@ mod tests {
         assert!(!dir.path().join("Private").exists());
     }
 
+    #[test]
+    fn note_ids_follow_the_rules_inventory_lists_notes_by() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".obsidian")).expect("obsidian dir");
+        fs::write(
+            dir.path().join(".obsidian/app.json"),
+            r#"{ "attachmentFolderPath": "Assets", "userIgnoreFilters": ["Private/"] }"#,
+        )
+        .expect("write app config");
+        let ids = [
+            "Projects/Plan",
+            ".hidden-note",
+            ".arrowhead",
+            "Assets",
+            "Private",
+            ".trash/Ghost",
+            "Sub/.cache/Note",
+            "Sub/attachments/Ghost",
+            "Sub/ATTACHMENTS/Ghost",
+            ".obsidian/app",
+            ".arrowhead/debug",
+            "Assets/image",
+            "Assets/nested/image",
+            "Private/draft",
+        ];
+        for id in ids {
+            let file = dir.path().join(format!("{id}.md"));
+            fs::create_dir_all(file.parent().expect("parent")).expect("note folders");
+            fs::write(&file, "x\n").expect("note file");
+        }
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let listed = vault.list_note_ids().expect("inventory");
+
+        for id in ids {
+            assert_eq!(
+                vault.relative_path_from_id(id).is_ok(),
+                listed.iter().any(|listed| listed == id),
+                "note id {id} is accepted exactly when inventory lists its note"
+            );
+        }
+        assert!(listed.iter().any(|id| id == "Projects/Plan"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_note_replaces_a_hard_linked_note_and_keeps_its_metadata() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("vault");
+        let outside = dir.path().join("outside.md");
+        fs::create_dir(&root).expect("vault");
+        fs::write(&outside, "outside original\n").expect("outside file");
+        let note = root.join("Hard.md");
+        fs::hard_link(&outside, &note).expect("hard link");
+        fs::set_permissions(&note, fs::Permissions::from_mode(0o640)).expect("chmod");
+        let has_xattr = test_xattr::set(&note);
+        let before = fs::metadata(&note).expect("metadata");
+        let vault = Vault::new(VaultConfig::new(root.clone())).expect("vault initialises");
+
+        vault
+            .write_note("Hard", &MetadataMap::default(), "vault update\n")
+            .expect("write replaces the note");
+
+        let outside_after = fs::metadata(&outside).expect("outside metadata");
+        assert_eq!(
+            fs::read_to_string(&outside).expect("read outside"),
+            "outside original\n",
+            "the other hard link keeps the old contents"
+        );
+        assert_eq!(
+            (outside_after.ino(), outside_after.nlink()),
+            (before.ino(), 1)
+        );
+        let after = fs::metadata(&note).expect("note metadata");
+        assert_eq!(
+            fs::read_to_string(&note).expect("read note"),
+            "vault update\n"
+        );
+        assert_eq!(after.mode() & 0o7777, 0o640, "permission bits carry over");
+        if has_xattr {
+            assert_eq!(
+                test_xattr::get(&note).as_deref(),
+                Some(&b"kept"[..]),
+                "extended attributes carry over"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            after.created().expect("created"),
+            before.created().expect("created"),
+            "the creation time carries over"
+        );
+        assert_eq!(
+            fs::read_dir(&root).expect("read vault").count(),
+            1,
+            "no temporary file is left behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_note_fails_without_touching_a_note_it_cannot_replace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("vault");
+        fs::create_dir_all(root.join("Locked")).expect("folders");
+        fs::write(root.join("Locked/Note.md"), "original\n").expect("note in locked folder");
+        fs::write(root.join("ReadOnly.md"), "original\n").expect("read-only note");
+        let chmod = |path: &str, mode| {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(mode)).expect("chmod")
+        };
+        chmod("ReadOnly.md", 0o444);
+        chmod("Locked", 0o555);
+        if fs::write(root.join("Locked/probe"), "").is_ok() {
+            // Permission bits do not bind this user (root), so there is nothing to refuse.
+            chmod("Locked", 0o755);
+            return;
+        }
+        let vault = Vault::new(VaultConfig::new(root.clone())).expect("vault initialises");
+        let before = tree(&root);
+
+        for note_id in ["Locked/Note", "ReadOnly"] {
+            match vault.write_note(note_id, &MetadataMap::default(), "changed\n") {
+                Err(NoteMutationError::Io { error, .. }) => {
+                    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{note_id}")
+                }
+                other => panic!("write {note_id} must fail with a permission error, got {other:?}"),
+            }
+        }
+
+        chmod("Locked", 0o755);
+        assert_eq!(
+            tree(&root),
+            before,
+            "both notes keep their contents and no temporary file remains"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn note_changes_need_the_exact_spelling_of_existing_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("vault");
+        fs::create_dir_all(root.join(".obsidian")).expect("obsidian dir");
+        fs::write(
+            root.join(".obsidian/app.json"),
+            r#"{ "attachmentFolderPath": "Pièces", "userIgnoreFilters": ["Private/"] }"#,
+        )
+        .expect("write app config");
+        for folder in ["Pièces", "Private", "Projects"] {
+            fs::create_dir_all(root.join(folder)).expect("folder");
+        }
+        fs::write(root.join("Projects/Keep.md"), "keep\n").expect("note");
+        let vault = Vault::new(VaultConfig::new(root.clone())).expect("vault initialises");
+        let decomposed = "Pie\u{300}ces";
+        let folds_case = root.join("PROJECTS").exists();
+        let folds_composition = root.join(decomposed).exists();
+        let before = tree(&root);
+
+        type Attempt<'a> = &'a dyn Fn(&str) -> Result<(), NoteMutationError>;
+        let create: Attempt = &|id| vault.create_note(id, &MetadataMap::default(), "x\n");
+        let write: Attempt = &|id| vault.write_note(id, &MetadataMap::default(), "x\n");
+        let delete: Attempt = &|id| vault.delete_note(id).map(drop);
+        let decomposed_id = format!("{decomposed}/Leak");
+        let cases: [(Attempt, &str, bool, &str, &str); 6] = [
+            (create, "PRIVATE/Leak", folds_case, "PRIVATE", "Private"),
+            (create, "PIÈCES/Leak", folds_case, "PIÈCES", "Pièces"),
+            (
+                create,
+                &decomposed_id,
+                folds_composition,
+                decomposed,
+                "Pièces",
+            ),
+            (create, "projects/New", folds_case, "projects", "Projects"),
+            (
+                write,
+                "Projects/keep",
+                folds_case,
+                "Projects/keep.md",
+                "Projects/Keep.md",
+            ),
+            (delete, "projects/Keep", folds_case, "projects", "Projects"),
+        ];
+        for (attempt, note_id, aliased, misspelled, spelled) in cases {
+            if !aliased {
+                // This filesystem treats the spelling as a different, missing entry.
+                continue;
+            }
+            match attempt(note_id) {
+                Err(NoteMutationError::Misspelled {
+                    path,
+                    listed: Some(listed),
+                    ..
+                }) => assert_eq!(
+                    (path.as_path(), listed.as_path()),
+                    (Path::new(misspelled), Path::new(spelled)),
+                    "{note_id}"
+                ),
+                other => panic!("{note_id} must be refused as a misspelling, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            tree(&root),
+            before,
+            "refused changes leave the vault untouched"
+        );
+
+        vault
+            .create_note("Projects/New", &MetadataMap::default(), "new\n")
+            .expect("the exact spelling creates");
+        vault
+            .write_note("Projects/Keep", &MetadataMap::default(), "kept\n")
+            .expect("the exact spelling writes");
+        assert_eq!(
+            fs::read_to_string(root.join("Projects/Keep.md")).expect("read note"),
+            "kept\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_note_creates_accept_exactly_one_and_keep_its_contents() {
+        const WRITERS: usize = 8;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let barrier = std::sync::Barrier::new(WRITERS);
+
+        let outcomes = std::thread::scope(|scope| {
+            let writers = (0..WRITERS)
+                .map(|writer| {
+                    let (vault, barrier) = (&vault, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let body = format!("writer {writer}\n");
+                        vault.create_note("Race/Note", &MetadataMap::default(), &body)
+                    })
+                })
+                .collect::<Vec<_>>();
+            writers
+                .into_iter()
+                .map(|writer| writer.join().expect("join writer"))
+                .collect::<Vec<_>>()
+        });
+
+        let winners = (0..WRITERS)
+            .filter(|writer| outcomes[*writer].is_ok())
+            .collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1, "exactly one create wins: {outcomes:?}");
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                Ok(()) | Err(NoteMutationError::AlreadyExists { .. })
+            )),
+            "every other create reports the existing note: {outcomes:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Race/Note.md")).expect("read note"),
+            format!("writer {}\n", winners[0]),
+            "the note holds the winner's contents"
+        );
+    }
+
+    #[cfg(unix)]
+    mod test_xattr {
+        use std::path::Path;
+
+        const NAME: &str = "user.arrowhead.test";
+
+        /// Set a test attribute, or report that this filesystem does not support one.
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        pub(super) fn set(path: &Path) -> bool {
+            rustix::fs::setxattr(path, NAME, b"kept", rustix::fs::XattrFlags::empty()).is_ok()
+        }
+
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        pub(super) fn get(path: &Path) -> Option<Vec<u8>> {
+            let mut value = vec![0; 64];
+            let len = rustix::fs::getxattr(path, NAME, value.as_mut_slice()).ok()?;
+            value.truncate(len);
+            Some(value)
+        }
+
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        pub(super) fn set(_path: &Path) -> bool {
+            false
+        }
+
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        pub(super) fn get(_path: &Path) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
     #[cfg(unix)]
     #[derive(Debug, PartialEq)]
     enum TreeEntry {
@@ -1692,69 +2097,169 @@ mod tests {
     }
 }
 
-fn collect_markdown_files(
-    root: &Path,
-    arrowhead_dir: Option<&Path>,
-    attachments_dir: Option<&Path>,
-    ignored_folders: &[PathBuf],
-) -> Result<Vec<PathBuf>> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut files = Vec::new();
+/// The rules deciding which files are notes. Full and scoped walks share them, so
+/// an update for one path admits exactly the notes a full pass would.
+struct InventoryWalk<'a> {
+    root: &'a Path,
+    arrowhead_dir: &'a Path,
+    attachments_dir: Option<&'a Path>,
+    ignored_folders: &'a [PathBuf],
+}
 
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)
-            .with_context(|| format!("failed to read directory {}", dir.display()))?
+impl InventoryWalk<'_> {
+    /// Real directories (never symlinks) the walk descends into.
+    fn admits_dir(&self, path: &Path) -> bool {
+        if path == self.arrowhead_dir
+            || self
+                .attachments_dir
+                .is_some_and(|attachments| path.starts_with(attachments))
         {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
+            return false;
+        }
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            if name.starts_with('.') || name.eq_ignore_ascii_case("attachments") {
+                return false;
+            }
+        }
+        !is_ignored(self.relative(path), self.ignored_folders)
+    }
 
-            let relative = path.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
+    /// Real files (never symlinks) that count as notes.
+    fn admits_file(&self, path: &Path) -> bool {
+        is_markdown(path) && !is_ignored(self.relative(path), self.ignored_folders)
+    }
 
-            if file_type.is_dir() {
-                if Some(path.as_path()) == arrowhead_dir {
-                    continue;
-                }
+    fn relative<'p>(&self, path: &'p Path) -> &'p Path {
+        path.strip_prefix(self.root)
+            .unwrap_or_else(|_| Path::new(""))
+    }
 
-                if attachments_dir
-                    .map(|attachments| path.starts_with(attachments))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
+    /// Vault-relative note paths at or below the directory `start`, sorted.
+    fn collect(&self, start: &Path) -> Result<Vec<PathBuf>> {
+        let mut stack = vec![start.to_path_buf()];
+        let mut files = Vec::new();
 
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with('.') {
-                        continue;
+        while let Some(dir) = stack.pop() {
+            for (path, file_type) in read_dir_entries(&dir)? {
+                if file_type.is_dir() {
+                    if self.admits_dir(&path) {
+                        stack.push(path);
                     }
-                    if name.eq_ignore_ascii_case("attachments") {
-                        continue;
-                    }
+                } else if file_type.is_file() && self.admits_file(&path) {
+                    files.push(self.relative(&path).to_path_buf());
                 }
+            }
+        }
 
-                if is_ignored(relative, ignored_folders) {
-                    continue;
+        files.sort();
+        Ok(files)
+    }
+
+    /// Add to `files` the note paths a full walk collects inside `scope`, plus
+    /// the files competing with `scope` for its note id. An empty scope is the
+    /// whole vault. `folders` keeps each listed folder for later scopes.
+    fn collect_scope(
+        &self,
+        scope: &Path,
+        folders: &mut HashMap<PathBuf, Option<Folder>>,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let (Some(parent), Some(name)) = (scope.parent(), scope.file_name()) else {
+            files.extend(self.collect(self.root)?);
+            return Ok(());
+        };
+        let folder = match folders.entry(parent.to_path_buf()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(self.folder(parent)?),
+        };
+        let Some(folder) = folder else {
+            return Ok(());
+        };
+
+        if let Some(dir) = folder.folders.get(name) {
+            files.extend(self.collect(dir)?);
+        }
+        if is_markdown(scope) {
+            if let Some(notes) = derive_note_id(scope)
+                .ok()
+                .and_then(|note_id| folder.notes.get(&note_id))
+            {
+                files.extend(notes.iter().cloned());
+            }
+        }
+        Ok(())
+    }
+
+    /// What a full walk sees in the vault-relative folder `relative`, or `None`
+    /// when the walk never gets there: the folder is missing, is not a real
+    /// folder, or sits inside one the walk skips.
+    fn folder(&self, relative: &Path) -> Result<Option<Folder>> {
+        let mut dir = self.root.to_path_buf();
+        for component in relative.components() {
+            dir.push(component);
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.is_dir() && self.admits_dir(&dir) => {}
+                Ok(_) => return Ok(None),
+                Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to inspect {}", dir.display()));
                 }
+            }
+        }
 
-                stack.push(path);
-            } else if file_type.is_file() && is_markdown(&path) {
-                if is_ignored(relative, ignored_folders) {
-                    continue;
+        // Entries keep their real names, so on a case-insensitive volume a path
+        // that differs from a note only in case finds nothing.
+        let mut folder = Folder::default();
+        for (path, file_type) in read_dir_entries(&dir)? {
+            if file_type.is_dir() && self.admits_dir(&path) {
+                if let Some(name) = path.file_name() {
+                    folder.folders.insert(name.to_os_string(), path.clone());
                 }
+            } else if file_type.is_file() && self.admits_file(&path) {
+                let relative = self.relative(&path).to_path_buf();
+                if let Ok(note_id) = derive_note_id(&relative) {
+                    folder.notes.entry(note_id).or_default().push(relative);
+                }
+            }
+        }
+        Ok(Some(folder))
+    }
+}
 
-                let relative = relative.to_path_buf();
-                files.push(relative);
+/// One folder's entries as a full walk sees them.
+#[derive(Default)]
+struct Folder {
+    /// Subfolders the walk descends into, by name.
+    folders: HashMap<OsString, PathBuf>,
+    /// Vault-relative notes by the note id each one claims.
+    notes: HashMap<NoteId, Vec<PathBuf>>,
+}
+
+/// Entries of `dir` with their types. Entries that vanish while being listed are
+/// skipped, and so is a directory that vanished before it could be listed.
+fn read_dir_entries(dir: &Path) -> Result<Vec<(PathBuf, fs::FileType)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read directory {}", dir.display()));
+        }
+    };
+
+    let mut listed = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read directory {}", dir.display()))?;
+        match entry.file_type() {
+            Ok(file_type) => listed.push((entry.path(), file_type)),
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", entry.path().display()));
             }
         }
     }
-
-    files.sort();
-    debug!(
-        root = %root.display(),
-        collected = files.len(),
-        "collected markdown files for inventory"
-    );
-    Ok(files)
+    Ok(listed)
 }
 
 fn collect_metrics_files(root: &Path, suffixes: &[String]) -> Result<Vec<PathBuf>> {

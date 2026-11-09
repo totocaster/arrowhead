@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Result;
 use notify::{Config, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
@@ -50,8 +53,9 @@ pub fn start_watcher(
                 root = %root_dir.display(),
                 "starting recommended filesystem watcher"
             );
+            let root = root_dir.clone();
             let mut watcher = RecommendedWatcher::new(
-                move |res: notify::Result<Event>| handle_event(res, sender.clone()),
+                move |res: notify::Result<Event>| handle_event(res, &root, &sender),
                 config,
             )
             .map_err(|err| anyhow::anyhow!("failed to build filesystem watcher: {err}"))?;
@@ -65,8 +69,9 @@ pub fn start_watcher(
                 root = %root_dir.display(),
                 "starting poll-based filesystem watcher"
             );
+            let root = root_dir.clone();
             let mut watcher = PollWatcher::new(
-                move |res: notify::Result<Event>| handle_event(res, sender.clone()),
+                move |res: notify::Result<Event>| handle_event(res, &root, &sender),
                 config,
             )
             .map_err(|err| anyhow::anyhow!("failed to build poll watcher: {err}"))?;
@@ -78,14 +83,23 @@ pub fn start_watcher(
     }
 }
 
-fn handle_event(result: notify::Result<Event>, sender: Sender<Vec<PathBuf>>) {
+fn handle_event(result: notify::Result<Event>, root: &Path, sender: &Sender<Vec<PathBuf>>) {
     match result {
         Ok(event) => {
-            if event.paths.is_empty() {
+            let rescan = event.need_rescan();
+            let mut paths = event.paths;
+            if rescan {
+                // The platform lost events under these paths. inotify names none
+                // when its queue overflows, which leaves the whole vault in doubt.
+                if paths.is_empty() {
+                    paths.push(root.to_path_buf());
+                }
+                warn!(paths = ?paths, "filesystem watcher lost events; reconciling these paths");
+            }
+            if paths.is_empty() {
                 return;
             }
 
-            let paths = event.paths;
             if let Err(err) = sender.blocking_send(paths) {
                 warn!(error = %err, "dropped filesystem event because queue is closed");
             }
@@ -93,5 +107,35 @@ fn handle_event(result: notify::Result<Event>, sender: Sender<Vec<PathBuf>>) {
         Err(err) => {
             error!(error = %err, "filesystem watcher reported an error");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{EventKind, Flag};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn rescan_without_paths_reconciles_the_whole_vault() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let root = PathBuf::from("/vault");
+
+        handle_event(
+            Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+            &root,
+            &sender,
+        );
+
+        assert_eq!(receiver.try_recv().expect("rescan forwarded"), vec![root]);
+    }
+
+    #[test]
+    fn other_events_without_paths_are_dropped() {
+        let (sender, mut receiver) = mpsc::channel(4);
+
+        handle_event(Ok(Event::new(EventKind::Any)), Path::new("/vault"), &sender);
+
+        assert!(receiver.try_recv().is_err());
     }
 }

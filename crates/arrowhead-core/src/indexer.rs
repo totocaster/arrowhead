@@ -1,7 +1,8 @@
 //! Indexing orchestration.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -9,7 +10,6 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, stream::FuturesUnordered};
-use serde_json::Value;
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task,
@@ -19,12 +19,11 @@ use tracing::{debug, error, info};
 use crate::{
     IndexingStats, MetricsFileEntry, NoteRecord, Vault,
     embeddings::{EmbeddingPipeline, EmbeddingRecord, EmbeddingStore},
-    graph::{LinkReason, LinkResolutionRecord, normalise_link_lookup},
-    metadata::{MetadataExtraction, MetadataExtractor, WikiLink},
-    metrics::parse_metrics_file,
-    sqlite::{IndexDatabase, LinkResolutionMaps, MetricFileState, NoteIndexState},
-    vault::NoteInventoryEntry,
-    vault::{normalise_relative_path, normalise_relative_str},
+    graph::{LinkResolutionRecord, LinkTargets},
+    metadata::{MetadataExtraction, MetadataExtractor},
+    metrics::{metrics_reader_fingerprint, parse_metrics_reader},
+    sqlite::{IndexDatabase, MetricFileState, NoteIndexState},
+    vault::{NoteInventoryEntry, ScopedInventory},
 };
 
 const EMBEDDING_FLUSH_BATCH: usize = 64;
@@ -135,19 +134,18 @@ impl Indexer {
             force = self.config.force,
             "starting full indexing pass"
         );
-        let note_set: Arc<HashSet<String>> =
-            Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
-        let resolution_maps = self.collect_resolution_maps(&inventory)?;
-        let resolution = Arc::new(ResolutionContext::new(
-            Arc::clone(&note_set),
-            resolution_maps,
+        let note_set: HashSet<String> = inventory.iter().map(|entry| entry.id.clone()).collect();
+        let resolution = Arc::new(in_flight_link_targets(
+            self.database.link_targets()?,
+            note_set.iter(),
         ));
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
+        let stale_embeddings = self.stale_embeddings(&state_table).await?;
         let (write_tx, write_rx) = mpsc::channel(self.config.parallelism.max(1) * 2);
         let writer_handle = tokio::spawn(run_writer(
             Arc::clone(&self.database),
-            self.embeddings.clone(),
+            self.embedding_store(),
             write_rx,
         ));
 
@@ -159,6 +157,7 @@ impl Indexer {
             let resolution = Arc::clone(&resolution);
             let semaphore = Arc::clone(&semaphore);
             let states = Arc::clone(&state_table);
+            let stale_embeddings = Arc::clone(&stale_embeddings);
             let entry_id = entry.id.clone();
             let write_sender = write_tx.clone();
 
@@ -169,7 +168,7 @@ impl Indexer {
                     .await
                     .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
                 let result = indexer
-                    .run_single(entry, resolution, states, write_sender)
+                    .run_single(entry, resolution, states, stale_embeddings, write_sender)
                     .await;
                 Ok::<_, anyhow::Error>((entry_id, result))
             }));
@@ -235,7 +234,7 @@ impl Indexer {
             .await
             .map_err(|err| anyhow!("writer task aborted: {err}"))??;
 
-        let pruned = self.prune_missing_notes(note_set.as_ref()).await?;
+        let pruned = self.prune_missing_notes(&note_set).await?;
         if !pruned.is_empty() {
             stats.removed += pruned.len() as u64;
             stats.total_notes += pruned.len() as u64;
@@ -247,8 +246,8 @@ impl Indexer {
             .iter()
             .map(|entry| entry.relative_path.to_string_lossy().into_owned())
             .collect();
-        let metric_stats = self.index_metrics_inventory(&metric_inventory).await?;
         let pruned_metrics = self.prune_missing_metrics(&known_metric_paths).await?;
+        let metric_stats = self.index_metrics_inventory(&metric_inventory).await?;
         if !pruned_metrics.is_empty() {
             info!(
                 removed = pruned_metrics.len(),
@@ -271,6 +270,9 @@ impl Indexer {
             );
         }
         stats.errors += metric_stats.errors;
+        // Unchanged notes were skipped above, so their links only follow notes
+        // created, removed, or retitled since the last pass through this refresh.
+        self.refresh_links().await?;
 
         info!(
             total = stats.total_notes,
@@ -286,116 +288,207 @@ impl Indexer {
     /// Reindexes a single note identified by the given ID.
     pub async fn index_note(&self, note_id: &str) -> Result<()> {
         info!(note_id = note_id, "starting single-note indexing");
-        let inventory = self.vault.inventory()?;
-        let note_set: Arc<HashSet<String>> =
-            Arc::new(inventory.iter().map(|entry| entry.id.clone()).collect());
-        let mut resolution_maps = self.database.link_resolution_maps()?;
-        let state_table: Arc<HashMap<String, NoteIndexState>> =
-            Arc::new(self.database.note_states()?);
-        let entry = inventory
-            .iter()
-            .find(|entry| entry.id == note_id)
-            .cloned()
-            .with_context(|| format!("note {note_id} not found in vault"))?;
-
-        let note = self
+        let entry = self
             .vault
-            .load_note_from_entry(&entry)
-            .with_context(|| format!("failed to load note {note_id} for resolution hints"))?;
-        let extraction = self.metadata.extract(&note)?;
-        let aliases = extract_aliases(&extraction);
-        resolution_maps.ingest_note(&note.id, note.title.as_deref(), &aliases);
-
-        let resolution = Arc::new(ResolutionContext::new(
-            Arc::clone(&note_set),
-            resolution_maps,
+            .inventory()?
+            .into_iter()
+            .find(|entry| entry.id == note_id)
+            .with_context(|| format!("note {note_id} not found in vault"))?;
+        let targets_before = self.database.link_targets()?;
+        let resolution = Arc::new(in_flight_link_targets(
+            targets_before.clone(),
+            std::iter::once(&entry.id),
         ));
+        let states = Arc::new(self.database.note_states()?);
+        let stale_embeddings = self.stale_embeddings(&states).await?;
         let (write_tx, write_rx) = mpsc::channel(2);
-        let writer_handle = tokio::spawn(run_writer(
+        let writer = tokio::spawn(run_writer(
             Arc::clone(&self.database),
-            self.embeddings.clone(),
+            self.embedding_store(),
             write_rx,
         ));
         let outcome = self
-            .run_single(entry, resolution, state_table, write_tx.clone())
-            .await?;
-        drop(write_tx);
-        writer_handle
-            .await
-            .map_err(|err| anyhow!("writer task aborted: {err}"))??;
-
-        match outcome {
-            NoteProcessing::Indexed => {}
-            NoteProcessing::Skipped => {}
-            NoteProcessing::Removed => {
-                debug!(
-                    note_id = note_id,
-                    "note removed during single-note indexing"
-                );
-            }
+            .run_single(entry, resolution, states, stale_embeddings, write_tx)
+            .await;
+        writer.await.context("writer task aborted")??;
+        outcome?;
+        if self.database.link_targets()? != targets_before {
+            self.refresh_links().await?;
         }
         info!(note_id = note_id, "completed single-note indexing");
         Ok(())
     }
 
     /// Incrementally reindex the supplied filesystem paths.
+    ///
+    /// A path may name a note, a metrics file, or a directory, and may no
+    /// longer exist. See [`Indexer::plan_paths`].
     pub async fn reindex_paths(&self, paths: &[PathBuf]) -> Result<IndexingStats> {
-        let mut targets: HashMap<String, PathBuf> = HashMap::new();
-        let mut metric_targets: Vec<PathBuf> = Vec::new();
-        for path in paths {
-            if let Some((note_id, relative)) = self.vault.normalise_note_path(path) {
-                let absolute = self.vault.note_path(&relative);
-                targets.insert(note_id, absolute);
-                continue;
-            }
+        let plan = self.plan_paths(paths).await?;
+        self.apply_plan(plan).await
+    }
 
-            if self.vault.resolve_relative_metrics_path(path).is_some() {
-                metric_targets.push(path.clone());
-            }
+    /// Work that brings the index in line with the vault at and below `paths`.
+    ///
+    /// Every path is treated as a subtree and compared against what a full
+    /// pass would index there, whatever kind of event reported it: notes and
+    /// metrics files the full inventory has are checked for changes, and
+    /// indexed ones it no longer has are removed.
+    pub async fn plan_paths(&self, paths: &[PathBuf]) -> Result<ReindexPlan> {
+        let indexer = self.clone();
+        let paths = paths.to_vec();
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || indexer.plan_paths_blocking(&paths))
+        })
+        .await
+        .context("reindex planning task panicked")?
+    }
+
+    fn plan_paths_blocking(&self, paths: &[PathBuf]) -> Result<ReindexPlan> {
+        let ScopedInventory { scopes, entries } = self.vault.inventory_within(paths)?;
+        if scopes.is_empty() {
+            return Ok(ReindexPlan::default());
         }
+        let notes: BTreeMap<String, NoteInventoryEntry> = entries
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
+        let removed_notes = self
+            .database
+            .notes_within(&scopes)?
+            .into_iter()
+            .filter(|(id, _)| !notes.contains_key(id))
+            .map(|(id, _)| id)
+            .collect();
 
-        if targets.is_empty() && metric_targets.is_empty() {
+        // Metrics follow their own inventory, which skips none of the folders
+        // notes skip, so they are matched against the scopes directly.
+        let metrics_root = &self.vault.metrics_conventions().root;
+        let metric_scopes: Vec<&PathBuf> = scopes
+            .iter()
+            .filter(|scope| scope.starts_with(metrics_root) || metrics_root.starts_with(scope))
+            .collect();
+        let (metrics, removed_metrics) = if metric_scopes.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let within = |path: &Path| metric_scopes.iter().any(|scope| path.starts_with(scope));
+            let metrics: Vec<MetricsFileEntry> = self
+                .vault
+                .metrics_files()?
+                .into_iter()
+                .filter(|entry| within(&entry.relative_path))
+                .collect();
+            let live: HashSet<&Path> = metrics
+                .iter()
+                .map(|entry| entry.relative_path.as_path())
+                .collect();
+            let removed = self
+                .database
+                .metric_file_states()?
+                .into_keys()
+                .filter(|path| within(Path::new(path)) && !live.contains(Path::new(path)))
+                .collect();
+            (metrics, removed)
+        };
+
+        Ok(ReindexPlan {
+            notes: notes.into_values().collect(),
+            removed_notes,
+            metrics,
+            removed_metrics,
+        })
+    }
+
+    /// Carry out a plan from [`Indexer::plan_paths`].
+    pub async fn apply_plan(&self, plan: ReindexPlan) -> Result<IndexingStats> {
+        if plan.is_empty() {
             debug!("reindex_paths called with no resolvable note or metrics paths");
             return Ok(IndexingStats::default());
         }
+        let ReindexPlan {
+            notes,
+            removed_notes,
+            metrics,
+            removed_metrics,
+        } = plan;
 
-        let total = targets.len() as u64;
+        let total = (notes.len() + removed_notes.len()) as u64;
         info!(total_notes = total, "starting targeted reindex");
+        let mut stats = IndexingStats {
+            total_notes: total,
+            ..IndexingStats::default()
+        };
+        if total > 0 {
+            self.apply_note_changes(notes, removed_notes, &mut stats)
+                .await?;
+        }
 
-        let mut known_notes: HashSet<String> = self.database.list_note_ids()?.into_iter().collect();
-        for note_id in targets.keys() {
-            known_notes.insert(note_id.clone());
-        }
-        let known = Arc::new(known_notes);
-        let mut resolution_maps = self.database.link_resolution_maps()?;
-        for absolute_path in targets.values() {
-            if let Some(entry) = self.vault.inventory_entry_for_path(absolute_path)? {
-                let note = self.vault.load_note_from_entry(&entry).with_context(|| {
-                    format!("failed to load note {} for resolution hints", entry.id)
-                })?;
-                let extraction = self.metadata.extract(&note)?;
-                let aliases = extract_aliases(&extraction);
-                resolution_maps.ingest_note(&note.id, note.title.as_deref(), &aliases);
+        if !metrics.is_empty() || !removed_metrics.is_empty() {
+            // A moved file keeps its record ids, which must leave the stale path
+            // before the new one can claim them.
+            let (mut removed, mut gone) = (0, 0);
+            for relative_path in removed_metrics {
+                if self
+                    .remove_metrics_path(PathBuf::from(relative_path))
+                    .await?
+                    == MetricFileProcessing::Removed
+                {
+                    removed += 1;
+                } else {
+                    gone += 1;
+                }
             }
+            let mut metric_stats = self.index_metrics_inventory(&metrics).await?;
+            metric_stats.removed += removed;
+            metric_stats.skipped += gone;
+            info!(
+                indexed = metric_stats.indexed,
+                skipped = metric_stats.skipped,
+                removed = metric_stats.removed,
+                errors = metric_stats.errors,
+                "completed targeted metrics reindex"
+            );
+            stats.errors += metric_stats.errors;
         }
-        let resolution = Arc::new(ResolutionContext::new(Arc::clone(&known), resolution_maps));
+
+        Ok(stats)
+    }
+
+    async fn apply_note_changes(
+        &self,
+        notes: Vec<NoteInventoryEntry>,
+        removed_notes: Vec<String>,
+        stats: &mut IndexingStats,
+    ) -> Result<()> {
+        let targets_before = self.database.link_targets()?;
+        let resolution = Arc::new(in_flight_link_targets(
+            targets_before.clone(),
+            notes.iter().map(|entry| &entry.id),
+        ));
         let state_table: Arc<HashMap<String, NoteIndexState>> =
             Arc::new(self.database.note_states()?);
+        let stale_embeddings = self.stale_embeddings(&state_table).await?;
         let (write_tx, write_rx) = mpsc::channel(self.config.parallelism.max(1) * 2);
         let writer_handle = tokio::spawn(run_writer(
             Arc::clone(&self.database),
-            self.embeddings.clone(),
+            self.embedding_store(),
             write_rx,
         ));
         let semaphore = Arc::new(Semaphore::new(self.config.parallelism.max(1)));
         let mut tasks = FuturesUnordered::new();
 
         let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        let jobs = notes
+            .into_iter()
+            .map(NoteJob::Index)
+            .chain(removed_notes.into_iter().map(NoteJob::Remove));
 
-        for (note_id, absolute_path) in targets {
+        for job in jobs {
             let indexer = self.clone();
             let resolution_clone = Arc::clone(&resolution);
             let states_clone = Arc::clone(&state_table);
+            let stale_clone = Arc::clone(&stale_embeddings);
             let semaphore_clone = Arc::clone(&semaphore);
             let task_dispatch = dispatch.clone();
             let write_sender = write_tx.clone();
@@ -405,43 +498,38 @@ impl Indexer {
                         .acquire_owned()
                         .await
                         .map_err(|err| anyhow!("indexer semaphore closed: {err}"))?;
-                    let key = note_id.clone();
-                    let outcome = match indexer.vault.inventory_entry_for_path(&absolute_path) {
-                        Ok(Some(entry)) => {
-                            indexer
+                    match job {
+                        NoteJob::Index(entry) => {
+                            let key = entry.id.clone();
+                            let outcome = indexer
                                 .run_single(
                                     entry,
                                     resolution_clone,
                                     states_clone,
-                                    write_sender.clone(),
+                                    stale_clone,
+                                    write_sender,
                                 )
-                                .await
+                                .await;
+                            Ok::<_, anyhow::Error>((key, outcome))
                         }
-                        Ok(None) => {
+                        NoteJob::Remove(note_id) => {
+                            let key = note_id.clone();
                             let dispatcher =
                                 tracing::dispatcher::get_default(|current| current.clone());
-                            let indexer_clone = indexer.clone();
-                            let write_clone = write_sender.clone();
-                            tokio::task::spawn_blocking(move || {
+                            let outcome = tokio::task::spawn_blocking(move || {
                                 tracing::dispatcher::with_default(&dispatcher, || {
-                                    indexer_clone.handle_missing_note(note_id.clone(), write_clone)
+                                    indexer.handle_missing_note(note_id, write_sender)
                                 })
                             })
                             .await
-                            .map_err(|err| anyhow!("indexing task panicked: {err}"))?
+                            .map_err(|err| anyhow!("indexing task panicked: {err}"))?;
+                            Ok((key, outcome))
                         }
-                        Err(err) => Err(err),
-                    };
-                    Ok::<_, anyhow::Error>((key, outcome))
+                    }
                 };
                 tracing::dispatcher::with_default(&task_dispatch, || fut).await
             }));
         }
-
-        let mut stats = IndexingStats {
-            total_notes: total,
-            ..IndexingStats::default()
-        };
 
         while let Some(result) = tasks.next().await {
             let (note_id, outcome) = result??;
@@ -483,25 +571,30 @@ impl Indexer {
             .await
             .map_err(|err| anyhow!("writer task aborted: {err}"))??;
 
-        if !metric_targets.is_empty() {
-            let metric_stats = self.reindex_metric_paths(&metric_targets).await?;
-            if metric_stats.indexed > 0
-                || metric_stats.skipped > 0
-                || metric_stats.removed > 0
-                || metric_stats.errors > 0
-            {
-                info!(
-                    indexed = metric_stats.indexed,
-                    skipped = metric_stats.skipped,
-                    removed = metric_stats.removed,
-                    errors = metric_stats.errors,
-                    "completed targeted metrics reindex"
-                );
-            }
-            stats.errors += metric_stats.errors;
+        // Links stored on unchanged notes only need resolving again when the
+        // notes they can point at changed: a note appeared or went away, or a
+        // title or alias changed.
+        if self.database.link_targets()? != targets_before {
+            self.refresh_links().await?;
         }
+        Ok(())
+    }
 
-        Ok(stats)
+    async fn refresh_links(&self) -> Result<()> {
+        let database = Arc::clone(&self.database);
+        let dispatch = tracing::dispatcher::get_default(|current| current.clone());
+        let changed = task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || database.refresh_link_targets())
+        })
+        .await
+        .context("link refresh task panicked")??;
+        if changed > 0 {
+            info!(
+                links = changed,
+                "resolved stored links against current notes"
+            );
+        }
+        Ok(())
     }
 
     /// Remove a note from the index and associated vector stores.
@@ -581,49 +674,6 @@ impl Indexer {
         Ok(stats)
     }
 
-    async fn reindex_metric_paths(&self, paths: &[PathBuf]) -> Result<MetricPassStats> {
-        let state_table = Arc::new(self.database.metric_file_states()?);
-        let mut seen = HashSet::new();
-        let mut stats = MetricPassStats::default();
-
-        for path in paths {
-            let Some(relative_path) = self.vault.resolve_relative_metrics_path(path) else {
-                continue;
-            };
-            if !seen.insert(relative_path.clone()) {
-                continue;
-            }
-
-            match self.vault.metrics_entry_for_path(path)? {
-                Some(entry) => match self
-                    .run_single_metrics(entry, Arc::clone(&state_table))
-                    .await
-                {
-                    Ok(MetricFileProcessing::Indexed) => stats.indexed += 1,
-                    Ok(MetricFileProcessing::Skipped) => stats.skipped += 1,
-                    Ok(MetricFileProcessing::Removed) => stats.removed += 1,
-                    Err(err) => {
-                        stats.errors += 1;
-                        error!(
-                            path = %relative_path.display(),
-                            error = ?err,
-                            "failed to reindex metrics file"
-                        );
-                    }
-                },
-                None => match self.remove_metrics_path(relative_path.clone()).await? {
-                    MetricFileProcessing::Removed => stats.removed += 1,
-                    MetricFileProcessing::Skipped => stats.skipped += 1,
-                    MetricFileProcessing::Indexed => {
-                        unreachable!("metrics removal should not produce indexed outcome")
-                    }
-                },
-            }
-        }
-
-        Ok(stats)
-    }
-
     async fn prune_missing_metrics(
         &self,
         known_inventory: &HashSet<String>,
@@ -645,39 +695,38 @@ impl Indexer {
         Ok(removed)
     }
 
-    fn collect_resolution_maps(
+    /// Notes whose stored vector does not match their current text-index generation.
+    async fn stale_embeddings(
         &self,
-        inventory: &[NoteInventoryEntry],
-    ) -> Result<LinkResolutionMaps> {
-        let mut maps = self.database.link_resolution_maps()?;
-
-        for entry in inventory {
-            let note = self
-                .vault
-                .load_note_from_entry(entry)
-                .with_context(|| format!("failed to load note {}", entry.id))?;
-            let extraction = self.metadata.extract(&note)?;
-            let aliases = extract_aliases(&extraction);
-            maps.ingest_note(&note.id, note.title.as_deref(), &aliases);
+        notes: &HashMap<String, NoteIndexState>,
+    ) -> Result<Arc<HashSet<String>>> {
+        match self.embedding_store() {
+            Some(store) => Ok(Arc::new(store.stale_note_ids(notes).await?)),
+            None => Ok(Arc::default()),
         }
+    }
 
-        Ok(maps)
+    fn embedding_store(&self) -> Option<EmbeddingStore> {
+        self.embeddings
+            .as_ref()
+            .map(|pipeline| pipeline.store().clone())
     }
 
     async fn run_single(
         &self,
         entry: NoteInventoryEntry,
-        resolution: Arc<ResolutionContext>,
+        resolution: Arc<LinkTargets>,
         index_states: Arc<HashMap<String, NoteIndexState>>,
+        stale_embeddings: Arc<HashSet<String>>,
         write_tx: WriteSender,
     ) -> Result<NoteProcessing> {
-        let missing_embedding = note_requires_embedding_backfill(
-            self.embeddings.as_ref().map(|pipeline| pipeline.store()),
-            self.config.force,
-            &entry,
-            index_states.get(&entry.id),
-        )
-        .await?;
+        let missing_embedding = stale_embeddings.contains(&entry.id);
+        if missing_embedding {
+            debug!(
+                note_id = %entry.id,
+                "note embedding is missing or older than its text index; scheduling refresh"
+            );
+        }
         let indexer = self.clone();
         let dispatch = tracing::dispatcher::get_default(|current| current.clone());
         task::spawn_blocking(move || {
@@ -714,7 +763,7 @@ impl Indexer {
     fn process_note(
         &self,
         entry: &NoteInventoryEntry,
-        resolution: &ResolutionContext,
+        resolution: &LinkTargets,
         index_states: &HashMap<String, NoteIndexState>,
         write_tx: &WriteSender,
         missing_embedding: bool,
@@ -729,9 +778,13 @@ impl Indexer {
             "processing note inventory entry"
         );
 
-        let state = index_states.get(&entry.id).cloned();
-        let is_stale =
-            note_requires_reindex(self.config.force, entry, state.as_ref(), missing_embedding);
+        let is_stale = note_requires_reindex(
+            self.config.force,
+            entry,
+            index_states.get(&entry.id),
+            &note.content_fingerprint(),
+            missing_embedding,
+        );
 
         if !is_stale {
             debug!(note_id = %entry.id, "note unchanged since last index; skipping");
@@ -745,7 +798,7 @@ impl Indexer {
             wikilinks = extraction.wikilinks.len(),
             "extracted note metadata"
         );
-        let resolved_links = resolve_wikilinks(&entry.id, &extraction.wikilinks, resolution);
+        let resolved_links = resolution.resolve_links(&extraction.wikilinks);
         debug!(
             note_id = %entry.id,
             link_count = resolved_links.len(),
@@ -799,14 +852,24 @@ impl Indexer {
         index_states: &HashMap<String, MetricFileState>,
     ) -> Result<MetricFileProcessing> {
         let relative_path = entry.relative_path.to_string_lossy().into_owned();
-        let state = index_states.get(&relative_path).cloned();
-        let is_stale = if self.config.force {
-            true
-        } else if let Some(state) = state {
-            state.file_modified_at < entry.file_modified_at
-        } else {
-            true
-        };
+        let contents = fs::read(&entry.absolute_path).with_context(|| {
+            format!(
+                "failed to read metrics file {}",
+                entry.absolute_path.display()
+            )
+        })?;
+        let is_stale = self.config.force
+            || match index_states.get(&relative_path) {
+                Some(state) => {
+                    state.file_modified_at < entry.file_modified_at
+                        || state.content_fingerprint
+                            != metrics_reader_fingerprint(
+                                contents.as_slice(),
+                                &entry.absolute_path,
+                            )?
+                }
+                None => true,
+            };
 
         if !is_stale {
             debug!(
@@ -816,12 +879,13 @@ impl Indexer {
             return Ok(MetricFileProcessing::Skipped);
         }
 
-        let rows = parse_metrics_file(&entry.absolute_path).with_context(|| {
-            format!(
-                "failed to parse metrics file {}",
-                entry.absolute_path.display()
-            )
-        })?;
+        let rows =
+            parse_metrics_reader(contents.as_slice(), &entry.absolute_path).with_context(|| {
+                format!(
+                    "failed to parse metrics file {}",
+                    entry.absolute_path.display()
+                )
+            })?;
         let indexed_at = Utc::now();
         let valid_records = rows
             .iter()
@@ -895,59 +959,59 @@ enum MetricFileProcessing {
     Removed,
 }
 
-#[derive(Debug, Clone)]
-struct ResolutionContext {
-    note_ids: Arc<HashSet<String>>,
-    lowercase_ids: Arc<HashMap<String, String>>,
-    maps: Arc<LinkResolutionMaps>,
+/// What the index must change to match the vault at and below some paths.
+/// Built by [`Indexer::plan_paths`] and carried out by [`Indexer::apply_plan`].
+#[derive(Debug, Default, Clone)]
+pub struct ReindexPlan {
+    notes: Vec<NoteInventoryEntry>,
+    removed_notes: Vec<String>,
+    metrics: Vec<MetricsFileEntry>,
+    removed_metrics: Vec<String>,
 }
 
-impl ResolutionContext {
-    fn new(note_ids: Arc<HashSet<String>>, maps: LinkResolutionMaps) -> Self {
-        let lowercase_ids = note_ids
+impl ReindexPlan {
+    /// Whether the paths hold nothing to index and nothing to remove.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of notes and metrics files the plan checks or removes.
+    pub fn len(&self) -> usize {
+        self.notes.len()
+            + self.removed_notes.len()
+            + self.metrics.len()
+            + self.removed_metrics.len()
+    }
+
+    /// Ids of the notes the plan checks or removes, sorted.
+    pub fn note_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .notes
             .iter()
-            .map(|id| (normalise_link_lookup(id), id.clone()))
+            .map(|entry| entry.id.clone())
+            .chain(self.removed_notes.iter().cloned())
             .collect();
-        Self {
-            note_ids,
-            lowercase_ids: Arc::new(lowercase_ids),
-            maps: Arc::new(maps),
-        }
+        ids.sort();
+        ids
     }
+}
 
-    fn resolve(&self, candidate: &str) -> (Option<String>, LinkReason) {
-        if let Some(id) = self.resolve_direct(candidate) {
-            return (Some(id), LinkReason::Direct);
-        }
-        if let Some(id) = self.resolve_title(candidate) {
-            return (Some(id), LinkReason::Title);
-        }
-        if let Some(id) = self.resolve_alias(candidate) {
-            return (Some(id), LinkReason::Alias);
-        }
-        (None, LinkReason::Unresolved)
+/// Link targets for resolving links while a batch is written: the indexed
+/// notes plus the batch's own ids. A batch that changes titles or aliases
+/// changes the targets, so the refresh that follows it resolves those.
+fn in_flight_link_targets<'a>(
+    mut targets: LinkTargets,
+    note_ids: impl IntoIterator<Item = &'a String>,
+) -> LinkTargets {
+    for note_id in note_ids {
+        targets.insert_note(note_id, None, &[]);
     }
+    targets
+}
 
-    fn resolve_direct(&self, candidate: &str) -> Option<String> {
-        if self.note_ids.contains(candidate) {
-            return Some(candidate.to_string());
-        }
-        let key = normalise_link_lookup(candidate);
-        self.lowercase_ids.get(&key).cloned()
-    }
-
-    fn resolve_title(&self, candidate: &str) -> Option<String> {
-        let key = normalise_link_lookup(candidate);
-        self.maps.titles.get(&key).cloned()
-    }
-
-    fn resolve_alias(&self, candidate: &str) -> Option<String> {
-        let key = normalise_link_lookup(candidate);
-        match self.maps.aliases.get(&key) {
-            Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
-            _ => None,
-        }
-    }
+enum NoteJob {
+    Index(NoteInventoryEntry),
+    Remove(String),
 }
 
 fn submit_write(write_tx: &WriteSender, op: WriteOperation) -> Result<WriteAck> {
@@ -965,6 +1029,7 @@ fn note_requires_reindex(
     force: bool,
     entry: &NoteInventoryEntry,
     state: Option<&NoteIndexState>,
+    content_fingerprint: &str,
     missing_embedding: bool,
 ) -> bool {
     if force || missing_embedding {
@@ -972,46 +1037,17 @@ fn note_requires_reindex(
     }
 
     match state {
-        Some(state) => state.file_modified_at < entry.file_modified_at,
+        Some(state) => {
+            state.file_modified_at < entry.file_modified_at
+                || state.content_fingerprint != content_fingerprint
+        }
         None => true,
     }
 }
 
-async fn note_requires_embedding_backfill(
-    store: Option<&EmbeddingStore>,
-    force: bool,
-    entry: &NoteInventoryEntry,
-    state: Option<&NoteIndexState>,
-) -> Result<bool> {
-    let Some(store) = store else {
-        return Ok(false);
-    };
-
-    if force {
-        return Ok(false);
-    }
-
-    let Some(state) = state else {
-        return Ok(false);
-    };
-
-    if state.file_modified_at < entry.file_modified_at {
-        return Ok(false);
-    }
-
-    let missing_embedding = !store.has_embedding_for_note(&entry.id).await?;
-    if missing_embedding {
-        debug!(
-            note_id = %entry.id,
-            "note is indexed but missing embeddings; scheduling backfill"
-        );
-    }
-    Ok(missing_embedding)
-}
-
 async fn run_writer(
     database: Arc<IndexDatabase>,
-    embeddings: Option<Arc<EmbeddingPipeline>>,
+    embeddings: Option<EmbeddingStore>,
     mut rx: mpsc::Receiver<WriteJob>,
 ) -> Result<()> {
     let mut embedding_buffer: Vec<EmbeddingRecord> = Vec::new();
@@ -1043,7 +1079,7 @@ async fn run_writer(
         match blocking_result {
             Ok(WriterResult::Upsert { embedding }) => {
                 if let Err(err) =
-                    handle_embedding(&embeddings, &mut embedding_buffer, embedding).await
+                    handle_embedding(embeddings.as_ref(), &mut embedding_buffer, embedding).await
                 {
                     let _ = ack.send(Err(err));
                 } else {
@@ -1059,20 +1095,19 @@ async fn run_writer(
         }
     }
 
-    flush_embedding_buffer(&embeddings, &mut embedding_buffer).await?;
+    flush_embedding_buffer(embeddings.as_ref(), &mut embedding_buffer).await?;
     Ok(())
 }
 
 async fn handle_embedding(
-    pipeline: &Option<Arc<EmbeddingPipeline>>,
+    store: Option<&EmbeddingStore>,
     buffer: &mut Vec<EmbeddingRecord>,
     embedding: Option<EmbeddingRecord>,
 ) -> Result<()> {
-    if let (Some(pipeline), Some(record)) = (pipeline.as_ref(), embedding) {
+    if let (Some(store), Some(record)) = (store, embedding) {
         buffer.push(record);
         if buffer.len() >= EMBEDDING_FLUSH_BATCH {
-            pipeline
-                .store()
+            store
                 .upsert_embeddings(buffer)
                 .await
                 .with_context(|| "failed to persist note embeddings")?;
@@ -1083,13 +1118,12 @@ async fn handle_embedding(
 }
 
 async fn flush_embedding_buffer(
-    pipeline: &Option<Arc<EmbeddingPipeline>>,
+    store: Option<&EmbeddingStore>,
     buffer: &mut Vec<EmbeddingRecord>,
 ) -> Result<()> {
-    if let Some(pipeline) = pipeline.as_ref() {
+    if let Some(store) = store {
         if !buffer.is_empty() {
-            pipeline
-                .store()
+            store
                 .upsert_embeddings(buffer)
                 .await
                 .with_context(|| "failed to persist note embeddings")?;
@@ -1097,24 +1131,6 @@ async fn flush_embedding_buffer(
         }
     }
     Ok(())
-}
-
-fn extract_aliases(extraction: &MetadataExtraction) -> Vec<String> {
-    extraction
-        .metadata
-        .get("aliases")
-        .and_then(|value| match value {
-            Value::Array(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(|alias| alias.trim()))
-                    .filter(|alias| !alias.is_empty())
-                    .map(|alias| alias.to_string())
-                    .collect(),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default()
 }
 
 fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) -> String {
@@ -1147,53 +1163,6 @@ fn compose_embedding_text(note: &NoteRecord, extraction: &MetadataExtraction) ->
     }
 
     sections.join("\n\n")
-}
-
-fn resolve_wikilinks(
-    _source_id: &str,
-    links: &[WikiLink],
-    context: &ResolutionContext,
-) -> Vec<LinkResolutionRecord> {
-    links
-        .iter()
-        .map(|link| {
-            let (target, reason) = match normalise_link(&link.target) {
-                Some(candidate) => context.resolve(&candidate),
-                None => (None, LinkReason::Unresolved),
-            };
-            LinkResolutionRecord {
-                raw: link.raw.clone(),
-                target,
-                display: link.display.clone(),
-                heading: link.heading.clone(),
-                reason,
-            }
-        })
-        .collect()
-}
-
-fn normalise_link(link: &str) -> Option<String> {
-    let mut candidate =
-        normalise_relative_str(link).or_else(|| normalise_relative_path(Path::new(link)))?;
-
-    if candidate.as_os_str().is_empty() {
-        return None;
-    }
-
-    if let Some(ext) = candidate.extension() {
-        if ext.eq_ignore_ascii_case("md") {
-            candidate.set_extension("");
-        }
-    }
-
-    let value = candidate
-        .to_string_lossy()
-        .replace(char::from(b'\\'), "/")
-        .trim()
-        .trim_matches('/')
-        .to_string();
-
-    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
@@ -1352,83 +1321,373 @@ mod tests {
         let state = NoteIndexState {
             file_modified_at: entry.file_modified_at,
             indexed_at: entry.file_modified_at,
+            content_fingerprint: "indexed".to_string(),
         };
 
-        assert!(!note_requires_reindex(false, &entry, Some(&state), false));
-        assert!(note_requires_reindex(false, &entry, Some(&state), true));
+        assert!(!note_requires_reindex(
+            false,
+            &entry,
+            Some(&state),
+            "indexed",
+            false
+        ));
+        assert!(note_requires_reindex(
+            false,
+            &entry,
+            Some(&state),
+            "indexed",
+            true
+        ));
     }
 
-    #[tokio::test]
-    async fn note_requires_embedding_backfill_for_fresh_indexed_notes_without_vectors() {
-        let (vault, database, _note_path) = temp_vault_with_note();
+    fn axis_vector(dimension: usize, axis: usize) -> Vec<f32> {
+        let mut vector = vec![0.0; dimension];
+        vector[axis] = 1.0;
+        vector
+    }
+
+    fn prepared_note(
+        vault: &Vault,
+        note_id: &str,
+        indexed_at: DateTime<Utc>,
+        vector: Vec<f32>,
+    ) -> PreparedNote {
         let entry = vault
             .inventory()
             .expect("inventory")
             .into_iter()
-            .find(|entry| entry.id == "Sample")
-            .expect("sample note entry");
-        let state = NoteIndexState {
-            file_modified_at: entry.file_modified_at,
-            indexed_at: entry.file_modified_at,
-        };
+            .find(|entry| entry.id == note_id)
+            .expect("note entry");
+        let note = vault.load_note_from_entry(&entry).expect("load note");
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("extract metadata");
+        PreparedNote {
+            embedding: Some(EmbeddingRecord {
+                note_id: note.id.clone(),
+                vector,
+                indexed_at,
+            }),
+            note,
+            extraction,
+            resolved_links: Vec::new(),
+            indexed_at,
+        }
+    }
 
+    async fn send_upsert(write_tx: &WriteSender, prepared: PreparedNote) -> Result<WriteAck> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        write_tx
+            .send(WriteJob {
+                op: WriteOperation::Upsert(Box::new(prepared)),
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|err| anyhow!("writer closed: {err}"))?;
+        ack_rx.await?
+    }
+
+    async fn write_session(
+        database: &Arc<IndexDatabase>,
+        store: &EmbeddingStore,
+        prepared: PreparedNote,
+    ) -> Result<()> {
+        let (write_tx, write_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(run_writer(
+            Arc::clone(database),
+            Some(store.clone()),
+            write_rx,
+        ));
+        send_upsert(&write_tx, prepared).await?;
+        drop(write_tx);
+        writer.await?
+    }
+
+    async fn next_pass_outcome(
+        indexer: &Indexer,
+        database: &Arc<IndexDatabase>,
+        note_id: &str,
+        stale_embeddings: HashSet<String>,
+    ) -> NoteProcessing {
+        let entry = indexer
+            .vault
+            .inventory()
+            .expect("inventory")
+            .into_iter()
+            .find(|entry| entry.id == note_id)
+            .expect("note entry");
+        let mut resolution = LinkTargets::default();
+        resolution.insert_note(note_id, None, &[]);
+        let resolution = Arc::new(resolution);
+        let states = Arc::new(database.note_states().expect("note states"));
+        let (write_tx, write_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(run_writer(Arc::clone(database), None, write_rx));
+        let outcome = indexer
+            .run_single(
+                entry,
+                resolution,
+                states,
+                Arc::new(stale_embeddings),
+                write_tx,
+            )
+            .await
+            .expect("note processed");
+        writer
+            .await
+            .expect("writer joins")
+            .expect("writer succeeds");
+        outcome
+    }
+
+    #[tokio::test]
+    async fn edits_indexed_without_embeddings_are_scheduled_for_new_vectors() {
+        let (vault, database, note_path) = temp_vault_with_note();
+        let indexer = Indexer::new(
+            Arc::clone(&vault),
+            Arc::clone(&database),
+            IndexerConfig::default(),
+            None,
+        );
+        indexer.index_all().await.expect("initial index");
         let descriptor = crate::embeddings::EmbeddingDescriptor::resolve("fast")
             .expect("resolve embedding descriptor");
-        let (store, _) =
-            crate::embeddings::EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor)
-                .await
-                .expect("bootstrap embedding store");
-
-        assert!(
-            note_requires_embedding_backfill(Some(&store), false, &entry, Some(&state))
-                .await
-                .expect("backfill check"),
-            "fresh indexed note without an embedding should be reindexed"
-        );
-
-        let record = EmbeddingRecord {
-            note_id: entry.id.clone(),
-            vector: vec![0.25; descriptor.dimension()],
-            indexed_at: entry.file_modified_at,
-        };
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor)
+            .await
+            .expect("bootstrap embedding store");
+        let generation = database
+            .note_state("Sample")
+            .expect("state query")
+            .expect("state present")
+            .indexed_at;
         store
-            .upsert_embeddings(&[record])
+            .upsert_embeddings(&[EmbeddingRecord {
+                note_id: "Sample".to_string(),
+                vector: axis_vector(descriptor.dimension(), 0),
+                indexed_at: generation,
+            }])
             .await
             .expect("upsert embedding");
 
+        let stale = store
+            .stale_note_ids(&database.note_states().expect("note states"))
+            .await
+            .expect("stale check");
+        assert!(stale.is_empty());
+        assert!(matches!(
+            next_pass_outcome(&indexer, &database, "Sample", stale).await,
+            NoteProcessing::Skipped
+        ));
+
+        sleep(Duration::from_millis(10)).await;
+        fs::write(
+            &note_path,
+            "---\ncategory: temp\n---\n\n# Sample\n\nEdited while embeddings were off\n",
+        )
+        .expect("edit note");
+        indexer
+            .reindex_paths(std::slice::from_ref(&note_path))
+            .await
+            .expect("text-only reindex");
+
+        let stale = store
+            .stale_note_ids(&database.note_states().expect("note states"))
+            .await
+            .expect("stale check");
         assert!(
-            !note_requires_embedding_backfill(Some(&store), false, &entry, Some(&state))
+            stale.contains("Sample"),
+            "a text reindex without a vector must mark the old vector stale"
+        );
+        assert!(matches!(
+            next_pass_outcome(&indexer, &database, "Sample", stale).await,
+            NoteProcessing::Indexed
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_vector_flush_leaves_a_durable_repair_marker() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let vault_dir = temp_dir.path().join("vault");
+        fs::create_dir_all(&vault_dir).expect("create vault");
+        let note_path = vault_dir.join("Sample.md");
+        fs::write(&note_path, "first version").expect("write note");
+        let vault = Arc::new(Vault::new(VaultConfig::new(vault_dir)).expect("vault initialises"));
+        let db_path = temp_dir.path().join("index.db");
+        let descriptor = crate::embeddings::EmbeddingDescriptor::resolve("fast")
+            .expect("resolve embedding descriptor");
+        let dimension = descriptor.dimension();
+
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("open db"));
+        let (store, _) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor)
+            .await
+            .expect("bootstrap embedding store");
+        write_session(
+            &database,
+            &store,
+            prepared_note(&vault, "Sample", Utc::now(), axis_vector(dimension, 0)),
+        )
+        .await
+        .expect("initial write succeeds");
+        assert!(
+            store
+                .stale_note_ids(&database.note_states().expect("note states"))
                 .await
-                .expect("backfill check"),
-            "fresh indexed note with an embedding should stay skippable"
+                .expect("stale check")
+                .is_empty()
+        );
+
+        fs::write(&note_path, "second version").expect("edit note");
+        database
+            .connection()
+            .expect("connection")
+            .execute_batch(
+                "CREATE TRIGGER fail_vector_flush BEFORE INSERT ON note_embeddings_rowids
+                 BEGIN SELECT RAISE(ABORT, 'injected vector flush failure'); END;",
+            )
+            .expect("install flush failure");
+        let edited_at = Utc::now();
+        let (write_tx, write_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(run_writer(
+            Arc::clone(&database),
+            Some(store.clone()),
+            write_rx,
+        ));
+        let ack = send_upsert(
+            &write_tx,
+            prepared_note(&vault, "Sample", edited_at, axis_vector(dimension, 1)),
+        )
+        .await;
+        assert!(matches!(ack, Ok(WriteAck::Upsert)));
+        assert!(
+            store
+                .stale_note_ids(&database.note_states().expect("note states"))
+                .await
+                .expect("stale check")
+                .contains("Sample"),
+            "an acknowledged note whose vector is still buffered is already marked stale"
+        );
+        drop(write_tx);
+        let flush = writer.await.expect("writer joins");
+        let err = flush.expect_err("a failed vector flush fails the pass");
+        assert!(
+            format!("{err:#}").contains("failed to persist note embeddings"),
+            "unexpected flush error: {err:#}"
+        );
+        database
+            .connection()
+            .expect("connection")
+            .execute_batch("DROP TRIGGER fail_vector_flush")
+            .expect("remove flush failure");
+        drop(store);
+        drop(database);
+
+        let database = Arc::new(IndexDatabase::open(&db_path).expect("reopen db"));
+        let (store, changed) = EmbeddingStore::bootstrap(Arc::clone(&database), &descriptor)
+            .await
+            .expect("bootstrap embedding store");
+        assert!(!changed);
+        assert_eq!(
+            database
+                .note_state("Sample")
+                .expect("state query")
+                .expect("state present")
+                .indexed_at
+                .timestamp_micros(),
+            edited_at.timestamp_micros(),
+            "the text index kept the edit"
+        );
+        assert_eq!(
+            store.vector_for_note("Sample").await.expect("vector query"),
+            Some(axis_vector(dimension, 0)),
+            "the old vector survived the rolled-back flush"
+        );
+        assert!(
+            store
+                .stale_note_ids(&database.note_states().expect("note states"))
+                .await
+                .expect("stale check")
+                .contains("Sample"),
+            "the stale vector is still marked after reopening the index"
+        );
+
+        write_session(
+            &database,
+            &store,
+            prepared_note(&vault, "Sample", Utc::now(), axis_vector(dimension, 2)),
+        )
+        .await
+        .expect("repair write succeeds");
+        assert!(
+            store
+                .stale_note_ids(&database.note_states().expect("note states"))
+                .await
+                .expect("stale check")
+                .is_empty()
+        );
+        assert_eq!(
+            store.vector_for_note("Sample").await.expect("vector query"),
+            Some(axis_vector(dimension, 2))
         );
     }
 
     #[tokio::test]
+    async fn index_note_reports_a_failed_database_write() {
+        let (vault, database, _) = temp_vault_with_note();
+        database
+            .connection()
+            .expect("connection")
+            .execute_batch(
+                "CREATE TRIGGER fail_note_write BEFORE INSERT ON notes
+             BEGIN SELECT RAISE(ABORT, 'injected note write failure'); END;",
+            )
+            .expect("inject write failure");
+        let indexer = Indexer::new(vault, database.clone(), IndexerConfig::default(), None);
+
+        let error = indexer
+            .index_note("Sample")
+            .await
+            .expect_err("write must fail");
+        assert!(format!("{error:#}").contains("injected note write failure"));
+        assert!(database.note_state("Sample").expect("state").is_none());
+    }
+
+    #[tokio::test]
     async fn index_note_only_updates_target() {
-        let vault = fixture_vault();
-        let database = temp_db();
-        let indexer = Indexer::new(
-            vault.clone(),
-            database.clone(),
-            IndexerConfig::default(),
-            None,
-        );
-
+        let (vault, database, note_path) = temp_vault_with_note();
+        let other_path = vault.paths().root.join("Other.md");
+        fs::write(&other_path, "otheroriginal").expect("other note");
+        let indexer = Indexer::new(vault, database.clone(), IndexerConfig::default(), None);
         indexer.index_all().await.expect("initial index");
+        let other_before = database.note_state("Other").expect("other state");
 
-        let before = database.note_state("Photography Equipment").expect("state");
-        assert!(before.is_some());
-
-        // Simulate stale note by forcing reindex of single note with force config.
+        fs::write(note_path, "targetfresh").expect("change target");
+        fs::write(other_path, "otherfresh").expect("change other");
         indexer
-            .index_note("Photography Equipment")
+            .index_note("Sample")
             .await
             .expect("single note index");
 
-        let after = database.note_state("Photography Equipment").expect("state");
-        assert!(after.is_some());
-        assert!(after.unwrap().indexed_at >= before.unwrap().indexed_at);
+        let target = database
+            .search_fts("targetfresh", 10)
+            .expect("target search");
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].note_id, "Sample");
+        assert!(
+            database
+                .search_fts("otherfresh", 10)
+                .expect("other search")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .search_fts("otheroriginal", 10)
+                .expect("old other search")
+                .len(),
+            1
+        );
+        assert_eq!(
+            database.note_state("Other").expect("other state"),
+            other_before
+        );
     }
 
     #[tokio::test]
@@ -1471,7 +1730,7 @@ mod tests {
         let target: Option<String> = row.get(0).expect("read target");
         let reason: String = row.get(1).expect("read reason");
         assert_eq!(target.as_deref(), Some("Target"));
-        assert_eq!(reason, LinkReason::Alias.as_str());
+        assert_eq!(reason, crate::LinkReason::Alias.as_str());
     }
 
     #[tokio::test]

@@ -3126,6 +3126,7 @@ fn map_metrics_mutation_error(err: Error) -> ProtocolError {
         || message.contains("must live under")
         || message.contains("must be different")
         || message.contains("no metrics files were discovered")
+        || message.contains("refusing to")
     {
         ProtocolError::invalid_params(message)
     } else {

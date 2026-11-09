@@ -4,7 +4,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Once,
         atomic::{AtomicI32, AtomicUsize, Ordering},
@@ -12,12 +12,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, params, params_from_iter, types::Value as SqlValue,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value as SqlValue,
 };
 use serde_json::Value;
 use tracing::{debug, info};
@@ -25,11 +26,11 @@ use tracing::{debug, info};
 use crate::{
     MetadataMap, NoteRecord,
     embeddings::EMBEDDING_TABLE_NAME,
-    graph::{LinkResolutionRecord, normalise_link_lookup},
-    metadata::MetadataExtraction,
+    graph::{LinkReason, LinkResolutionRecord, LinkTargets, normalise_link_lookup},
+    metadata::{MetadataExtraction, WikiLink},
     metrics::{
         MetricIssueCode, MetricIssueSeverity, MetricRecord, MetricValidationIssue,
-        MetricValidationStatus, ParsedMetricRow,
+        MetricValidationStatus, ParsedMetricRow, metrics_rows_fingerprint,
     },
     metrics_service::{MetricFileSummary, MetricRecordEntry, MetricsQuery},
     query::{QueryFilters, parse_absolute_date},
@@ -45,7 +46,10 @@ static SQLITE_VEC_REGISTER: Once = Once::new();
 static SQLITE_VEC_STATUS: AtomicI32 = AtomicI32::new(rusqlite::ffi::SQLITE_OK);
 
 /// Current schema version for the Arrowhead index database.
-const INDEX_SCHEMA_VERSION: i32 = 6;
+const INDEX_SCHEMA_VERSION: i32 = 7;
+
+/// How long a connection waits for another connection's lock before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tracks existing index metadata for a note to drive staleness checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +58,8 @@ pub struct NoteIndexState {
     pub file_modified_at: DateTime<Utc>,
     /// When the note was last indexed.
     pub indexed_at: DateTime<Utc>,
+    /// [`NoteRecord::content_fingerprint`] of the indexed content.
+    pub content_fingerprint: String,
 }
 
 /// How a user-supplied note reference resolved to an indexed note.
@@ -102,6 +108,8 @@ pub struct MetricFileState {
     pub file_modified_at: DateTime<Utc>,
     /// When the metrics file was last indexed.
     pub indexed_at: DateTime<Utc>,
+    /// [`metrics_rows_fingerprint`] of the indexed rows.
+    pub content_fingerprint: String,
 }
 
 /// Wrapper around a connection pool for the SQLite index database.
@@ -112,7 +120,10 @@ pub struct IndexDatabase {
 }
 
 impl IndexDatabase {
-    /// Open (and initialise) the database at the supplied path.
+    /// Open the database at the supplied path, creating its schema, or
+    /// rebuilding it in place when an older release wrote it.
+    ///
+    /// Fails without changes when a newer release wrote the database.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         debug!(path = %path.display(), "initialising SQLite index database");
@@ -124,25 +135,8 @@ impl IndexDatabase {
             })?;
         }
 
-        if path.exists() {
-            let conn = Connection::open(&path).with_context(|| {
-                format!("failed to inspect existing database {}", path.display())
-            })?;
-            let stored_version: i32 = conn
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .context("failed to read SQLite user_version pragma")?;
-
-            if stored_version != INDEX_SCHEMA_VERSION {
-                info!(
-                    path = %path.display(),
-                    stored_version,
-                    expected_version = INDEX_SCHEMA_VERSION,
-                    "rebuilding index database due to schema version mismatch"
-                );
-                drop(conn);
-                remove_database_files(&path)?;
-            }
-        }
+        initialise_schema(&path)
+            .with_context(|| format!("failed to initialise index database {}", path.display()))?;
 
         // Pragmas are per-connection in SQLite, so every pooled connection must
         // run them: without `foreign_keys` the ON DELETE CASCADE clauses are
@@ -154,13 +148,6 @@ impl IndexDatabase {
             .connection_timeout(Duration::from_secs(120))
             .build(manager)
             .context("failed to build SQLite connection pool")?;
-
-        {
-            let conn = pool
-                .get()
-                .context("failed to obtain SQLite connection for migrations")?;
-            apply_migrations(&conn)?;
-        }
 
         let id = NEXT_DATABASE_ID.fetch_add(1, Ordering::SeqCst);
         debug!(
@@ -203,30 +190,35 @@ impl IndexDatabase {
         let conn = self.connection()?;
         let row = conn
             .query_row(
-                "SELECT file_modified_at, indexed_at FROM notes WHERE id = ?1",
+                "SELECT file_modified_at, indexed_at, content_fingerprint FROM notes WHERE id = ?1",
                 [note_id],
                 |row| {
                     let file_modified: i64 = row.get(0)?;
                     let indexed: i64 = row.get(1)?;
-                    Ok((file_modified, indexed))
+                    let fingerprint: String = row.get(2)?;
+                    Ok((file_modified, indexed, fingerprint))
                 },
             )
             .optional()
             .context("failed to query note indexing state")?;
 
-        row.map(|(file_modified, indexed)| -> Result<_> {
-            Ok(NoteIndexState {
-                file_modified_at: from_micros(file_modified)?,
-                indexed_at: from_micros(indexed)?,
-            })
-        })
+        row.map(
+            |(file_modified, indexed, content_fingerprint)| -> Result<_> {
+                Ok(NoteIndexState {
+                    file_modified_at: from_micros(file_modified)?,
+                    indexed_at: from_micros(indexed)?,
+                    content_fingerprint,
+                })
+            },
+        )
         .transpose()
     }
 
     /// Retrieve indexing state for every note as a single lookup table.
     pub fn note_states(&self) -> Result<HashMap<String, NoteIndexState>> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare("SELECT id, file_modified_at, indexed_at FROM notes")?;
+        let mut stmt = conn
+            .prepare("SELECT id, file_modified_at, indexed_at, content_fingerprint FROM notes")?;
         let mut rows = stmt.query([])?;
         let mut result = HashMap::new();
 
@@ -239,6 +231,7 @@ impl IndexDatabase {
                 NoteIndexState {
                     file_modified_at: from_micros(file_modified)?,
                     indexed_at: from_micros(indexed)?,
+                    content_fingerprint: row.get(3)?,
                 },
             );
         }
@@ -344,31 +337,37 @@ impl IndexDatabase {
         let conn = self.connection()?;
         let row = conn
             .query_row(
-                "SELECT file_modified_at, indexed_at FROM metric_files WHERE relative_path = ?1",
+                "SELECT file_modified_at, indexed_at, content_fingerprint
+                 FROM metric_files WHERE relative_path = ?1",
                 [relative_path],
                 |row| {
                     let file_modified: i64 = row.get(0)?;
                     let indexed: i64 = row.get(1)?;
-                    Ok((file_modified, indexed))
+                    let fingerprint: String = row.get(2)?;
+                    Ok((file_modified, indexed, fingerprint))
                 },
             )
             .optional()
             .context("failed to query metrics file indexing state")?;
 
-        row.map(|(file_modified, indexed)| -> Result<_> {
-            Ok(MetricFileState {
-                file_modified_at: from_micros(file_modified)?,
-                indexed_at: from_micros(indexed)?,
-            })
-        })
+        row.map(
+            |(file_modified, indexed, content_fingerprint)| -> Result<_> {
+                Ok(MetricFileState {
+                    file_modified_at: from_micros(file_modified)?,
+                    indexed_at: from_micros(indexed)?,
+                    content_fingerprint,
+                })
+            },
+        )
         .transpose()
     }
 
     /// Retrieve indexing state for every metrics file as a single lookup table.
     pub fn metric_file_states(&self) -> Result<HashMap<String, MetricFileState>> {
         let conn = self.connection()?;
-        let mut stmt =
-            conn.prepare("SELECT relative_path, file_modified_at, indexed_at FROM metric_files")?;
+        let mut stmt = conn.prepare(
+            "SELECT relative_path, file_modified_at, indexed_at, content_fingerprint FROM metric_files",
+        )?;
         let mut rows = stmt.query([])?;
         let mut result = HashMap::new();
 
@@ -381,6 +380,7 @@ impl IndexDatabase {
                 MetricFileState {
                     file_modified_at: from_micros(file_modified)?,
                     indexed_at: from_micros(indexed)?,
+                    content_fingerprint: row.get(3)?,
                 },
             );
         }
@@ -541,6 +541,34 @@ impl IndexDatabase {
         Ok(ids)
     }
 
+    /// Indexed notes whose files lie at or below any of `scopes`, as note id
+    /// and vault-relative path. The empty scope is the whole vault.
+    pub fn notes_within(&self, scopes: &[PathBuf]) -> Result<Vec<(String, PathBuf)>> {
+        let conn = self.connection()?;
+        let mut all = conn.prepare_cached("SELECT id, relative_path FROM notes")?;
+        let mut range = conn.prepare_cached(
+            "SELECT id, relative_path FROM notes WHERE relative_path >= ?1 AND relative_path < ?2",
+        )?;
+        let mut found = Vec::new();
+        for scope in scopes {
+            let prefix = scope.to_string_lossy();
+            // '0' follows '/', so the range holds the scope and everything inside
+            // it, plus names that merely start with it, which the filter drops.
+            let mut rows = if prefix.is_empty() {
+                all.query([])?
+            } else {
+                range.query(params![prefix, format!("{prefix}0")])?
+            };
+            while let Some(row) = rows.next()? {
+                let path = PathBuf::from(row.get::<_, String>(1)?);
+                if path.starts_with(scope) {
+                    found.push((row.get(0)?, path));
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Return the number of notes currently stored in the index.
     pub fn note_count(&self) -> Result<u64> {
         let conn = self.connection()?;
@@ -604,58 +632,52 @@ impl IndexDatabase {
         Ok(None)
     }
 
-    /// Load resolution hints to support WikiLink matching (titles and aliases).
-    pub fn link_resolution_maps(&self) -> Result<LinkResolutionMaps> {
+    /// The notes stored links can resolve to, with their titles and aliases.
+    pub fn link_targets(&self) -> Result<LinkTargets> {
         let conn = self.connection()?;
-        let mut maps = LinkResolutionMaps::default();
+        load_link_targets(&conn)
+    }
 
-        {
-            let mut stmt = conn.prepare("SELECT id, title FROM notes WHERE title IS NOT NULL")?;
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next()? {
-                let id: String = row.get(0)?;
-                let title: String = row.get(1)?;
-                let key = normalise_link_lookup(&title);
-                if !key.is_empty() {
-                    maps.titles.entry(key).or_insert(id);
-                }
-            }
-        }
+    /// Resolve every stored WikiLink again against the notes now in the index.
+    ///
+    /// Only the target and reason change; raw text, heading, and display text
+    /// stay as extracted, and no note is re-read. Returns how many links changed.
+    pub fn refresh_link_targets(&self) -> Result<usize> {
+        let mut conn = self.connection_for_thread()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("failed to start link refresh transaction")?;
+        let targets = load_link_targets(&tx)?;
 
+        let mut changed = Vec::new();
         {
             let mut stmt =
-                conn.prepare("SELECT note_id, value FROM metadata WHERE key = 'aliases'")?;
+                tx.prepare("SELECT rowid, raw_text, target_id, reason FROM note_links")?;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                let note_id: String = row.get(0)?;
-                let raw_value: String = row.get(1)?;
-                match serde_json::from_str::<Value>(&raw_value)? {
-                    Value::Array(items) => {
-                        for item in items {
-                            if let Value::String(alias) = item {
-                                let key = normalise_link_lookup(&alias);
-                                if key.is_empty() {
-                                    continue;
-                                }
-                                let entry = maps.aliases.entry(key).or_default();
-                                if !entry.iter().any(|existing| existing == &note_id) {
-                                    entry.push(note_id.clone());
-                                }
-                            }
-                        }
-                    }
-                    Value::Null => {}
-                    _ => {
-                        debug!(
-                            note_id = %note_id,
-                            "skipping non-array aliases metadata while building resolution maps"
-                        );
-                    }
+                let raw: String = row.get(1)?;
+                let stored_target: Option<String> = row.get(2)?;
+                let stored_reason: String = row.get(3)?;
+                let (target, reason) = match WikiLink::parse(&raw) {
+                    Some(link) => targets.resolve(&link.target),
+                    None => (None, LinkReason::Unresolved),
+                };
+                if target != stored_target || reason.as_str() != stored_reason {
+                    changed.push((row.get::<_, i64>(0)?, target, reason));
                 }
             }
         }
 
-        Ok(maps)
+        for (rowid, target, reason) in &changed {
+            tx.execute(
+                "UPDATE note_links SET target_id = ?1, reason = ?2 WHERE rowid = ?3",
+                params![target.as_deref(), reason.as_str(), rowid],
+            )
+            .context("failed to update link resolution")?;
+        }
+        tx.commit()
+            .context("failed to commit link refresh transaction")?;
+        Ok(changed.len())
     }
 
     /// Remove a note and all associated text, metadata, link, and vector rows.
@@ -690,8 +712,8 @@ impl IndexDatabase {
 
         if affected > 0 {
             tx.execute(
-                "UPDATE note_links SET target_id = NULL WHERE target_id = ?1",
-                [note_id],
+                "UPDATE note_links SET target_id = NULL, reason = ?2 WHERE target_id = ?1",
+                params![note_id, LinkReason::Unresolved.as_str()],
             )
             .context("failed to clear backlinks for removed note")?;
         }
@@ -736,15 +758,17 @@ impl IndexDatabase {
                 row_count,
                 record_count,
                 warning_count,
-                error_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                error_count,
+                content_fingerprint
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(relative_path) DO UPDATE SET
                 file_modified_at = excluded.file_modified_at,
                 indexed_at = excluded.indexed_at,
                 row_count = excluded.row_count,
                 record_count = excluded.record_count,
                 warning_count = excluded.warning_count,
-                error_count = excluded.error_count",
+                error_count = excluded.error_count,
+                content_fingerprint = excluded.content_fingerprint",
             params![
                 relative_path,
                 file_modified_at.timestamp_micros(),
@@ -753,6 +777,7 @@ impl IndexDatabase {
                 record_count,
                 warning_count,
                 error_count,
+                metrics_rows_fingerprint(rows),
             ],
         )
         .context("failed to upsert metric file row")?;
@@ -903,20 +928,22 @@ impl IndexDatabase {
         let tx = conn.transaction().context("failed to start transaction")?;
 
         tx.execute(
-            "INSERT INTO notes (id, title, relative_path, file_modified_at, indexed_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO notes (id, title, relative_path, file_modified_at, indexed_at, created_at, content_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                  title = excluded.title,
                  relative_path = excluded.relative_path,
                  file_modified_at = excluded.file_modified_at,
-                 indexed_at = excluded.indexed_at",
+                 indexed_at = excluded.indexed_at,
+                 content_fingerprint = excluded.content_fingerprint",
             params![
                 &note.id,
                 note.title.as_deref(),
                 note.relative_path.to_string_lossy(),
                 note.file_modified_at.timestamp_micros(),
                 indexed_at.timestamp_micros(),
-                note.created_at.map(|dt| dt.timestamp_micros())
+                note.created_at.map(|dt| dt.timestamp_micros()),
+                note.content_fingerprint(),
             ],
         )
         .context("failed to upsert notes row")?;
@@ -977,15 +1004,18 @@ impl IndexDatabase {
 
     /// Execute a full-text search query against the FTS index without additional filters.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsMatch>> {
-        self.search_fts_with_filters(query, limit, &QueryFilters::default())
+        self.search_fts_with_filters(query, limit, &QueryFilters::default(), &[])
     }
 
     /// Execute a full-text search query with optional filesystem and metadata filters.
+    ///
+    /// Notes matching any `excludes` FTS expression are dropped before `limit` applies.
     pub fn search_fts_with_filters(
         &self,
         query: &str,
         limit: usize,
         filters: &QueryFilters,
+        excludes: &[String],
     ) -> Result<Vec<FtsMatch>> {
         let limit = limit.max(1) as i64;
         let conn = self.connection()?;
@@ -1000,6 +1030,7 @@ impl IndexDatabase {
 
         let mut params: Vec<SqlValue> = vec![SqlValue::from(query.to_string())];
         Self::append_filter_clauses(&mut sql, &mut params, filters);
+        Self::append_exclusion_clauses(&mut sql, &mut params, excludes);
 
         sql.push_str(" ORDER BY rank ASC LIMIT ?");
         params.push(SqlValue::from(limit));
@@ -1070,10 +1101,18 @@ impl IndexDatabase {
     }
 
     /// Retrieve note identifiers that satisfy the supplied filters, ordered by modified time.
-    pub fn notes_for_filters(&self, filters: &QueryFilters, limit: usize) -> Result<Vec<String>> {
+    ///
+    /// Notes matching any `excludes` FTS expression are dropped before `limit` applies.
+    pub fn notes_for_filters(
+        &self,
+        filters: &QueryFilters,
+        excludes: &[String],
+        limit: usize,
+    ) -> Result<Vec<String>> {
         let mut sql = String::from("SELECT n.id FROM notes n WHERE 1 = 1");
         let mut params: Vec<SqlValue> = Vec::new();
         Self::append_filter_clauses(&mut sql, &mut params, filters);
+        Self::append_exclusion_clauses(&mut sql, &mut params, excludes);
         sql.push_str(" ORDER BY n.file_modified_at DESC, n.id ASC");
 
         let limit = limit.max(1) as i64;
@@ -1131,6 +1170,13 @@ impl IndexDatabase {
             }
 
             sql.push(')');
+        }
+    }
+
+    fn append_exclusion_clauses(sql: &mut String, params: &mut Vec<SqlValue>, excludes: &[String]) {
+        for expr in excludes {
+            sql.push_str(" AND n.id NOT IN (SELECT id FROM notes_fts WHERE notes_fts MATCH ?)");
+            params.push(SqlValue::from(expr.clone()));
         }
     }
 
@@ -1247,11 +1293,110 @@ impl IndexDatabase {
 }
 
 fn init_connection(conn: &mut Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
     Ok(())
+}
+
+/// Bring the database at `path` to [`INDEX_SCHEMA_VERSION`] without replacing
+/// the file.
+///
+/// The daemon, CLI, and MCP server share this file. A process whose
+/// connections still point at a replaced file writes where no one reads, so
+/// an older schema is rebuilt in place. One `BEGIN IMMEDIATE` transaction
+/// drops every table and creates the current ones. Concurrent openers wait
+/// for that write lock, read the version again, and find the work done. A
+/// current schema takes no write lock at all.
+fn initialise_schema(path: &Path) -> Result<()> {
+    let mut conn = Connection::open(path).context("failed to open database file")?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .context("failed to set SQLite busy timeout")?;
+    let stored = stored_schema_version(&conn)?;
+    // The bundled SQLite enforces foreign keys by default, and then dropping a
+    // parent table first deletes its rows one by one through every cascade.
+    conn.pragma_update(None, "foreign_keys", false)
+        .context("failed to disable foreign keys for schema initialisation")?;
+    enable_wal(&conn).context("failed to enable WAL journal mode")?;
+
+    if stored == INDEX_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to lock database for schema initialisation")?;
+    let stored = stored_schema_version(&tx)?;
+    if stored == INDEX_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let dropped = drop_tables(&tx)?;
+    if dropped > 0 {
+        info!(
+            path = %path.display(),
+            stored_version = stored,
+            expected_version = INDEX_SCHEMA_VERSION,
+            dropped_tables = dropped,
+            "rebuilding index database in place due to schema version mismatch"
+        );
+    }
+    apply_migrations(&tx)?;
+    tx.commit()
+        .context("failed to commit schema initialisation")
+}
+
+/// Switch the database to WAL, which persists in the file.
+///
+/// Converting a new file reads its header and then upgrades to the write lock.
+/// When another opener holds that lock while converting the same file, SQLite
+/// fails the upgrade at once instead of calling the busy handler. An empty
+/// write transaction waits for that opener; the second attempt then finds the
+/// file in WAL mode and only reads.
+fn enable_wal(conn: &Connection) -> rusqlite::Result<()> {
+    match conn.pragma_update(None, "journal_mode", "WAL") {
+        Err(err) if err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) => {
+            conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")?;
+            conn.pragma_update(None, "journal_mode", "WAL")
+        }
+        result => result,
+    }
+}
+
+/// The schema version stored in the database. Fails on a newer version,
+/// because a newer release owns those tables and may be using them now.
+fn stored_schema_version(conn: &Connection) -> Result<i32> {
+    let stored: i32 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .context("failed to read SQLite user_version pragma")?;
+    if stored > INDEX_SCHEMA_VERSION {
+        bail!(
+            "index schema version {stored} is newer than version {INDEX_SCHEMA_VERSION}, \
+             the newest this arrowhead supports; upgrade arrowhead to open this index"
+        );
+    }
+    Ok(stored)
+}
+
+/// Drop every table, virtual tables first so each removes its own shadow
+/// tables. Returns how many tables were dropped.
+fn drop_tables(conn: &Connection) -> Result<usize> {
+    let mut dropped = 0;
+    for kind in ["virtual", "table"] {
+        let names = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM pragma_table_list
+                 WHERE schema = 'main' AND type = ?1 AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+            )?;
+            stmt.query_map([kind], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for name in names {
+            conn.execute(&format!("DROP TABLE \"{}\"", name.replace('"', "\"\"")), [])
+                .with_context(|| format!("failed to drop table {name}"))?;
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
@@ -1263,8 +1408,11 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             relative_path TEXT NOT NULL,
             file_modified_at INTEGER NOT NULL,
             indexed_at INTEGER NOT NULL,
-            created_at INTEGER
+            created_at INTEGER,
+            content_fingerprint TEXT NOT NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_notes_relative_path ON notes(relative_path);
 
         CREATE TABLE IF NOT EXISTS metadata (
             note_id TEXT NOT NULL,
@@ -1323,7 +1471,8 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
             row_count INTEGER NOT NULL,
             record_count INTEGER NOT NULL,
             warning_count INTEGER NOT NULL,
-            error_count INTEGER NOT NULL
+            error_count INTEGER NOT NULL,
+            content_fingerprint TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS metric_records (
@@ -1389,36 +1538,6 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
 
     conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)
         .context("failed to set schema version")
-}
-
-/// Remove a SQLite database along with its WAL/SHM companion files.
-///
-/// The database runs in WAL mode, so deleting only the main file can leave a
-/// stale `-wal` journal behind that SQLite would replay into a freshly created
-/// database of the same name.
-fn remove_database_files(path: &Path) -> Result<()> {
-    fs::remove_file(path)
-        .with_context(|| format!("failed to remove incompatible database {}", path.display()))?;
-
-    for suffix in ["-wal", "-shm"] {
-        let mut companion = path.as_os_str().to_os_string();
-        companion.push(suffix);
-        let companion = std::path::PathBuf::from(companion);
-        match fs::remove_file(&companion) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to remove stale database companion {}",
-                        companion.display()
-                    )
-                });
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn ensure_sqlite_vec_registered() -> Result<()> {
@@ -1931,13 +2050,51 @@ fn collect_dates_from_value(key: &str, value: &Value, output: &mut Vec<(String, 
     }
 }
 
+/// Every indexed note with its title and the aliases from its frontmatter.
+fn load_link_targets(conn: &Connection) -> Result<LinkTargets> {
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT note_id, value FROM metadata WHERE key = 'aliases'")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let note_id: String = row.get(0)?;
+            let raw_value: String = row.get(1)?;
+            match serde_json::from_str::<Value>(&raw_value)? {
+                Value::Array(items) => aliases.entry(note_id).or_default().extend(
+                    items
+                        .into_iter()
+                        .filter_map(|item| item.as_str().map(str::to_string)),
+                ),
+                Value::Null => {}
+                _ => debug!(
+                    note_id = %note_id,
+                    "skipping non-array aliases metadata while loading link targets"
+                ),
+            }
+        }
+    }
+
+    let mut targets = LinkTargets::default();
+    let mut stmt = conn.prepare("SELECT id, title FROM notes")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let title: Option<String> = row.get(1)?;
+        let note_aliases = aliases.get(&id).map(Vec::as_slice).unwrap_or_default();
+        targets.insert_note(&id, title.as_deref(), note_aliases);
+    }
+    Ok(targets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::{
         io::Cursor,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Barrier},
+        thread,
     };
 
     use chrono::Utc;
@@ -1950,6 +2107,87 @@ mod tests {
         metrics::parse_metrics_reader,
         vault::{Vault, VaultConfig},
     };
+
+    #[test]
+    fn link_refresh_waits_for_a_concurrent_writer_and_uses_its_committed_targets() {
+        use std::{sync::mpsc, thread};
+
+        let dir = tempfile::tempdir().expect("temp database");
+        let database = Arc::new(IndexDatabase::open(dir.path().join("index.db")).expect("open"));
+        let now = Utc::now();
+        let source = NoteRecord::new("Source", "Source.md", now, "[[Shared]]".to_string());
+        let mut target = NoteRecord::new("Target", "Target.md", now, String::new());
+        target.title = Some("Shared".to_string());
+        let mut current = NoteRecord::new("Current", "Current.md", now, String::new());
+        current.title = Some("Other title".to_string());
+        database
+            .upsert_note(
+                &source,
+                &MetadataExtraction::default(),
+                &[LinkResolutionRecord {
+                    raw: "Shared".to_string(),
+                    target: None,
+                    display: None,
+                    heading: None,
+                    reason: LinkReason::Unresolved,
+                }],
+                now,
+            )
+            .expect("source");
+        database
+            .upsert_note(&target, &MetadataExtraction::default(), &[], now)
+            .expect("target");
+        database
+            .upsert_note(&current, &MetadataExtraction::default(), &[], now)
+            .expect("current target");
+
+        let mut connection = database.connection().expect("writer connection");
+        let writer = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("writer transaction");
+        writer
+            .execute(
+                "UPDATE notes SET title = 'Old title' WHERE id = 'Target'",
+                [],
+            )
+            .expect("change title");
+        writer
+            .execute("UPDATE notes SET title = 'Shared' WHERE id = 'Current'", [])
+            .expect("move title");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader_database = Arc::clone(&database);
+        let refresh = thread::spawn(move || {
+            started_tx.send(()).expect("signal refresh");
+            result_tx
+                .send(reader_database.refresh_link_targets())
+                .expect("send refresh result");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("refresh started");
+        let early = result_rx.recv_timeout(Duration::from_millis(100));
+        writer.commit().expect("commit concurrent change");
+        let result = match early {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("refresh completed"),
+            Err(error) => panic!("refresh disconnected: {error}"),
+        };
+        refresh.join().expect("refresh joins");
+        assert_eq!(result.expect("refresh must survive a concurrent writer"), 1);
+        let link: (Option<String>, String) = database
+            .connection()
+            .expect("connection")
+            .query_row(
+                "SELECT target_id, reason FROM note_links WHERE source_id = 'Source'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("resolved link");
+        assert_eq!(link, (Some("Current".to_string()), "title".to_string()));
+    }
 
     fn fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2033,6 +2271,10 @@ mod tests {
                 .pragma_query_value(None, "foreign_keys", |row| row.get(0))
                 .expect("read foreign_keys");
             assert_eq!(foreign_keys, 1, "foreign key enforcement must be enabled");
+            let journal_mode: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("read journal_mode");
+            assert_eq!(journal_mode, "wal", "every connection must use the WAL");
             held.push(conn);
         }
     }
@@ -2080,25 +2322,260 @@ mod tests {
         }
     }
 
+    fn write_note(db: &IndexDatabase, id: &str) {
+        let note = NoteRecord::new(
+            id,
+            format!("{id}.md"),
+            Utc::now(),
+            format!("text of {id}\n"),
+        );
+        let extraction = MetadataExtractor::new()
+            .extract(&note)
+            .expect("metadata extracts");
+        db.upsert_note(&note, &extraction, &[], Utc::now())
+            .expect("note upserts");
+    }
+
+    fn sorted_note_ids(db: &IndexDatabase) -> Vec<String> {
+        let mut ids = db.list_note_ids().expect("list note ids");
+        ids.sort();
+        ids
+    }
+
+    fn stored_version(conn: &Connection) -> i32 {
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read user_version")
+    }
+
+    /// The tables of a schema 6 index that version 7 must replace: `notes`
+    /// without `content_fingerprint`, the FTS table, and a sqlite-vec table.
+    fn write_schema_6_index(path: &Path) {
+        ensure_sqlite_vec_registered().expect("sqlite-vec registers");
+        let conn = Connection::open(path).expect("raw connection");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("enable WAL");
+        conn.execute_batch(
+            "CREATE TABLE notes (
+                 id TEXT PRIMARY KEY,
+                 title TEXT,
+                 relative_path TEXT NOT NULL,
+                 file_modified_at INTEGER NOT NULL,
+                 indexed_at INTEGER NOT NULL,
+                 created_at INTEGER
+             );
+             CREATE VIRTUAL TABLE notes_fts USING fts5(
+                 id UNINDEXED, content, metadata, tokenize = 'porter unicode61', columnsize = 0
+             );
+             CREATE VIRTUAL TABLE note_embeddings USING vec0(
+                 note_id TEXT, vector FLOAT[2] distance_metric=cosine, model TEXT, indexed_at INTEGER
+             );
+             INSERT INTO notes VALUES ('legacy', NULL, 'legacy.md', 0, 0, NULL);
+             INSERT INTO notes_fts (id, content, metadata) VALUES ('legacy', 'legacy text', '');
+             INSERT INTO note_embeddings (note_id, vector, model, indexed_at)
+                 VALUES ('legacy', '[0.5, 0.5]', 'old-model', 0);
+             PRAGMA user_version = 6;",
+        )
+        .expect("write schema 6 index");
+    }
+
     #[test]
-    fn remove_database_files_deletes_wal_companions() {
+    fn upgrade_rebuilds_the_database_other_connections_have_open() {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("index.db");
-        let wal_path = dir.path().join("index.db-wal");
-        let shm_path = dir.path().join("index.db-shm");
-        fs::write(&db_path, b"db").expect("write db");
-        fs::write(&wal_path, b"wal").expect("write wal");
-        fs::write(&shm_path, b"shm").expect("write shm");
+        write_schema_6_index(&db_path);
+        // Another process using the old index, such as a running daemon.
+        let observer = Connection::open(&db_path).expect("observer connection");
+        assert_eq!(stored_version(&observer), 6);
 
-        remove_database_files(&db_path).expect("removal succeeds");
-        assert!(!db_path.exists());
-        assert!(!wal_path.exists());
-        assert!(!shm_path.exists());
+        let db = IndexDatabase::open(&db_path).expect("schema 6 index upgrades");
+        write_note(&db, "fresh");
 
-        // Missing companions must not be treated as errors.
-        fs::write(&db_path, b"db").expect("rewrite db");
-        remove_database_files(&db_path).expect("removal without companions succeeds");
-        assert!(!db_path.exists());
+        assert_eq!(stored_version(&observer), INDEX_SCHEMA_VERSION);
+        let mut stmt = observer
+            .prepare("SELECT id FROM notes")
+            .expect("observer reads notes");
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("query notes")
+            .collect::<rusqlite::Result<_>>()
+            .expect("read notes");
+        assert_eq!(
+            ids,
+            vec!["fresh".to_string()],
+            "the upgrade must rebuild the database other connections hold, not a new file"
+        );
+    }
+
+    #[test]
+    fn open_waits_for_a_concurrent_initialiser_instead_of_replacing_its_database() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        // Another opener partway through creating the index holds the write
+        // lock, with one table written and the version still 0.
+        let initialiser = Connection::open(&db_path).expect("initialiser connection");
+        initialiser
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("enable WAL");
+        initialiser
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE notes (id TEXT PRIMARY KEY);")
+            .expect("start initialising");
+
+        let path = db_path.clone();
+        let opener = thread::spawn(move || IndexDatabase::open(path));
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !opener.is_finished(),
+            "open must wait for the initialiser's write lock"
+        );
+
+        // The initialiser fails; the waiting opener then creates the schema itself.
+        initialiser.execute_batch("ROLLBACK").expect("roll back");
+        let db = opener
+            .join()
+            .expect("opener thread")
+            .expect("open succeeds once the lock is released");
+        write_note(&db, "after");
+
+        assert_eq!(stored_version(&initialiser), INDEX_SCHEMA_VERSION);
+        let visible: i64 = initialiser
+            .query_row("SELECT COUNT(*) FROM notes WHERE id = 'after'", [], |row| {
+                row.get(0)
+            })
+            .expect("count notes");
+        assert_eq!(
+            visible, 1,
+            "the initialiser's connection must see the opener's database"
+        );
+    }
+
+    /// Open `path` from `openers` threads, each starting `stagger` after the
+    /// previous one, and write one note through each handle.
+    fn open_concurrently(path: &Path, openers: usize, stagger: Duration) -> Vec<IndexDatabase> {
+        let barrier = Arc::new(Barrier::new(openers));
+        let threads: Vec<_> = (0..openers)
+            .map(|i| {
+                let (path, barrier) = (path.to_path_buf(), Arc::clone(&barrier));
+                thread::spawn(move || {
+                    barrier.wait();
+                    thread::sleep(stagger * i as u32);
+                    let db = IndexDatabase::open(&path).expect("concurrent open succeeds");
+                    write_note(&db, &format!("note-{i}"));
+                    db
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|handle| handle.join().expect("opener thread"))
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_first_opens_share_one_database() {
+        // Simultaneous starts race to switch the new file to WAL. Staggered
+        // starts make later openers arrive while an earlier one initialises it.
+        for stagger in [Duration::ZERO, Duration::from_micros(250)] {
+            let dir = TempDir::new().expect("tempdir");
+            let db_path = dir.path().join(".arrowhead/index.db");
+            let databases = open_concurrently(&db_path, 8, stagger);
+
+            let expected: Vec<String> = (0..8).map(|i| format!("note-{i}")).collect();
+            let reopened = IndexDatabase::open(&db_path).expect("reopen");
+            for db in databases.iter().chain([&reopened]) {
+                assert_eq!(
+                    sorted_note_ids(db),
+                    expected,
+                    "every opener must write to and read from one database"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_upgrades_rebuild_once_and_keep_every_later_write() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        write_schema_6_index(&db_path);
+        let databases = open_concurrently(&db_path, 6, Duration::ZERO);
+
+        let expected: Vec<String> = (0..6).map(|i| format!("note-{i}")).collect();
+        let reopened = IndexDatabase::open(&db_path).expect("reopen");
+        for db in databases.iter().chain([&reopened]) {
+            assert_eq!(
+                sorted_note_ids(db),
+                expected,
+                "no opener may rebuild over another opener's accepted write"
+            );
+        }
+    }
+
+    #[test]
+    fn uncommitted_rebuild_leaves_the_previous_index_usable() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("index.db");
+        write_schema_6_index(&db_path);
+        let mut conn = Connection::open(&db_path).expect("raw connection");
+        {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("lock database");
+            assert!(drop_tables(&tx).expect("drop tables") > 0);
+            apply_migrations(&tx).expect("create schema");
+            // Dropped without COMMIT, as when the process dies mid-rebuild.
+        }
+
+        assert_eq!(stored_version(&conn), 6);
+        for (sql, what) in [
+            ("SELECT COUNT(*) FROM notes WHERE id = 'legacy'", "note row"),
+            (
+                "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'legacy'",
+                "FTS match",
+            ),
+            (
+                "SELECT COUNT(*) FROM note_embeddings WHERE note_id = 'legacy'",
+                "vector row",
+            ),
+        ] {
+            let count: i64 = conn
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap_or_else(|err| panic!("{what} must still be readable: {err}"));
+            assert_eq!(count, 1, "{what} must survive the aborted rebuild");
+        }
+
+        let db = IndexDatabase::open(&db_path).expect("the next open upgrades");
+        assert!(sorted_note_ids(&db).is_empty());
+    }
+
+    #[test]
+    fn newer_schema_is_refused_and_left_untouched() {
+        for journal_mode in ["wal", "delete"] {
+            let dir = TempDir::new().expect("tempdir");
+            let db_path = dir.path().join("index.db");
+            write_schema_6_index(&db_path);
+            let newer = INDEX_SCHEMA_VERSION + 1;
+            let conn = Connection::open(&db_path).expect("raw connection");
+            conn.pragma_update(None, "journal_mode", journal_mode)
+                .expect("set journal mode");
+            conn.pragma_update(None, "user_version", newer)
+                .expect("set newer version");
+
+            IndexDatabase::open(&db_path)
+                .expect_err("an older build must not rebuild a newer index");
+
+            assert_eq!(stored_version(&conn), newer);
+            let mode: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("read journal mode");
+            assert_eq!(mode, journal_mode, "refusal must not change journal mode");
+            let kept: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM notes WHERE id = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count notes");
+            assert_eq!(kept, 1, "the newer index must keep its rows");
+        }
     }
 
     #[test]
@@ -2629,41 +3106,6 @@ mod tests {
     }
 
     #[test]
-    fn rebuilds_database_when_schema_version_changes() {
-        let dir = TempDir::new().expect("tempdir");
-        let db_path = dir.path().join("index.db");
-
-        {
-            let db = IndexDatabase::open(&db_path).expect("database opens");
-            let note = load_note("Photography Equipment");
-            let extraction = MetadataExtractor::new()
-                .extract(&note)
-                .expect("extract succeeds");
-            let resolved_links = make_resolved_links(&extraction);
-            db.upsert_note(&note, &extraction, &resolved_links, Utc::now())
-                .expect("upsert succeeds");
-        }
-
-        {
-            let conn = Connection::open(&db_path).expect("open raw connection");
-            conn.pragma_update(None, "user_version", 999)
-                .expect("set bogus version");
-        }
-
-        let db = IndexDatabase::open(&db_path).expect("database rebuilds");
-        let conn = db.connection().expect("connection available");
-        let version: i32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .expect("read schema version");
-        assert_eq!(version, INDEX_SCHEMA_VERSION);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
-            .expect("count notes");
-        assert_eq!(count, 0, "incompatible database should be cleared");
-    }
-
-    #[test]
     fn metadata_for_notes_returns_expected_fields() {
         let dir = TempDir::new().expect("tempdir");
         let db = IndexDatabase::open(dir.path().join("index.db")).expect("database opens");
@@ -2752,12 +3194,4 @@ mod tests {
         assert!(matches[0].rank.is_finite());
         assert!(matches[0].snippet.is_some());
     }
-}
-/// Cached lookup tables used when resolving WikiLinks.
-#[derive(Debug, Default, Clone)]
-pub struct LinkResolutionMaps {
-    /// Lower-cased note titles mapped to note identifiers.
-    pub titles: HashMap<String, String>,
-    /// Lower-cased aliases mapped to note identifiers (multiple entries when ambiguous).
-    pub aliases: HashMap<String, Vec<String>>,
 }

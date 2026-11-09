@@ -4,11 +4,15 @@
 //! lookup and id checks through the file write and index refresh, so concurrent Arrowhead
 //! writers in one process or across processes never lose each other's changes. Editors and
 //! scripts that write metrics files without Arrowhead do not take this lock.
+//!
+//! Every metrics file read, write, rename, delete, and empty-folder cleanup goes through
+//! [`contained_fs`], so none of them follows a symbolic link. Changes also require the exact
+//! spelling of existing entries. See `docs/vault_write_containment.md`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Write},
+    io::{self, BufReader},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -22,7 +26,9 @@ use tokio::task;
 
 use crate::{
     MetricIssueSeverity, MetricRecord, MetricRecordEntry, MetricValidationIssue, ParsedMetricRow,
-    Vault, parse_metrics_file, parse_metrics_line, sqlite::IndexDatabase,
+    Vault, parse_metrics_line, parse_metrics_reader,
+    sqlite::IndexDatabase,
+    vault::contained_fs::{self, Refusal},
 };
 
 /// Patch semantics for update operations.
@@ -275,7 +281,6 @@ impl MetricsMutationService {
 #[derive(Debug, Clone)]
 struct LocatedMetricRow {
     relative_path: PathBuf,
-    absolute_path: PathBuf,
     rows: Vec<ParsedMetricRow>,
     row_index: usize,
 }
@@ -285,7 +290,7 @@ fn create_record(
     database: &IndexDatabase,
     input: MetricCreateRequest,
 ) -> Result<MetricRecordEntry> {
-    let (relative_path, absolute_path) = resolve_write_target(vault, input.file.as_deref())?;
+    let relative_path = resolve_write_target(vault, input.file.as_deref())?;
     let metric_id = input.id.unwrap_or_else(generate_metric_id);
     ensure_metric_id_available(vault, &metric_id)?;
 
@@ -303,8 +308,8 @@ fn create_record(
         tags: normalise_tags(input.tags),
         extra_fields: input.extra_fields,
     };
-    let raw_line = render_validated_metric_line(&record, &absolute_path)?;
-    append_metric_line(&absolute_path, &raw_line)?;
+    let raw_line = render_validated_metric_line(&record, &vault.note_path(&relative_path))?;
+    append_metric_line(vault, &relative_path, &raw_line)?;
     refresh_index_for_file(vault, database, &relative_path)?;
 
     database.metric_record_by_id(&metric_id)?.ok_or_else(|| {
@@ -364,9 +369,10 @@ fn update_record(
         PatchValue::Clear => Vec::new(),
     };
 
-    let raw_line = render_validated_metric_line(&updated, &located.absolute_path)?;
+    let raw_line =
+        render_validated_metric_line(&updated, &vault.note_path(&located.relative_path))?;
     located.rows[located.row_index].raw_line = raw_line;
-    write_rows_preserving_raw_lines(&located.absolute_path, &located.rows)?;
+    write_rows_preserving_raw_lines(vault, &located.relative_path, &located.rows)?;
     refresh_index_for_file(vault, database, &located.relative_path)?;
 
     database.metric_record_by_id(&metric_id)?.ok_or_else(|| {
@@ -385,16 +391,10 @@ fn delete_record(
     let source_file = located.relative_path.clone();
     located.rows.remove(located.row_index);
     if located.rows.is_empty() {
-        fs::remove_file(&located.absolute_path).with_context(|| {
-            format!(
-                "failed to delete emptied metrics file {}",
-                located.absolute_path.display()
-            )
-        })?;
+        remove_metrics_file(vault, &located.relative_path)?;
         database.remove_metrics_file(&located.relative_path.to_string_lossy())?;
-        clean_empty_metrics_parents(vault, located.absolute_path.parent())?;
     } else {
-        write_rows_preserving_raw_lines(&located.absolute_path, &located.rows)?;
+        write_rows_preserving_raw_lines(vault, &located.relative_path, &located.rows)?;
         refresh_index_for_file(vault, database, &located.relative_path)?;
     }
 
@@ -410,12 +410,9 @@ fn create_metrics_file(
     database: &IndexDatabase,
     requested_path: &Path,
 ) -> Result<CreatedMetricFile> {
-    let (relative_path, absolute_path) = resolve_existing_metrics_file_path(vault, requested_path)?;
-    if absolute_path.exists() {
-        bail!("metrics file `{}` already exists", relative_path.display());
-    }
-
-    write_string_atomic(&absolute_path, "")?;
+    let relative_path = resolve_metrics_path(vault, requested_path)?;
+    contained_fs::create(&vault.paths().root, &relative_path, b"")
+        .map_err(|refusal| refused(vault, refusal, "create", &relative_path))?;
     refresh_index_for_file(vault, database, &relative_path)?;
     Ok(CreatedMetricFile { relative_path })
 }
@@ -426,42 +423,28 @@ fn rename_metrics_file(
     source_path: &Path,
     destination_path: &Path,
 ) -> Result<RenamedMetricFile> {
-    let (source_relative, source_absolute) =
-        resolve_existing_metrics_file_path(vault, source_path)?;
-    let (destination_relative, destination_absolute) =
-        resolve_existing_metrics_file_path(vault, destination_path)?;
+    let source_relative = resolve_metrics_path(vault, source_path)?;
+    let destination_relative = resolve_metrics_path(vault, destination_path)?;
 
     if source_relative == destination_relative {
         bail!("source and destination metrics files must be different");
     }
-    if !source_absolute.exists() {
-        bail!(
-            "metrics file `{}` does not exist",
-            source_relative.display()
-        );
-    }
-    if destination_absolute.exists() {
-        bail!(
+
+    contained_fs::rename(
+        &vault.paths().root,
+        &source_relative,
+        &destination_relative,
+        metrics_root_depth(vault),
+    )
+    .map_err(|refusal| match refusal {
+        Refusal::Exists => anyhow!(
             "metrics file `{}` already exists",
             destination_relative.display()
-        );
-    }
-
-    if let Some(parent) = destination_absolute.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create metrics directory {}", parent.display()))?;
-    }
-
-    fs::rename(&source_absolute, &destination_absolute).with_context(|| {
-        format!(
-            "failed to rename metrics file {} to {}",
-            source_absolute.display(),
-            destination_absolute.display()
-        )
+        ),
+        refusal => refused(vault, refusal, "rename", &source_relative),
     })?;
     database.remove_metrics_file(&source_relative.to_string_lossy())?;
     refresh_index_for_file(vault, database, &destination_relative)?;
-    clean_empty_metrics_parents(vault, source_absolute.parent())?;
 
     Ok(RenamedMetricFile {
         source_path: source_relative,
@@ -474,16 +457,10 @@ fn delete_metrics_file(
     database: &IndexDatabase,
     requested_path: &Path,
 ) -> Result<DeletedMetricFile> {
-    let (relative_path, absolute_path) = resolve_existing_metrics_file_path(vault, requested_path)?;
-    if !absolute_path.exists() {
-        bail!("metrics file `{}` does not exist", relative_path.display());
-    }
-
-    let row_count = parse_metrics_file(&absolute_path)?.len();
-    fs::remove_file(&absolute_path)
-        .with_context(|| format!("failed to delete metrics file {}", absolute_path.display()))?;
+    let relative_path = resolve_metrics_path(vault, requested_path)?;
+    let row_count = read_metrics_rows(vault, &relative_path)?.len();
+    remove_metrics_file(vault, &relative_path)?;
     database.remove_metrics_file(&relative_path.to_string_lossy())?;
-    clean_empty_metrics_parents(vault, absolute_path.parent())?;
 
     Ok(DeletedMetricFile {
         relative_path,
@@ -501,8 +478,8 @@ fn assign_missing_metric_ids(
     let mut files = Vec::new();
     let mut total_assigned = 0;
 
-    for target in targets {
-        let mut rows = parse_metrics_file(&target.absolute_path)?;
+    for relative_path in targets {
+        let mut rows = read_metrics_rows(vault, &relative_path)?;
         let mut assigned_count = 0;
 
         for row in &mut rows {
@@ -514,13 +491,13 @@ fn assign_missing_metric_ids(
         }
 
         if assigned_count > 0 {
-            write_rows_preserving_raw_lines(&target.absolute_path, &rows)?;
-            refresh_index_for_file(vault, database, &target.relative_path)?;
+            write_rows_preserving_raw_lines(vault, &relative_path, &rows)?;
+            refresh_index_for_file(vault, database, &relative_path)?;
         }
 
         total_assigned += assigned_count;
         files.push(AssignedMetricIdsFile {
-            relative_path: target.relative_path,
+            relative_path,
             assigned_count,
         });
     }
@@ -531,39 +508,26 @@ fn assign_missing_metric_ids(
     })
 }
 
-fn resolve_write_target(vault: &Vault, requested: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
-    let metrics = vault.metrics_conventions();
-    let relative_path = if let Some(path) = requested {
-        vault.resolve_relative_metrics_path(path).ok_or_else(|| {
-            anyhow!(
-                "metrics file `{}` must live under `{}` and use a supported metrics extension",
-                path.display(),
-                metrics.root.display()
-            )
-        })?
-    } else {
-        metrics.default_write_file.clone()
-    };
-
-    Ok((relative_path.clone(), vault.note_path(&relative_path)))
+/// The file a record create appends to. The configured default passes the same path rules as a
+/// requested file, so a vault setting cannot point writes at Arrowhead or Obsidian internals.
+fn resolve_write_target(vault: &Vault, requested: Option<&Path>) -> Result<PathBuf> {
+    match requested {
+        Some(path) => resolve_metrics_path(vault, path),
+        None => resolve_metrics_path(vault, &vault.metrics_conventions().default_write_file)
+            .context("the configured default metrics file is not a valid metrics file path"),
+    }
 }
 
-fn resolve_existing_metrics_file_path(
-    vault: &Vault,
-    requested: &Path,
-) -> Result<(PathBuf, PathBuf)> {
-    let metrics = vault.metrics_conventions();
-    let relative_path = vault
+fn resolve_metrics_path(vault: &Vault, requested: &Path) -> Result<PathBuf> {
+    vault
         .resolve_relative_metrics_path(requested)
         .ok_or_else(|| {
             anyhow!(
                 "metrics file `{}` must live under `{}` and use a supported metrics extension",
                 requested.display(),
-                metrics.root.display()
+                vault.metrics_conventions().root.display()
             )
-        })?;
-    let absolute_path = vault.note_path(&relative_path);
-    Ok((relative_path, absolute_path))
+        })
 }
 
 fn locate_unique_metric_row(vault: &Vault, metric_id: &str) -> Result<LocatedMetricRow> {
@@ -593,12 +557,11 @@ fn ensure_metric_id_available(vault: &Vault, metric_id: &str) -> Result<()> {
 fn locate_metric_rows(vault: &Vault, metric_id: &str) -> Result<Vec<LocatedMetricRow>> {
     let mut matches = Vec::new();
     for file in vault.metrics_files()? {
-        let rows = parse_metrics_file(&file.absolute_path)?;
+        let rows = read_metrics_rows(vault, &file.relative_path)?;
         for (row_index, row) in rows.iter().enumerate() {
             if row.record.as_ref().map(|record| record.id.as_str()) == Some(metric_id) {
                 matches.push(LocatedMetricRow {
                     relative_path: file.relative_path.clone(),
-                    absolute_path: file.absolute_path.clone(),
                     rows: rows.clone(),
                     row_index,
                 });
@@ -619,44 +582,35 @@ fn describe_metric_locations(matches: &[LocatedMetricRow]) -> String {
         .join(", ")
 }
 
-fn append_metric_line(path: &Path, raw_line: &str) -> Result<()> {
-    let mut content = if path.exists() {
-        fs::read_to_string(path)
-            .with_context(|| format!("failed to read metrics file {}", path.display()))?
-    } else {
-        String::new()
+fn append_metric_line(vault: &Vault, relative_path: &Path, raw_line: &str) -> Result<()> {
+    let mut content = match contained_fs::open_file(&vault.paths().root, relative_path) {
+        Ok(file) => io::read_to_string(file).with_context(|| {
+            format!(
+                "failed to read metrics file {}",
+                vault.note_path(relative_path).display()
+            )
+        })?,
+        Err(Refusal::Missing) => String::new(),
+        Err(refusal) => return Err(refused(vault, refusal, "write", relative_path)),
     };
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
     content.push_str(raw_line);
     content.push('\n');
-    write_string_atomic(path, &content)
+    replace_metrics_file(vault, relative_path, &content)
 }
 
-fn resolve_assign_id_targets(
-    vault: &Vault,
-    requested_path: Option<&Path>,
-) -> Result<Vec<crate::metrics::MetricsFileEntry>> {
+fn resolve_assign_id_targets(vault: &Vault, requested_path: Option<&Path>) -> Result<Vec<PathBuf>> {
     if let Some(path) = requested_path {
-        let (relative_path, absolute_path) = resolve_existing_metrics_file_path(vault, path)?;
-        if !absolute_path.exists() {
-            bail!("metrics file `{}` does not exist", relative_path.display());
-        }
-        let metadata = fs::metadata(&absolute_path)
-            .with_context(|| format!("failed to stat metrics file {}", absolute_path.display()))?;
-        let file_modified_at = metadata
-            .modified()
-            .with_context(|| format!("failed to read metrics mtime {}", absolute_path.display()))?
-            .into();
-        return Ok(vec![crate::metrics::MetricsFileEntry {
-            relative_path,
-            absolute_path,
-            file_modified_at,
-        }]);
+        return Ok(vec![resolve_metrics_path(vault, path)?]);
     }
 
-    let targets = vault.metrics_files()?;
+    let targets = vault
+        .metrics_files()?
+        .into_iter()
+        .map(|file| file.relative_path)
+        .collect::<Vec<_>>();
     if targets.is_empty() {
         bail!("no metrics files were discovered in this vault");
     }
@@ -666,7 +620,7 @@ fn resolve_assign_id_targets(
 fn collect_present_metric_ids(vault: &Vault) -> Result<BTreeSet<String>> {
     let mut ids = BTreeSet::new();
     for file in vault.metrics_files()? {
-        for row in parse_metrics_file(&file.absolute_path)? {
+        for row in read_metrics_rows(vault, &file.relative_path)? {
             if let Some(id) = extract_present_metric_id(&row.raw_line) {
                 ids.insert(id);
             }
@@ -714,7 +668,11 @@ fn assign_missing_id_to_raw_line(
         .context("failed to serialise metrics row with assigned id")
 }
 
-fn write_rows_preserving_raw_lines(path: &Path, rows: &[ParsedMetricRow]) -> Result<()> {
+fn write_rows_preserving_raw_lines(
+    vault: &Vault,
+    relative_path: &Path,
+    rows: &[ParsedMetricRow],
+) -> Result<()> {
     let mut content = rows
         .iter()
         .map(|row| row.raw_line.as_str())
@@ -723,51 +681,58 @@ fn write_rows_preserving_raw_lines(path: &Path, rows: &[ParsedMetricRow]) -> Res
     if !content.is_empty() {
         content.push('\n');
     }
-    write_string_atomic(path, &content)
+    replace_metrics_file(vault, relative_path, &content)
 }
 
-fn write_string_atomic(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create metrics directory {}", parent.display()))?;
-    }
+/// Read and parse a metrics file. Every row that a mutation rewrites comes from this read, so
+/// a symlinked file or folder cannot pull rows from outside the vault into a vault file.
+fn read_metrics_rows(vault: &Vault, relative_path: &Path) -> Result<Vec<ParsedMetricRow>> {
+    let file = contained_fs::open_file(&vault.paths().root, relative_path)
+        .map_err(|refusal| refused(vault, refusal, "read", relative_path))?;
+    parse_metrics_reader(BufReader::new(file), &vault.note_path(relative_path))
+}
 
-    let temp_name = format!(
-        ".{}.arrowhead.{}.{:016x}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("metrics"),
-        std::process::id(),
-        rand::random::<u64>()
-    );
-    let temp_path = path.with_file_name(temp_name);
-    let mut temp_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .with_context(|| {
-            format!(
-                "failed to create temporary metrics file {}",
-                temp_path.display()
-            )
-        })?;
-    let written = temp_file.write_all(content.as_bytes());
-    drop(temp_file);
-    let replaced = written
-        .with_context(|| {
-            format!(
-                "failed to write temporary metrics file {}",
-                temp_path.display()
-            )
-        })
-        .and_then(|()| {
-            fs::rename(&temp_path, path)
-                .with_context(|| format!("failed to replace metrics file {}", path.display()))
-        });
-    if replaced.is_err() {
-        let _ = fs::remove_file(&temp_path);
+/// Replace a metrics file through a temporary file in its folder, creating missing folders.
+fn replace_metrics_file(vault: &Vault, relative_path: &Path, content: &str) -> Result<()> {
+    contained_fs::replace(&vault.paths().root, relative_path, content.as_bytes())
+        .map_err(|refusal| refused(vault, refusal, "write", relative_path))
+}
+
+/// Delete a metrics file, then the folders it leaves empty below the metrics root.
+fn remove_metrics_file(vault: &Vault, relative_path: &Path) -> Result<()> {
+    contained_fs::remove(
+        &vault.paths().root,
+        relative_path,
+        metrics_root_depth(vault),
+    )
+    .map(drop)
+    .map_err(|refusal| refused(vault, refusal, "delete", relative_path))
+}
+
+/// Folders on a metrics path that empty-folder cleanup keeps: the metrics root and its parents.
+fn metrics_root_depth(vault: &Vault) -> usize {
+    vault.metrics_conventions().root.components().count()
+}
+
+/// Describe why a metrics file operation stopped, naming the file the caller asked for.
+fn refused(vault: &Vault, refusal: Refusal, action: &str, relative_path: &Path) -> anyhow::Error {
+    let file = relative_path.display();
+    match refusal {
+        Refusal::Symlink(path) => anyhow!(
+            "refusing to {action} metrics file `{file}`: `{}` is a symbolic link, and metrics changes never follow symlinks",
+            path.display()
+        ),
+        Refusal::Misspelled { path, listed } => anyhow!(
+            "refusing to {action} metrics file `{file}`: {}, and metrics changes need the exact spelling",
+            contained_fs::describe_misspelling(&path, listed.as_deref())
+        ),
+        Refusal::Exists => anyhow!("metrics file `{file}` already exists"),
+        Refusal::Missing => anyhow!("metrics file `{file}` does not exist"),
+        Refusal::Io(path, error) => anyhow::Error::new(error).context(format!(
+            "failed to {action} metrics file {}",
+            vault.note_path(path).display()
+        )),
     }
-    replaced
 }
 
 /// Blocks until the caller holds the vault's exclusive metrics write lock. Dropping the
@@ -777,6 +742,9 @@ fn write_string_atomic(path: &Path, content: &str) -> Result<()> {
 /// exclude each other just as two processes do, and the OS releases the lock when its holder
 /// exits or crashes. The file stays on disk between writes. Deleting it would let one writer
 /// lock the old inode while another locks a newly created file.
+///
+/// The Arrowhead folder may be a symlink, as it may for the index database, but the lock file
+/// itself may not: opening a symlinked lock file would create or lock a file outside that folder.
 fn lock_metrics_writes(vault: &Vault) -> Result<fs::File> {
     let arrowhead_dir = &vault.paths().arrowhead_dir;
     fs::create_dir_all(arrowhead_dir).with_context(|| {
@@ -786,15 +754,35 @@ fn lock_metrics_writes(vault: &Vault) -> Result<fs::File> {
         )
     })?;
     let path = arrowhead_dir.join("metrics.lock");
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
+    let file = open_lock_file(&path)
         .with_context(|| format!("failed to open metrics write lock {}", path.display()))?;
     lock_exclusive(&file, &path)
         .with_context(|| format!("failed to acquire metrics write lock {}", path.display()))?;
     Ok(file)
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> io::Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let file = fs::File::from(open(path, flags, Mode::from_raw_mode(0o666))?);
+    if file.metadata()?.is_file() {
+        Ok(file)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the metrics write lock is not a regular file",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn open_lock_file(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "metrics writes need advisory file locking, which Arrowhead implements only on Unix",
+    ))
 }
 
 #[cfg(unix)]
@@ -828,18 +816,24 @@ fn lock_exclusive(_file: &fs::File, _path: &Path) -> io::Result<()> {
     ))
 }
 
+/// Re-index one metrics file from a single open handle. The modification time is read before
+/// the rows, so a concurrent outside edit makes the recorded time older than the content and
+/// the next index pass reads the file again.
 fn refresh_index_for_file(
     vault: &Vault,
     database: &IndexDatabase,
     relative_path: &Path,
 ) -> Result<()> {
+    let file = contained_fs::open_file(&vault.paths().root, relative_path)
+        .map_err(|refusal| refused(vault, refusal, "index", relative_path))?;
     let absolute_path = vault.note_path(relative_path);
-    let rows = parse_metrics_file(&absolute_path)?;
-    let file_modified_at: DateTime<Utc> = fs::metadata(&absolute_path)
+    let file_modified_at: DateTime<Utc> = file
+        .metadata()
         .with_context(|| format!("failed to inspect metrics file {}", absolute_path.display()))?
         .modified()
         .with_context(|| format!("failed to read metrics mtime {}", absolute_path.display()))?
         .into();
+    let rows = parse_metrics_reader(BufReader::new(file), &absolute_path)?;
     database.upsert_metrics_file(
         &relative_path.to_string_lossy(),
         file_modified_at,
@@ -1007,31 +1001,6 @@ fn generate_unique_metric_id(used_ids: &mut BTreeSet<String>) -> String {
     }
 }
 
-fn clean_empty_metrics_parents(vault: &Vault, start: Option<&Path>) -> Result<()> {
-    let metrics_root = vault.note_path(&vault.metrics_conventions().root);
-    let Some(mut current) = start.map(Path::to_path_buf) else {
-        return Ok(());
-    };
-
-    while current.starts_with(&metrics_root) && current != metrics_root {
-        let is_empty = fs::read_dir(&current)
-            .with_context(|| format!("failed to inspect metrics directory {}", current.display()))?
-            .next()
-            .is_none();
-        if !is_empty {
-            break;
-        }
-        fs::remove_dir(&current)
-            .with_context(|| format!("failed to remove empty directory {}", current.display()))?;
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent.to_path_buf();
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,7 +1050,7 @@ mod tests {
         let vault = Vault::new(VaultConfig::new(vault_root.to_path_buf())).expect("vault");
         let mut values = BTreeMap::<String, Vec<f64>>::new();
         for file in vault.metrics_files().expect("metrics files") {
-            for row in parse_metrics_file(&file.absolute_path).expect("parse metrics file") {
+            for row in crate::parse_metrics_file(&file.absolute_path).expect("parse metrics file") {
                 let record = row.record.expect("structurally valid row");
                 values.entry(record.id).or_default().push(record.value);
             }
@@ -1579,5 +1548,402 @@ mod tests {
         let files = read.list_files().await.expect("list files");
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].record_count, 2);
+    }
+
+    /// Every entry below `root` without following symlinks: file contents, link targets, and
+    /// folders. Skips Arrowhead's own folder, which holds the index and the write lock.
+    #[cfg(unix)]
+    fn tree(root: &Path) -> BTreeMap<PathBuf, String> {
+        let mut entries = BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                let relative = path.strip_prefix(root).expect("relative").to_path_buf();
+                if relative == Path::new(".arrowhead") {
+                    continue;
+                }
+                let file_type = fs::symlink_metadata(&path).expect("metadata").file_type();
+                let entry = if file_type.is_symlink() {
+                    format!("-> {}", fs::read_link(&path).expect("read link").display())
+                } else if file_type.is_dir() {
+                    stack.push(path.clone());
+                    "folder".to_string()
+                } else {
+                    fs::read_to_string(&path).expect("read file")
+                };
+                entries.insert(relative, entry);
+            }
+        }
+        entries
+    }
+
+    #[cfg(unix)]
+    fn metric_line(id: &str, source: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","ts":"2026-04-14T08:30:00+04:00","key":"body.weight","value":1.0,"source":"{source}"}}"#
+        ) + "\n"
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metrics_changes_never_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, inner, _read) = build_service();
+        let (linked_dir, root_linked, _linked_read) = build_service();
+        let vault = dir.path().join("vault");
+        let linked_vault = linked_dir.path().join("vault");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(outside.join("linked/sub")).expect("outside folders");
+        fs::write(
+            outside.join("linked/Out.metrics.ndjson"),
+            metric_line("01OUT", "outside"),
+        )
+        .expect("outside file");
+        fs::write(
+            outside.join("linked/sub/Doomed.metrics.ndjson"),
+            metric_line("01DOOM", "outside"),
+        )
+        .expect("outside file");
+        fs::write(
+            outside.join("secret.metrics.ndjson"),
+            metric_line("01SECRET", "outside"),
+        )
+        .expect("outside file");
+        fs::write(
+            outside.join("linked/Data.metrics.ndjson"),
+            metric_line("01ROW1", "outside")
+                + &metric_line("01ROW2", "outside")
+                + r#"{"ts":"2026-04-14T08:30:00+04:00","key":"body.weight","value":3.0,"source":"outside"}"#
+                + "\n",
+        )
+        .expect("outside rows");
+        fs::write(
+            outside.join("linked/Only.metrics.ndjson"),
+            metric_line("01ONLY", "outside"),
+        )
+        .expect("outside rows");
+        fs::create_dir_all(vault.join("Metrics")).expect("metrics folder");
+        fs::write(
+            vault.join("Metrics/Local.metrics.ndjson"),
+            metric_line("01LOCAL", "vault"),
+        )
+        .expect("vault file");
+        symlink(outside.join("linked"), vault.join("Metrics/Linked")).expect("folder link");
+        symlink(
+            outside.join("secret.metrics.ndjson"),
+            vault.join("Metrics/Alias.metrics.ndjson"),
+        )
+        .expect("file link");
+        symlink(
+            outside.join("planted.metrics.ndjson"),
+            vault.join("Metrics/Dangling.metrics.ndjson"),
+        )
+        .expect("dangling link");
+        symlink(outside.join("linked"), linked_vault.join("Metrics")).expect("root link");
+        let trees = || (tree(&outside), tree(&vault), tree(&linked_vault));
+        let before = trees();
+
+        let path = Path::new;
+        let request = |file: Option<&str>, id: &str| MetricCreateRequest {
+            file: file.map(PathBuf::from),
+            ..create_request("Metrics/Unused.metrics.ndjson", id, 9.0)
+        };
+        let update = MetricUpdateRequest {
+            metric_id: "01ROW1".to_string(),
+            value: Some(99.0),
+            ..MetricUpdateRequest::default()
+        };
+        let attempts: Vec<(&str, Result<()>)> = vec![
+            (
+                "create through a folder link",
+                inner
+                    .create(request(Some("Metrics/Linked/New.metrics.ndjson"), "01NEW1"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "create into a file link",
+                inner
+                    .create(request(Some("Metrics/Alias.metrics.ndjson"), "01NEW2"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "create into a dangling link",
+                inner
+                    .create(request(Some("Metrics/Dangling.metrics.ndjson"), "01NEW3"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "create file through a folder link",
+                inner
+                    .create_file(path("Metrics/Linked/New.metrics.ndjson"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "create file at a dangling link",
+                inner
+                    .create_file(path("Metrics/Dangling.metrics.ndjson"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "rename from a folder link",
+                inner
+                    .rename_file(
+                        path("Metrics/Linked/Out.metrics.ndjson"),
+                        path("Metrics/In.metrics.ndjson"),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "rename a file link",
+                inner
+                    .rename_file(
+                        path("Metrics/Alias.metrics.ndjson"),
+                        path("Metrics/In.metrics.ndjson"),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "rename into a folder link",
+                inner
+                    .rename_file(
+                        path("Metrics/Local.metrics.ndjson"),
+                        path("Metrics/Linked/Moved.metrics.ndjson"),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "rename onto a dangling link",
+                inner
+                    .rename_file(
+                        path("Metrics/Local.metrics.ndjson"),
+                        path("Metrics/Dangling.metrics.ndjson"),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "delete file through a folder link",
+                inner
+                    .delete_file(path("Metrics/Linked/sub/Doomed.metrics.ndjson"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "delete a file link",
+                inner
+                    .delete_file(path("Metrics/Alias.metrics.ndjson"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "assign ids through a folder link",
+                inner
+                    .assign_missing_ids(Some(path("Metrics/Linked/Out.metrics.ndjson")))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "update under a linked root",
+                root_linked.update(update).await.map(drop),
+            ),
+            (
+                "delete a row under a linked root",
+                root_linked.delete("01ROW2").await.map(drop),
+            ),
+            (
+                "delete the last row under a linked root",
+                root_linked.delete("01ONLY").await.map(drop),
+            ),
+            (
+                "assign ids under a linked root",
+                root_linked.assign_missing_ids(None).await.map(drop),
+            ),
+            (
+                "create in the default file under a linked root",
+                root_linked.create(request(None, "01NEW4")).await.map(drop),
+            ),
+            (
+                "create file under a linked root",
+                root_linked
+                    .create_file(path("Metrics/New.metrics.ndjson"))
+                    .await
+                    .map(drop),
+            ),
+            (
+                "rename under a linked root",
+                root_linked
+                    .rename_file(
+                        path("Metrics/Data.metrics.ndjson"),
+                        path("Metrics/Renamed.metrics.ndjson"),
+                    )
+                    .await
+                    .map(drop),
+            ),
+            (
+                "delete file under a linked root",
+                root_linked
+                    .delete_file(path("Metrics/Data.metrics.ndjson"))
+                    .await
+                    .map(drop),
+            ),
+        ];
+
+        let followed = attempts
+            .into_iter()
+            .filter_map(|(attempt, result)| match result {
+                Err(err) if err.to_string().contains("is a symbolic link") => None,
+                other => Some(format!("{attempt}: {other:?}")),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            followed.is_empty(),
+            "every change must refuse the symlink: {followed:#?}"
+        );
+        assert_eq!(
+            trees(),
+            before,
+            "files outside the vault and both vaults stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_write_lock_is_refused() {
+        let (dir, mutation, _read) = build_service();
+        let planted = dir.path().join("planted.lock");
+        std::os::unix::fs::symlink(&planted, dir.path().join("vault/.arrowhead/metrics.lock"))
+            .expect("lock link");
+
+        let err = mutation
+            .create_file(Path::new("Metrics/Fine.metrics.ndjson"))
+            .await
+            .expect_err("a symlinked lock must be refused");
+
+        assert!(
+            format!("{err:#}").contains("failed to open metrics write lock"),
+            "{err:#}"
+        );
+        assert!(!planted.exists(), "no file is created through the link");
+        assert!(
+            !dir.path().join("vault/Metrics").exists(),
+            "nothing changes without the lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_changes_prune_empty_folders_below_the_metrics_root_only() {
+        let (dir, mutation, read) = build_service();
+        let vault = dir.path().join("vault");
+        mutation
+            .create(create_request(
+                "Metrics/2026/11/Day.metrics.ndjson",
+                "01DAY",
+                1.0,
+            ))
+            .await
+            .expect("create in nested folders");
+        mutation
+            .rename_file(
+                Path::new("Metrics/2026/11/Day.metrics.ndjson"),
+                Path::new("Metrics/Archive/Day.metrics.ndjson"),
+            )
+            .await
+            .expect("rename into another nested folder");
+        assert!(
+            !vault.join("Metrics/2026").exists(),
+            "rename removes the source folders it empties"
+        );
+        mutation
+            .create_file(Path::new("Metrics/Archive/Other.metrics.ndjson"))
+            .await
+            .expect("create a sibling file");
+        mutation.delete("01DAY").await.expect("delete the last row");
+        assert!(
+            vault.join("Metrics/Archive").is_dir(),
+            "a folder that still holds a file stays"
+        );
+        mutation
+            .delete_file(Path::new("Metrics/Archive/Other.metrics.ndjson"))
+            .await
+            .expect("delete the sibling file");
+        assert!(!vault.join("Metrics/Archive").exists());
+        assert!(vault.join("Metrics").is_dir(), "the metrics root stays");
+        assert!(read.list_files().await.expect("list files").is_empty());
+
+        let nested_dir = TempDir::new().expect("tempdir");
+        let nested = nested_dir.path().join("vault");
+        fs::create_dir_all(nested.join(".arrowhead")).expect("arrowhead dir");
+        crate::workspace::write_workspace_file(
+            &nested
+                .join(".arrowhead")
+                .join(crate::workspace::WORKSPACE_CONFIG_FILE),
+            &crate::workspace::WorkspaceFile {
+                metrics: Some(crate::metrics::MetricsConfigFile {
+                    root: Some("Data/Metrics".to_string()),
+                    ..crate::metrics::MetricsConfigFile::default()
+                }),
+                ..crate::workspace::WorkspaceFile::default()
+            },
+        )
+        .expect("write workspace config");
+        let (nested_mutation, _nested_read) = open_service(&nested);
+        nested_mutation
+            .create_file(Path::new("Data/Metrics/Only.metrics.ndjson"))
+            .await
+            .expect("create under a nested root");
+        nested_mutation
+            .delete_file(Path::new("Data/Metrics/Only.metrics.ndjson"))
+            .await
+            .expect("delete under a nested root");
+        assert!(
+            nested.join("Data/Metrics").is_dir(),
+            "a nested metrics root and its parents stay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metrics_changes_need_the_exact_spelling_of_existing_folders() {
+        let (dir, mutation, _read) = build_service();
+        let vault = dir.path().join("vault");
+        mutation
+            .create(create_request(
+                "Metrics/sub/Data.metrics.ndjson",
+                "01CASE",
+                1.0,
+            ))
+            .await
+            .expect("seed a nested file");
+        if !vault.join("Metrics/SUB").exists() {
+            // On a case-sensitive filesystem `SUB` is a different, missing folder.
+            return;
+        }
+        let before = tree(&vault);
+
+        let err = mutation
+            .create(create_request(
+                "Metrics/SUB/Data.metrics.ndjson",
+                "01ALIAS",
+                2.0,
+            ))
+            .await
+            .expect_err("another spelling of an existing folder must be refused");
+
+        assert!(
+            err.to_string()
+                .contains("the vault spells `Metrics/SUB` as `Metrics/sub`"),
+            "{err}"
+        );
+        assert_eq!(tree(&vault), before, "the refused create changes nothing");
     }
 }

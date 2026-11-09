@@ -1228,6 +1228,150 @@ async fn notes_mutations_never_follow_symlinks_out_of_the_vault() {
     );
 }
 
+/// Vault-relative paths below `root`, without Arrowhead's own folder.
+fn vault_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            let relative = path.strip_prefix(root).expect("relative").to_path_buf();
+            if relative == Path::new(".arrowhead") {
+                continue;
+            }
+            if fs::symlink_metadata(&path).expect("metadata").is_dir() {
+                stack.push(path);
+            }
+            paths.push(relative);
+        }
+    }
+    paths.sort();
+    paths
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn notes_update_replaces_a_hard_linked_note_without_changing_the_other_link() {
+    let temp_dir = copy_fixture();
+    let outside = tempfile::tempdir().expect("outside dir");
+    let sentinel = outside.path().join("sentinel.md");
+    fs::write(&sentinel, "outside original\n").expect("write sentinel");
+    fs::hard_link(&sentinel, temp_dir.path().join("Hard.md")).expect("hard link");
+    let handler = build_handler(&temp_dir).await;
+
+    call_tool(
+        &handler,
+        "notes_update",
+        json!({ "noteId": "Hard", "content": "agent wrote this" }),
+    )
+    .await;
+
+    assert_eq!(
+        fs::read_to_string(&sentinel).expect("read sentinel"),
+        "outside original\n",
+        "the file outside the vault keeps its contents"
+    );
+    assert!(
+        fs::read_to_string(temp_dir.path().join("Hard.md"))
+            .expect("read note")
+            .contains("agent wrote this")
+    );
+}
+
+#[tokio::test]
+async fn note_changes_outside_inventory_fail_before_touching_the_vault() {
+    let temp_dir = copy_fixture_generic();
+    for folder in ["Attachments", "Drafts", "Sub/attachments"] {
+        fs::create_dir_all(temp_dir.path().join(folder)).expect("create folder");
+    }
+    let folds_case = temp_dir.path().join("ATTACHMENTS").exists();
+    let handler = build_handler(&temp_dir).await;
+    let before = vault_paths(temp_dir.path());
+
+    let mut attempts = vec![
+        json!({ "noteId": ".trash/Ghost", "content": "hidden" }),
+        json!({ "noteId": "Sub/attachments/Ghost", "content": "attachment" }),
+        json!({ "noteId": "Attachments/Ghost", "content": "attachment" }),
+        json!({ "noteId": "Drafts/Ghost", "content": "ignored" }),
+    ];
+    if folds_case {
+        attempts.push(json!({ "noteId": "ATTACHMENTS/Ghost", "content": "alias" }));
+        attempts.push(json!({ "noteId": "DRAFTS/Ghost", "content": "alias" }));
+    }
+    for arguments in attempts {
+        match call_tool_error(&handler, "notes_create", arguments.clone()).await {
+            ProtocolError::InvalidParams { .. } => {}
+            other => panic!("{arguments} must be refused as invalid params, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        vault_paths(temp_dir.path()),
+        before,
+        "refused changes create no files or folders"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn metrics_mutations_refuse_a_symlinked_metrics_root() {
+    let temp_dir = copy_fixture();
+    let outside = tempfile::tempdir().expect("outside dir");
+    fs::write(
+        outside.path().join("Data.metrics.ndjson"),
+        concat!(
+            r#"{"id":"01OUT","ts":"2026-04-14T08:30:00+00:00","key":"body.weight","value":1.0,"source":"outside"}"#,
+            "\n"
+        ),
+    )
+    .expect("write outside metrics");
+    std::os::unix::fs::symlink(outside.path(), temp_dir.path().join("Metrics"))
+        .expect("symlink metrics root");
+    let before = tree_snapshot(outside.path());
+    let handler = build_handler(&temp_dir).await;
+
+    let attempts = [
+        (
+            "metrics_create",
+            json!({ "filePath": "Metrics/Proof.metrics.ndjson", "id": "01NEW", "ts": "2026-04-14T08:30:00+00:00", "key": "body.weight", "value": 2.0, "source": "agent" }),
+        ),
+        (
+            "metrics_update",
+            json!({ "metricId": "01OUT", "value": 9.0 }),
+        ),
+        (
+            "metrics_delete",
+            json!({ "metricId": "01OUT", "confirm": true }),
+        ),
+        (
+            "metrics_create_file",
+            json!({ "path": "Metrics/New.metrics.ndjson" }),
+        ),
+        (
+            "metrics_rename_file",
+            json!({ "sourcePath": "Metrics/Data.metrics.ndjson", "destinationPath": "Metrics/Moved.metrics.ndjson" }),
+        ),
+        (
+            "metrics_delete_file",
+            json!({ "path": "Metrics/Data.metrics.ndjson", "confirm": true }),
+        ),
+    ];
+    for (tool, arguments) in attempts {
+        match call_tool_error(&handler, tool, arguments.clone()).await {
+            ProtocolError::InvalidParams { message, .. } => {
+                assert!(message.contains("is a symbolic link"), "{tool}: {message}")
+            }
+            other => panic!("{tool} {arguments} must be refused as invalid params, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        tree_snapshot(outside.path()),
+        before,
+        "files outside the vault stay untouched"
+    );
+}
+
 #[tokio::test]
 async fn discovery_related_notes_returns_payload() {
     let temp_dir = copy_fixture();

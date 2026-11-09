@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Unique identifier for a note (filename without extension).
 pub type NoteId = String;
@@ -47,6 +48,24 @@ impl NoteRecord {
             file_modified_at,
             created_at: None,
         }
+    }
+
+    /// SHA-256 of everything the index derives from this note: its path,
+    /// frontmatter, and body. Timestamps are left out, so the index can tell an
+    /// edit from a touch even when the edit kept the old modification time.
+    pub fn content_fingerprint(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.relative_path.to_string_lossy().as_bytes());
+        for (key, value) in &self.metadata {
+            hasher.update([0]);
+            hasher.update(key.as_bytes());
+            hasher.update([0]);
+            hasher.update(value.to_string().as_bytes());
+        }
+        // 0xff never occurs in UTF-8, so the body cannot pass for metadata.
+        hasher.update([0xff]);
+        hasher.update(self.content.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 }
 
