@@ -456,10 +456,6 @@ fn date_range_contains(range: &DateRange, date: NaiveDate) -> bool {
 fn create_note(vault: &Vault, args: &CreateArgs) -> Result<()> {
     let note_id = resolve_note_id(args)?;
 
-    if vault.note_file_path(&note_id)?.exists() {
-        bail!("note {note_id} already exists");
-    }
-
     let mut metadata = MetadataMap::default();
     if let Some(title) = &args.title {
         metadata.insert("title".to_string(), JsonValue::String(title.clone()));
@@ -476,7 +472,7 @@ fn create_note(vault: &Vault, args: &CreateArgs) -> Result<()> {
 
     let body = load_content(args.content.as_ref(), args.file.as_ref())?;
 
-    vault.write_note(&note_id, &metadata, &body)?;
+    vault.create_note(&note_id, &metadata, &body)?;
     Ok(())
 }
 
@@ -513,39 +509,7 @@ fn delete_note(vault: &Vault, args: &DeleteArgs) -> Result<()> {
         bail!("use --yes to confirm deletion");
     }
 
-    let path = vault
-        .note_file_path(&args.note_id)
-        .with_context(|| format!("invalid note id {}", args.note_id))?;
-
-    if !path.exists() {
-        bail!("note {} does not exist", args.note_id);
-    }
-
-    fs::remove_file(&path)
-        .with_context(|| format!("failed to delete note file {}", path.display()))?;
-
-    cleanup_empty_dirs(path.parent(), &vault.paths().root)?;
-    Ok(())
-}
-
-fn cleanup_empty_dirs(start: Option<&std::path::Path>, root: &std::path::Path) -> Result<()> {
-    let mut current = match start {
-        Some(path) => path.to_path_buf(),
-        None => return Ok(()),
-    };
-
-    while current.starts_with(root) && current != root {
-        if fs::read_dir(&current)?.next().is_some() {
-            break;
-        }
-        fs::remove_dir(&current)?;
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            break;
-        }
-    }
-
+    vault.delete_note(&args.note_id)?;
     Ok(())
 }
 
@@ -978,5 +942,53 @@ mod tests {
         delete_note(&vault, &delete_args).expect("delete");
 
         assert!(!vault.note_file_path("Disposable").unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn note_commands_leave_files_behind_symlinks_untouched() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let vault_root = temp_dir.path().join("vault");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir_all(outside.join("sub")).expect("outside dirs");
+        fs::create_dir(&vault_root).expect("vault dir");
+        fs::write(outside.join("sub/Deep.md"), "outside deep\n").expect("sentinel");
+        std::os::unix::fs::symlink(&outside, vault_root.join("Linked")).expect("symlink parent");
+        std::os::unix::fs::symlink(outside.join("Planted.md"), vault_root.join("Dangling.md"))
+            .expect("dangling symlink");
+        let vault = Vault::new(VaultConfig::new(vault_root)).expect("vault");
+
+        let created = create_note(
+            &vault,
+            &CreateArgs {
+                id: Some("Dangling".to_string()),
+                title: None,
+                category: None,
+                content: Some("escaped".to_string()),
+                file: None,
+                metadata: None,
+            },
+        );
+        let deleted = delete_note(
+            &vault,
+            &DeleteArgs {
+                note_id: "Linked/sub/Deep".to_string(),
+                yes: true,
+            },
+        );
+
+        assert!(
+            !outside.join("Planted.md").exists(),
+            "create must not write through a dangling symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("sub/Deep.md"))
+                .ok()
+                .as_deref(),
+            Some("outside deep\n"),
+            "delete must not remove files or prune directories behind a symlinked parent"
+        );
+        assert!(created.is_err(), "create through a symlink must fail");
+        assert!(deleted.is_err(), "delete through a symlink must fail");
     }
 }

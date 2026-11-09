@@ -1128,6 +1128,106 @@ async fn notes_delete_requires_confirmation_flag() {
     }
 }
 
+#[cfg(unix)]
+fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<String>)> {
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("relative path")
+                .to_path_buf();
+            if fs::symlink_metadata(&path).expect("metadata").is_dir() {
+                stack.push(path);
+                entries.push((relative, None));
+            } else {
+                entries.push((
+                    relative,
+                    Some(fs::read_to_string(&path).expect("read file")),
+                ));
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn notes_mutations_never_follow_symlinks_out_of_the_vault() {
+    let temp_dir = copy_fixture();
+    let outside = tempfile::tempdir().expect("outside dir");
+    fs::write(outside.path().join("Existing.md"), "outside original\n").expect("write sentinel");
+    fs::create_dir(outside.path().join("sub")).expect("create outside sub");
+    fs::write(outside.path().join("sub/Deep.md"), "outside deep\n").expect("write sentinel");
+    std::os::unix::fs::symlink(outside.path(), temp_dir.path().join("Linked"))
+        .expect("symlink parent");
+    std::os::unix::fs::symlink(
+        outside.path().join("Planted.md"),
+        temp_dir.path().join("Dangling.md"),
+    )
+    .expect("dangling symlink");
+    let before = tree_snapshot(outside.path());
+    let handler = build_handler(&temp_dir).await;
+
+    let attempts = [
+        (
+            "notes_create",
+            json!({ "noteId": "Linked/Proof", "content": "escaped" }),
+        ),
+        (
+            "notes_create",
+            json!({ "noteId": "Linked/newdir/Deeper", "content": "escaped" }),
+        ),
+        (
+            "notes_create",
+            json!({ "noteId": "Dangling", "content": "escaped" }),
+        ),
+        (
+            "notes_update",
+            json!({ "noteId": "Linked/Existing", "content": "escaped" }),
+        ),
+        (
+            "notes_delete",
+            json!({ "noteId": "Linked/Existing", "confirm": true }),
+        ),
+        (
+            "notes_delete",
+            json!({ "noteId": "Linked/sub/Deep", "confirm": true }),
+        ),
+    ];
+    let mut accepted = Vec::new();
+    for (tool, arguments) in attempts {
+        let params =
+            Params::new(json!({ "name": tool, "arguments": arguments })).expect("tool params");
+        match handler
+            .handle_request(Request::new(0, "tools/call", params))
+            .await
+        {
+            Err(ProtocolError::InvalidParams { .. }) => {}
+            other => accepted.push(format!("{tool} {arguments} -> {other:?}")),
+        }
+    }
+
+    assert_eq!(
+        tree_snapshot(outside.path()),
+        before,
+        "files outside the vault must stay untouched"
+    );
+    assert!(
+        accepted.is_empty(),
+        "symlinked note paths must be refused as invalid params: {accepted:#?}"
+    );
+    assert!(
+        fs::symlink_metadata(temp_dir.path().join("Dangling.md"))
+            .expect("dangling link remains")
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[tokio::test]
 async fn discovery_related_notes_returns_payload() {
     let temp_dir = copy_fixture();

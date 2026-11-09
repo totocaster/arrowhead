@@ -2,12 +2,7 @@
 //!
 //! Implements request handlers for all MCP tools.
 
-use std::{
-    fs,
-    io::ErrorKind,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use anyhow::Error;
 use async_trait::async_trait;
@@ -20,6 +15,7 @@ use arrowhead_core::{
     MetadataMap, MetricCreateRequest, MetricUpdateRequest, MonthContextSelector, NoteRecord,
     PatchValue, Vault, WeekContextSelector,
     status::{ActivityState, ActivityStatus, DaemonStatus},
+    vault::NoteMutationError,
 };
 
 use crate::{
@@ -3163,14 +3159,10 @@ fn map_note_load_error(err: Error, note_id: &str) -> ProtocolError {
     }
 }
 
-fn map_note_write_error(err: Error, note_id: &str) -> ProtocolError {
-    if err
-        .chain()
-        .any(|cause| cause.to_string().contains("invalid note id"))
-    {
-        ProtocolError::invalid_params(format!("invalid note id {note_id}"))
-    } else {
-        ProtocolError::internal(err.to_string())
+fn map_note_mutation_error(err: NoteMutationError) -> ProtocolError {
+    match err {
+        NoteMutationError::Io { .. } => ProtocolError::internal(err.to_string()),
+        _ => ProtocolError::invalid_params(err.to_string()),
     }
 }
 
@@ -3355,15 +3347,6 @@ fn create_note_in_vault(
         metadata,
     } = params;
 
-    let path = vault
-        .note_file_path(&note_id)
-        .map_err(|err| ProtocolError::invalid_params(err.to_string()))?;
-    if path.exists() {
-        return Err(ProtocolError::invalid_params(format!(
-            "note {note_id} already exists"
-        )));
-    }
-
     let mut metadata_map = metadata.unwrap_or_default();
     if let Some(title_value) = &title {
         metadata_map.insert("title".to_string(), Value::String(title_value.clone()));
@@ -3381,8 +3364,8 @@ fn create_note_in_vault(
 
     let body = content.unwrap_or_default();
     vault
-        .write_note(&note_id, &metadata_map, &body)
-        .map_err(|err| map_note_write_error(err, &note_id))?;
+        .create_note(&note_id, &metadata_map, &body)
+        .map_err(map_note_mutation_error)?;
     vault
         .load_note(&note_id)
         .map_err(|err| map_note_load_error(err, &note_id))
@@ -3418,7 +3401,7 @@ fn update_note_in_vault(
     let body = content.unwrap_or(record.content);
     vault
         .write_note(&note_id, &metadata_map, &body)
-        .map_err(|err| map_note_write_error(err, &note_id))?;
+        .map_err(map_note_mutation_error)?;
     vault
         .load_note(&note_id)
         .map_err(|err| map_note_load_error(err, &note_id))
@@ -3432,80 +3415,15 @@ fn delete_note_in_vault(
         note_id,
         confirm: _,
     } = params;
-    let path = vault
-        .note_file_path(&note_id)
-        .map_err(|err| ProtocolError::invalid_params(err.to_string()))?;
-
-    if !path.exists() {
-        return Err(ProtocolError::invalid_params(format!(
-            "note {note_id} does not exist"
-        )));
-    }
-
-    fs::remove_file(&path).map_err(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            ProtocolError::invalid_params(format!("note {note_id} does not exist"))
-        } else {
-            ProtocolError::internal(format!(
-                "failed to delete note file {}: {err}",
-                path.display()
-            ))
-        }
-    })?;
-
-    let root = vault.paths().root.clone();
-    let pruned = prune_empty_directories(&root, path.parent())?;
+    let pruned = vault
+        .delete_note(&note_id)
+        .map_err(map_note_mutation_error)?;
 
     Ok(NoteDeletePayload {
         note_id,
         deleted: true,
         pruned_directories: pruned,
     })
-}
-
-fn prune_empty_directories(
-    root: &Path,
-    start: Option<&Path>,
-) -> Result<Vec<PathBuf>, ProtocolError> {
-    let mut pruned = Vec::new();
-    let mut current = match start {
-        Some(path) => path.to_path_buf(),
-        None => return Ok(pruned),
-    };
-
-    while current.starts_with(root) && current != root {
-        match fs::read_dir(&current) {
-            Ok(mut entries) => {
-                if entries.next().is_some() {
-                    break;
-                }
-            }
-            Err(err) => {
-                return Err(ProtocolError::internal(format!(
-                    "failed to inspect directory {}: {err}",
-                    current.display()
-                )));
-            }
-        }
-
-        fs::remove_dir(&current).map_err(|err| {
-            ProtocolError::internal(format!(
-                "failed to remove directory {}: {err}",
-                current.display()
-            ))
-        })?;
-
-        let relative = current.strip_prefix(root).unwrap_or(&current).to_path_buf();
-        pruned.push(relative);
-
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            break;
-        }
-    }
-
-    Ok(pruned)
 }
 
 fn build_daemon_status_payload(status: DaemonStatus) -> DaemonStatusPayload {

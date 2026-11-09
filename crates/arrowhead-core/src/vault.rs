@@ -8,7 +8,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
-    fs,
+    fs, io,
     io::ErrorKind,
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -32,6 +32,59 @@ use crate::workspace::{
     WORKSPACE_CONFIG_FILE, WorkspaceFile, WorkspaceKind, WorkspaceSource, load_workspace_file,
 };
 use crate::{MetadataMap, NoteId, NoteRecord};
+
+mod note_fs;
+
+/// Why [`Vault::create_note`], [`Vault::write_note`], or [`Vault::delete_note`]
+/// was refused or failed. An I/O failure can leave a partial change.
+///
+/// Note changes never follow symbolic links. A symlink anywhere on the note
+/// path is refused, whether it points outside the vault, inside it, or nowhere.
+/// See `docs/note_mutations.md`.
+#[derive(Debug, thiserror::Error)]
+pub enum NoteMutationError {
+    /// The note id is malformed or names an internal, attachment, or ignored path.
+    #[error("{0}")]
+    InvalidId(String),
+    /// The metadata cannot be written as YAML frontmatter.
+    #[error("invalid note metadata: {0}")]
+    InvalidMetadata(String),
+    /// [`Vault::create_note`] found an existing entry at the note path.
+    #[error("note {note_id} already exists")]
+    AlreadyExists {
+        /// Note id as the caller supplied it.
+        note_id: String,
+    },
+    /// [`Vault::delete_note`] found no note at the note path.
+    #[error("note {note_id} does not exist")]
+    NotFound {
+        /// Note id as the caller supplied it.
+        note_id: String,
+    },
+    /// A folder on the note path, or the note file itself, is a symbolic link.
+    #[error(
+        "refusing to change note {note_id}: `{}` is a symbolic link, and note changes never follow symlinks",
+        path.display()
+    )]
+    Symlink {
+        /// Note id as the caller supplied it.
+        note_id: String,
+        /// The symlink, relative to the vault root.
+        path: PathBuf,
+    },
+    /// The filesystem rejected the change.
+    #[error("failed to {action} note {note_id} at {}: {error}", path.display())]
+    Io {
+        /// Note id as the caller supplied it.
+        note_id: String,
+        /// The change that failed: `create`, `write`, or `delete`.
+        action: &'static str,
+        /// Absolute path where the failure happened.
+        path: PathBuf,
+        /// The underlying filesystem error.
+        error: io::Error,
+    },
+}
 
 /// Lightweight description of a note discovered during vault inventory.
 #[derive(Debug, Clone)]
@@ -413,25 +466,73 @@ impl Vault {
         Ok(self.note_path(relative))
     }
 
-    /// Write the supplied metadata/body to the given note identifier, creating parent directories.
-    pub fn write_note(&self, note_id: &str, metadata: &MetadataMap, body: &str) -> Result<()> {
-        let relative = append_md_extension(self.relative_path_from_id(note_id)?);
-        let absolute = self.note_path(&relative);
-
-        info!(
-            note_id = note_id,
-            path = %absolute.display(),
-            "writing note to disk"
-        );
-
-        if let Some(parent) = absolute.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create note directory {}", parent.display()))?;
-        }
-
+    /// Create a note that does not exist yet, creating missing parent folders.
+    ///
+    /// Fails with [`NoteMutationError::AlreadyExists`] when a non-symlink entry
+    /// sits at the note path. Symlinks fail with [`NoteMutationError::Symlink`].
+    /// Concurrent creates cannot overwrite each other.
+    pub fn create_note(
+        &self,
+        note_id: &str,
+        metadata: &MetadataMap,
+        body: &str,
+    ) -> Result<(), NoteMutationError> {
+        let relative = self.mutable_note_path(note_id)?;
         let content = compose_note_content(metadata, body)?;
-        fs::write(&absolute, content)
-            .with_context(|| format!("failed to write note file {}", absolute.display()))
+        info!(note_id, path = %relative.display(), "creating note");
+        note_fs::create(&self.paths.root, &relative, content.as_bytes())
+            .map_err(|refusal| self.refused(refusal, note_id, "create"))
+    }
+
+    /// Write the supplied metadata/body to the given note identifier, replacing
+    /// an existing note and creating missing parent folders.
+    pub fn write_note(
+        &self,
+        note_id: &str,
+        metadata: &MetadataMap,
+        body: &str,
+    ) -> Result<(), NoteMutationError> {
+        let relative = self.mutable_note_path(note_id)?;
+        let content = compose_note_content(metadata, body)?;
+        info!(note_id, path = %relative.display(), "writing note to disk");
+        note_fs::replace(&self.paths.root, &relative, content.as_bytes())
+            .map_err(|refusal| self.refused(refusal, note_id, "write"))
+    }
+
+    /// Delete a note and remove the parent folders it leaves empty.
+    ///
+    /// Returns the removed folders relative to the vault root, deepest first.
+    pub fn delete_note(&self, note_id: &str) -> Result<Vec<PathBuf>, NoteMutationError> {
+        let relative = self.mutable_note_path(note_id)?;
+        info!(note_id, path = %relative.display(), "deleting note");
+        note_fs::remove(&self.paths.root, &relative)
+            .map_err(|refusal| self.refused(refusal, note_id, "delete"))
+    }
+
+    fn mutable_note_path(&self, note_id: &str) -> Result<PathBuf, NoteMutationError> {
+        self.relative_path_from_id(note_id)
+            .map(append_md_extension)
+            .map_err(|err| NoteMutationError::InvalidId(err.to_string()))
+    }
+
+    fn refused(
+        &self,
+        refusal: note_fs::Refusal,
+        note_id: &str,
+        action: &'static str,
+    ) -> NoteMutationError {
+        let note_id = note_id.to_string();
+        match refusal {
+            note_fs::Refusal::Symlink(path) => NoteMutationError::Symlink { note_id, path },
+            note_fs::Refusal::Exists => NoteMutationError::AlreadyExists { note_id },
+            note_fs::Refusal::Missing => NoteMutationError::NotFound { note_id },
+            note_fs::Refusal::Io(path, error) => NoteMutationError::Io {
+                note_id,
+                action,
+                path: self.paths.root.join(path),
+                error,
+            },
+        }
     }
 
     /// List all markdown note identifiers in the vault.
@@ -1416,6 +1517,179 @@ mod tests {
                 .is_none()
         );
     }
+
+    #[test]
+    fn note_mutations_create_write_and_delete_nested_notes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".obsidian")).expect("obsidian dir");
+        fs::write(
+            dir.path().join(".obsidian/app.json"),
+            r#"{ "userIgnoreFilters": ["Private/"] }"#,
+        )
+        .expect("write app config");
+        let vault =
+            Vault::new(VaultConfig::new(dir.path().to_path_buf())).expect("vault initialises");
+        let mut metadata = MetadataMap::default();
+        metadata.insert("title".to_string(), Value::String("Plan".to_string()));
+
+        vault
+            .create_note("Projects/Plan/Note", &metadata, "first\n")
+            .expect("create creates missing folders");
+        assert!(matches!(
+            vault.create_note("Projects/Plan/Note", &metadata, "second\n"),
+            Err(NoteMutationError::AlreadyExists { .. })
+        ));
+        vault
+            .write_note("Projects/Plan/Note", &metadata, "second\n")
+            .expect("write replaces the note");
+        let note = vault.load_note("Projects/Plan/Note").expect("note loads");
+        assert_eq!(note.title.as_deref(), Some("Plan"));
+        assert_eq!(note.content.trim(), "second");
+
+        fs::write(dir.path().join("Projects/Keep.md"), "keep\n").expect("sibling note");
+        assert_eq!(
+            vault
+                .delete_note("Projects/Plan/Note")
+                .expect("delete note"),
+            vec![PathBuf::from("Projects/Plan")],
+            "only folders left empty are removed"
+        );
+        assert!(matches!(
+            vault.delete_note("Projects/Plan/Note"),
+            Err(NoteMutationError::NotFound { .. })
+        ));
+        assert_eq!(
+            vault
+                .delete_note("Projects/Keep")
+                .expect("delete last note"),
+            vec![PathBuf::from("Projects")]
+        );
+        assert!(dir.path().is_dir(), "the vault root is never removed");
+
+        for note_id in [".obsidian/app", "Private/draft"] {
+            assert!(
+                matches!(
+                    vault.create_note(note_id, &metadata, "x\n"),
+                    Err(NoteMutationError::InvalidId(_))
+                ),
+                "create {note_id}"
+            );
+            assert!(
+                matches!(
+                    vault.write_note(note_id, &metadata, "x\n"),
+                    Err(NoteMutationError::InvalidId(_))
+                ),
+                "write {note_id}"
+            );
+            assert!(
+                matches!(
+                    vault.delete_note(note_id),
+                    Err(NoteMutationError::InvalidId(_))
+                ),
+                "delete {note_id}"
+            );
+        }
+        assert!(!dir.path().join(".obsidian/app.md").exists());
+        assert!(!dir.path().join("Private").exists());
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq)]
+    enum TreeEntry {
+        Folder,
+        File(String),
+        Symlink(PathBuf),
+    }
+
+    #[cfg(unix)]
+    fn tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
+        let mut entries = BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                let file_type = fs::symlink_metadata(&path).expect("metadata").file_type();
+                let kind = if file_type.is_symlink() {
+                    TreeEntry::Symlink(fs::read_link(&path).expect("read link"))
+                } else if file_type.is_dir() {
+                    stack.push(path.clone());
+                    TreeEntry::Folder
+                } else {
+                    TreeEntry::File(fs::read_to_string(&path).expect("read file"))
+                };
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("relative path")
+                    .to_path_buf();
+                entries.insert(relative, kind);
+            }
+        }
+        entries
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn note_mutations_refuse_every_symlink_on_the_note_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("vault");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(root.join("Real")).expect("vault folders");
+        fs::create_dir_all(outside.join("sub")).expect("outside folders");
+        fs::write(root.join("Real/Note.md"), "inside\n").expect("inside note");
+        fs::write(outside.join("Existing.md"), "outside\n").expect("outside note");
+        fs::write(outside.join("sub/Deep.md"), "outside deep\n").expect("outside note");
+        let link = |target: PathBuf, name: &str| {
+            std::os::unix::fs::symlink(target, root.join(name)).expect("symlink")
+        };
+        link(outside.clone(), "Linked");
+        link(outside.join("Existing.md"), "Alias.md");
+        link(outside.join("Planted.md"), "Dangling.md");
+        link(root.join("Real"), "Inner");
+        let vault = Vault::new(VaultConfig::new(root.clone())).expect("vault initialises");
+        let vault_before = tree(&root);
+        let outside_before = tree(&outside);
+
+        type Mutation<'a> = &'a dyn Fn(&str) -> Result<(), NoteMutationError>;
+        let create: Mutation = &|id| vault.create_note(id, &MetadataMap::default(), "changed\n");
+        let write: Mutation = &|id| vault.write_note(id, &MetadataMap::default(), "changed\n");
+        let delete: Mutation = &|id| vault.delete_note(id).map(drop);
+        let cases: [(&str, Mutation, &str, &str); 15] = [
+            ("create", create, "Linked/Proof", "Linked"),
+            ("create", create, "Linked/newdir/Deeper", "Linked"),
+            ("create", create, "Alias", "Alias.md"),
+            ("create", create, "Dangling", "Dangling.md"),
+            ("create", create, "Inner/New", "Inner"),
+            ("write", write, "Linked/Existing", "Linked"),
+            ("write", write, "Linked/Proof", "Linked"),
+            ("write", write, "Alias", "Alias.md"),
+            ("write", write, "Dangling", "Dangling.md"),
+            ("write", write, "Inner/Note", "Inner"),
+            ("delete", delete, "Linked/Existing", "Linked"),
+            ("delete", delete, "Linked/sub/Deep", "Linked"),
+            ("delete", delete, "Alias", "Alias.md"),
+            ("delete", delete, "Dangling", "Dangling.md"),
+            ("delete", delete, "Inner/Note", "Inner"),
+        ];
+        for (action, mutate, note_id, symlink) in cases {
+            match mutate(note_id) {
+                Err(NoteMutationError::Symlink { path, .. }) => {
+                    assert_eq!(path, Path::new(symlink), "{action} {note_id}")
+                }
+                other => panic!("{action} {note_id} must be refused as a symlink, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            tree(&outside),
+            outside_before,
+            "files outside the vault stay untouched"
+        );
+        assert_eq!(
+            tree(&root),
+            vault_before,
+            "refused changes leave the vault untouched"
+        );
+    }
 }
 
 fn collect_markdown_files(
@@ -1532,11 +1806,12 @@ fn is_ignored(relative: &Path, ignored_folders: &[PathBuf]) -> bool {
         .any(|ignore| relative.starts_with(ignore))
 }
 
-fn compose_note_content(metadata: &MetadataMap, body: &str) -> Result<String> {
+fn compose_note_content(metadata: &MetadataMap, body: &str) -> Result<String, NoteMutationError> {
     let mut content = String::new();
 
     if !metadata.is_empty() {
-        let yaml = metadata_to_yaml(metadata)?;
+        let yaml = metadata_to_yaml(metadata)
+            .map_err(|err| NoteMutationError::InvalidMetadata(err.to_string()))?;
         content.push_str("---\n");
         content.push_str(&yaml);
         if !yaml.ends_with('\n') {
